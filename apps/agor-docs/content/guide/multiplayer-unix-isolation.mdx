@@ -1,0 +1,153 @@
+---
+title: Multiplayer Execution Isolation
+description: Configure branch RBAC with local filesystem sandboxing or a delegated execution substrate
+---
+
+# Multiplayer Execution Isolation
+
+Agor separates **application authorization** from the **execution boundary**. Branch RBAC decides which principals may view, prompt, or control a branch. Execution mode decides what files and credentials agent code can reach.
+
+## Supported modes
+
+| Mode        | Boundary                                 | Use case                       |
+| ----------- | ---------------------------------------- | ------------------------------ |
+| `simple`    | none beyond daemon-user permissions      | trusted personal installation  |
+| `sandbox`   | fail-closed bubblewrap filesystem mounts | shared Linux host              |
+| `delegated` | operator-supplied external substrate     | hosted/containerized execution |
+
+The former `strict` and `insulated` modes were removed in Agor 0.25. Agor no longer creates host users or groups, changes passwords, repairs ACLs, creates per-user symlinks, or launches executors through sudo.
+
+## Sandbox mode
+
+```yaml
+execution:
+  unix_user_mode: sandbox
+```
+
+Board and branch RBAC is always enabled. Sandbox mode adds the per-user filesystem sandbox. It requires Linux and bubblewrap and refuses to launch rather than silently falling back.
+
+For each launch the daemon derives mount access from trusted tenant and branch authorization state:
+
+- the active branch is writable, read-only, or absent according to the prompt actor's file access;
+- sibling worktrees and tenant homes are masked;
+- daemon state and external data roots are hidden;
+- the principal receives a persistent private home overlay;
+- provider and daemon connectivity still use the host network namespace—this is filesystem isolation, not network isolation.
+
+While a Task is running, its existing executor heartbeat rechecks the exact
+user, Task, Session, Branch, prompt permission, and effective file access
+against PostgreSQL authority. Losing prompt permission ends the Task through
+the normal fenced shutdown path. A file-access reduction also ends a runtime
+whose original mounts were broader (`read/write` to `read` or `none`, and
+`read` to `none`). An access increase does not widen or remount a live runtime;
+it applies to a later launch. Redis can accelerate disconnection but is not
+required for the next heartbeat decision.
+
+`users.filesystem_home` can point at a migrated home. Otherwise Agor uses its canonical tenant-scoped home store. Never derive this path from untrusted request data.
+
+### Per-branch SDK homes
+
+Agent SDK state can be relocated from the session owner's home into a directory
+shared by sessions on one branch:
+
+```yaml
+execution:
+  unix_user_mode: sandbox
+  sandbox:
+    sdk_home_mode: per_branch
+```
+
+The default is `inherit`, which preserves the existing home layout. With
+`per_branch`, admission of the first supported independent Session on a branch
+stickily records branch intent. Its directory at
+`<tenantDataRoot>/branch-homes/<branchId>` is still created lazily when that
+Session first runs. Disabling the deployment setting later stops new adoption
+but does not strand an adopted branch's state. Archiving retains the directory;
+permanently deleting the branch removes it.
+
+Each Session also records an immutable SDK-home scope. Existing Sessions keep
+using their historical execution home even after their branch is adopted; a
+new independent Session is the deliberate migration point. Forked and spawned
+children inherit their parent's scope so one native conversation lineage never
+moves between homes. Branch intent selects the default for future independent
+Sessions, while the Session stamp selects the home used when a conversation is
+resumed.
+
+Agor sets each supported tool's config-home environment variables and mounts
+the branch directory at its real path. Cursor is refused because its config
+home cannot currently be relocated reliably. Local OpenCode is also refused because
+its current XDG data home combines native credentials with relocatable state;
+hosted OpenCode keeps live state and the prompter's key on Job-local scratch and
+stores only sealed conversation checkpoints in the branch home.
+Credentials remain caller-scoped rather than being copied into the shared
+branch home. Codex API keys are injected through the environment; Codex
+subscription auth uses a caller-specific file overlay in local sandbox mode.
+The daemon opens that caller's existing `.codex/auth.json` without following
+symlinks, passes the pinned inode to bubblewrap, and mounts it read/write over
+an empty `auth.json` mountpoint in the branch Codex home. Codex refreshes the
+caller's credential file in place, while no credential bytes are copied into
+branch-owned storage. This requires `home_mode: per_user`, functional
+`--bind-fd`, and bubblewrap 0.12.0 or newer; Agor fails closed without that
+boundary. Importing replacement credentials or logging out durably requests
+termination of that actor's live branch-scoped Codex Tasks: their sandboxes
+pin the prior inode, and the next prompt must bind the new pathname. A reviewed
+delegated launcher may provide an equivalent caller-scoped overlay.
+
+### Web terminals
+
+A branch terminal requires Collaborator or Manager access plus `read` or `read/write` file access. In sandbox mode it receives the same filesystem boundary as an agent launch. In `simple` mode it is a daemon-user shell and should be disabled on shared instances:
+
+Interactive terminals do not mount or receive environment variables for a
+per-branch SDK home. Native tool login commands write credentials into their
+config home, so exposing the shared home to an arbitrary shell would violate
+the caller-scoped credential boundary.
+
+Terminals do not share the Task executor heartbeat, so this continuous
+revalidation applies to Task executors only. Closing that live-terminal parity
+gap requires separate terminal lifecycle work.
+
+```yaml
+execution:
+  allow_web_terminal: false
+```
+
+## Delegated execution
+
+```yaml
+execution:
+  unix_user_mode: delegated
+  executor_command_template: >-
+    launcher --tenant {tenant_id} --user {user_id} --branch-access {branch_fs_access}
+    --branch-sdk-home {branch_sdk_home}
+```
+
+Agor does not claim to prove an external launcher's isolation. The operator must ensure:
+
+- tenant and immutable user identity are bound to the runtime;
+- homes and credentials are isolated;
+- branch storage matches application authorization;
+- Stop, heartbeat, retry, and orphan cleanup semantics are enforced;
+- terminal support is owner-affine or disabled;
+- network access is explicitly controlled.
+
+Prefer `{tenant_id}`, `{user_id}`, `{branch_fs_access}`, and
+`{branch_sdk_home}`. The branch-home value is shell-escaped and is present only
+for a branch-scoped Session; it is empty for execution-home Sessions even when
+their branch has since been adopted. The launcher must make the same
+Session-scoped mount decision and owns its tool-environment policy.
+`{unix_user}` remains temporarily as an opaque, validated home key for
+compatible hosted launchers; it is not a Unix account and is never passed to
+sudo.
+
+## Board and branch permissions
+
+For roles, file access, ownership transfers, and shared-session gates, see
+[Sharing & Permissions](/guide/permissions#board-and-branch-permissions).
+Application permissions remain separate from execution isolation: assigning a
+role does not make trusted local `simple` execution a filesystem sandbox.
+
+## Related
+
+- [Security](/security)
+- [Containerized Execution](/guide/containerized-execution)
+- [Multiplayer Social](/guide/multiplayer-social)

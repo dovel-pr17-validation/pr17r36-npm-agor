@@ -1,0 +1,439 @@
+---
+title: Development Guide
+description: Complete guide for contributing to agor. Set up your development environment with Docker or local install, learn the codebase structure, and understand development workflows.
+---
+
+# Development Guide
+
+Complete developer documentation for contributing to Agor.
+
+## Quick start
+
+```bash
+git clone https://github.com/preset-io/agor
+cd agor
+docker compose up
+# Visit http://localhost:5173 → Login: admin@agor.live / admin
+```
+
+That gives you SQLite, single-user, always-on RBAC, and no executor sandbox — the fastest path to a running daemon. For Postgres, RBAC + sandbox testing, HA smoke testing, or the docs site, see the variant system below.
+
+The fixed login is an intentionally narrow bootstrap exception, not a weak
+deployment-wide password profile. It requires all three checked-in values:
+`AGOR_ADMIN_PASSWORD=admin`, `AGOR_ALLOW_DEVELOPMENT_DEFAULT_ADMIN=true`, and
+`NODE_ENV=development`. Every newly created or changed password still follows
+the secure daemon policy. An existing development `admin` password remains
+usable until you change it, after which it cannot be assigned again through
+normal user APIs.
+
+## Seeding test data
+
+Two optional, composable env switches pre-populate the database on first boot:
+
+```bash
+# Real runnable branch (clones the agor repo) + a rich set of demo data
+SEED=true LOAD_FIXTURES=true docker compose up
+```
+
+- **`SEED=true`** clones the real `agor` repo and creates one runnable `test-branch`.
+- **`LOAD_FIXTURES=true`** inserts hardcoded, `demo-`-prefixed fake data (pure DB
+  inserts, no git/network): 4 loginable users, 2 repos, a board with 4 zones, 5
+  branches, 4 sessions with fork/spawn genealogy + transcripts, kanban cards, and a
+  live Sandpack artifact. Idempotent and **dev-only**. You can also run it manually
+  with `pnpm load:fixtures`.
+
+The `SEED=true LOAD_FIXTURES=true docker compose up` form is for running compose
+directly on a host. **In an Agor-managed env** the start command comes pre-rendered
+from a `.agor.yml` variant, so pick a demo variant instead of injecting env vars:
+the `sqlite-demo` and `postgres-demo` variants below are the `sqlite` / `postgres`
+variants with `LOAD_FIXTURES=true` added next to `SEED=true`. Select one via the
+**Branch → Environment** tab variant picker, the MCP call
+`agor_environment_set({ branchId, variant: "sqlite-demo", andStart: true })`, or at
+branch creation with `variant: "sqlite-demo"`.
+
+Managed standalone variants explicitly acknowledge offline-cutover migrations
+before their one daemon starts. Existing rendered variants are recognized by
+their development-only `SEED=true` setting. This convenience applies only to
+the variant's isolated Compose database volume; never use seeding or the
+cutover acknowledgement against a shared or production database.
+
+Both are off by default and can be enabled independently. With `LOAD_FIXTURES`,
+extra demo logins are available (passwords printed in the seed log):
+
+| Email                  | Password              | Role   |
+| ---------------------- | --------------------- | ------ |
+| `demo.alice@agor.live` | `demo-password-alice` | admin  |
+| `demo.bob@agor.live`   | `demo-password-bob`   | member |
+| `demo.carol@agor.live` | `demo-password-carol` | member |
+| `demo.dave@agor.live`  | `demo-password-dave`  | viewer |
+
+The `rich` RBAC fixture uses `alice@agor.live / alice-development-only` and
+`bob@agor.live / bob-development-only`. All fixture passwords are local-only;
+do not expose a managed development environment to an untrusted network.
+
+See [`packages/core/src/seed/README.md`](https://github.com/preset-io/agor/blob/main/packages/core/src/seed/README.md) for the full inventory.
+
+## `.agor.yml` (the variant system)
+
+Agor's repo ships [`.agor.yml`](https://github.com/preset-io/agor/blob/main/.agor.yml), a declarative schema describing how to spawn an environment for this codebase. The same schema you'd write for any repo you load into Agor: Agor uses it to develop itself. Each variant is a Handlebars-templated `start` / `stop` / `nuke` / `logs` / `health` / `app` block.
+
+| Variant                  | What you get                                                                                                                                                                                                                                   | Base ports                                        |
+| ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------- |
+| **`sqlite`** _(default)_ | Standalone source-mode dev with SQLite, always-on branch RBAC, and no Agor executor sandbox. Fastest to boot.                                                                                                                                  | daemon: `3000 + branch.unique_id`, UI: `5000 + …` |
+| **`postgres`**           | `sqlite` topology with PostgreSQL schema parity. Application RBAC is always on; the Agor executor sandbox remains off. **Requires Postgres 13+** (migrations use `gen_random_uuid()` from `pg_catalog`).                                       | same as `sqlite`                                  |
+| **`sandbox`**            | SQLite plus the tunable, shared-home bubblewrap filesystem sandbox. Application RBAC is always on; sandbox unavailability is not fail-closed.                                                                                                  | same as `sqlite`                                  |
+| **`sandbox-peruser`**    | SQLite plus `execution.unix_user_mode: sandbox`, a per-user home, and fail-closed bubblewrap isolation. It does not impersonate host users.                                                                                                    | same as `sqlite`                                  |
+| **`rich`**               | Standalone PostgreSQL + fail-closed per-user sandbox profile. Also creates Alice/Bob RBAC fixtures. HA remains a separate variant.                                                                                                             | same as `sqlite`                                  |
+| **`full`**               | Deprecated compatibility alias for `rich`, retained so existing branches can still re-render safely.                                                                                                                                           | same as `rich`                                    |
+| **`ha`**                 | Hosted control-plane smoke: PostgreSQL/RLS, ephemeral Redis, two production-source daemons, nginx affinity, auth-resolved Acme/Globex personas, RBAC, and per-user sandbox homes. The Compose-only picker intentionally has no authentication. | ingress: `3000 + branch.unique_id`                |
+| **`docs`**               | Nextra docs site (`apps/agor-docs`) in a self-contained container. No daemon or database.                                                                                                                                                      | `7000 + branch.unique_id`                         |
+| **`sqlite-demo`**        | `sqlite` plus `LOAD_FIXTURES=true`, which adds a populated demo board and four loginable demo users.                                                                                                                                           | same as `sqlite`                                  |
+| **`postgres-demo`**      | `postgres` plus the same demo fixtures on PostgreSQL.                                                                                                                                                                                          | same as `sqlite`                                  |
+
+Ports derive from `branch.unique_id` so multiple branches run side-by-side without colliding. The `docs` variant uses `{{host.ip_address}}` in its app URL so the dev server is reachable from your laptop, not just localhost on the daemon host. Except for `ha`, daemon variants use the standalone deployment mode; a managed-environment variant name does not select a daemon deployment mode by itself.
+
+Pick a variant in the branch's environment settings or through `agor_environment_set`. There is no daemon-wide `AGOR_VARIANT` switch: variant selection is repository/branch data, and rendering stores the resolved commands on that branch.
+
+A representative variant block, abridged from the file:
+
+```yaml
+sqlite:
+  description: Single-user dev with SQLite. Always-on RBAC, no executor sandbox. Fastest to boot.
+  start: >-
+    DAEMON_PORT={{add 3000 branch.unique_id}}
+    UI_PORT={{add 5000 branch.unique_id}}
+    docker compose -p agor-{{branch.name}} up -d
+  stop: docker compose -p agor-{{branch.name}} down
+  nuke: docker compose -p agor-{{branch.name}} down -v
+  logs: docker compose -p agor-{{branch.name}} logs --tail=100
+  health: http://localhost:{{add 3000 branch.unique_id}}/health
+  app: http://localhost:{{add 5000 branch.unique_id}}
+```
+
+Other variants `extends: sqlite` to inherit the unchanged blocks. The schema enforces single-level extension only (no chains).
+
+## Agor in Agor (recommended)
+
+The whole point of `.agor.yml` is that Agor can develop itself. The natural workflow:
+
+1. **Run a "host" Agor** (any way you like, via `npm i -g agor-live`, `docker compose up`, anything).
+2. **Register the agor repo** in your host Agor. Clone or point it at your local checkout.
+3. **Create a branch per feature**. Each branch gets a unique `branch.unique_id` → unique ports → fully isolated dev stack.
+4. **Pick a variant** in the branch's environment settings (`sqlite` for most things, `postgres` for DB-only parity, `rich` for single-tenant PostgreSQL + RBAC + per-user sandbox testing, `ha` for multi-tenant hosted/HA control-plane behavior, or `docs` for documentation work).
+5. **Spawn an agent session**. The session has [Agor MCP](/guide/internal-mcp) access, so it can spin up environments, monitor health and logs, run tasks against the running stack, and tear it down, all without you ever leaving the canvas.
+
+This is also the only sane way to develop multiple Agor features in parallel: each branch's variant picks its own ports, mounts source for HMR, and persists `node_modules` in a named volume.
+
+## When to use `pnpm dev` instead
+
+Skip Docker if you're working on the **environment-spawning system itself**. Running Agor in Docker while it tries to spawn `docker compose` for environments creates docker-in-docker entanglements that aren't worth fighting.
+
+```bash
+git clone https://github.com/preset-io/agor && cd agor && pnpm install
+```
+
+Two terminals:
+
+```bash
+# Terminal 1: Daemon (watches @agor/core + daemon, auto-restarts)
+cd apps/agor-daemon && pnpm dev
+
+# Terminal 2: UI dev server (Vite HMR)
+cd apps/agor-ui && pnpm dev
+
+# Visit http://localhost:5173
+```
+
+## Custom builds
+
+To test the **packaged artifact** end-to-end (the way users actually install Agor), build the `agor-live` npm package locally:
+
+```bash
+cd packages/agor-live
+./build.sh
+CLIENT_TARBALL=$(ls "$PWD"/release/agor-live-client-*.tgz)
+AGOR_TARBALL=$(ls "$PWD"/release/agor-live-[0-9]*.tgz)
+npm i -g "$CLIENT_TARBALL" "$AGOR_TARBALL"
+```
+
+`build.sh` produces immutable release tarballs in `packages/agor-live/release/`: the UI is built as static assets and bundled into `agor-live` so the daemon serves it directly, internal packages are materialized in the tarball, and workspace dependencies are rewritten to exact release versions. The package has no required install lifecycle script, so the local artifact uses the same plain npm command as a registry release. After installation, the global `agor` and `agor-live` commands run your local build instead of the published version.
+
+Useful when you want to:
+
+- Verify the production-style flow (no Vite dev server, no separate UI process)
+- Test CLI behavior against a built package
+- Hand a colleague a tarball without publishing to npm
+
+Run `npm uninstall -g agor-live` to remove your local build and fall back to whatever you had installed before.
+
+## Committing from inside Docker
+
+When the daemon runs in Docker, `pnpm install` populates `node_modules/` with **Linux** binaries (`turbo-linux-arm64`, `@biomejs/cli-linux-x64`, etc.). If you commit from the host, Husky pre-commit hooks try to execute those Linux binaries and fail.
+
+Two fixes:
+
+1. **Commit inside the container** _(recommended)_. Run `docker compose exec agor-dev git add . && docker compose exec agor-dev git commit -m "msg"`. Hooks run in Linux.
+2. **Reinstall on host.** Run `pnpm install` from the host once to get host-OS binaries; commit normally afterward. (You'll end up with both binary sets in `node_modules`, which is harmless but bloats the tree.)
+
+## Checking which database is active
+
+Open **Settings → About** (admin only):
+
+- 💾 SQLite shows the database file path
+- 🐘 PostgreSQL shows the connection URL (password masked)
+
+Or hit the daemon directly:
+
+```bash
+curl http://localhost:3030/health
+```
+
+## Project Structure
+
+```
+agor/
+├── apps/
+│   ├── agor-daemon/         # FeathersJS backend (REST + WebSocket)
+│   ├── agor-cli/            # CLI tool (oclif-based)
+│   ├── agor-ui/             # React UI (Ant Design + React Flow)
+│   └── agor-docs/           # Documentation website (Nextra)
+├── packages/
+│   ├── core/                # Shared @agor/core package
+│   │   ├── types/           # TypeScript types (Session, Task, Branch, etc.)
+│   │   ├── db/              # Drizzle ORM + repositories + schema
+│   │   └── api/             # FeathersJS client utilities
+│   ├── git/                 # @agor/git (simple-git only, no subprocess)
+│   ├── executor/            # Process-isolated agent runtime
+│   └── agor-live/           # Published npm package
+└── context/                 # Agent-oriented design contracts and house rules
+```
+
+## Monorepo & Development Tooling
+
+Agor is a **pnpm workspace monorepo** with several automation tools:
+
+### pnpm Workspaces
+
+**Structure:**
+
+```yaml
+# pnpm-workspace.yaml
+packages:
+  - 'apps/*'
+  - 'packages/*'
+```
+
+**Workspace protocol:**
+
+- Packages reference each other via `workspace:*`
+- Example: `@agor/cli` depends on `@agor/core@workspace:*`
+- pnpm symlinks workspace packages (no need to rebuild on every change)
+
+### Turbo
+
+**Parallel builds and task orchestration:**
+
+```bash
+# Build all packages in dependency order
+pnpm build
+
+# Run typecheck across all packages in parallel
+pnpm typecheck
+
+# Run dev servers (daemon + UI)
+pnpm dev
+```
+
+**How it works:**
+
+- Reads `turbo.json` for task definitions
+- Understands package dependencies
+- Runs tasks in parallel when possible
+- Caches build outputs for speed
+
+### Git Hooks (Husky + lint-staged)
+
+**Pre-commit checks:**
+
+- Runs automatically before `git commit`
+- Only checks staged files (fast!)
+- Runs: biome (linting), prettier (formatting), typecheck
+
+**Setup:**
+
+```bash
+pnpm prepare  # Installs git hooks
+```
+
+### Code Quality
+
+**Linting:**
+
+- [biome](https://biomejs.dev/) - Fast linter and formatter
+- Config: `biome.json`
+- Run: `pnpm lint` or `pnpm lint:fix`
+
+**Formatting:**
+
+- [prettier](https://prettier.io/) - Code formatter
+- Config: `.prettierrc`
+- Run: `pnpm format`
+
+### Root Scripts
+
+Common commands from root directory:
+
+```bash
+# Development
+pnpm dev              # Start daemon + UI
+pnpm docs:dev         # Start docs site
+
+# Code quality
+pnpm typecheck        # Type check all packages
+pnpm lint             # Lint all packages
+pnpm lint:fix         # Lint and auto-fix
+pnpm format           # Format all files
+pnpm check            # typecheck + lint + build
+pnpm check:fix        # lint:fix + typecheck + build
+
+# Building
+pnpm build            # Build all packages
+pnpm clean            # Clean all build artifacts
+
+# CLI (from root)
+pnpm agor <command>   # Run CLI without global install
+```
+
+## Tech Stack
+
+See the **[Architecture Guide](/guide/architecture#technology-stack)** for the complete tech stack (FeathersJS, Drizzle, React, Ant Design, etc.).
+
+## Contributor Conventions
+
+Repository rules for humans and coding agents (type reuse, `simple-git`, multi-tenancy review,
+branch-centric boards, commit hooks) live in
+**[AGENTS.md](https://github.com/preset-io/agor/blob/main/AGENTS.md)**. Agent-oriented design
+contracts are indexed in
+**[context/README.md](https://github.com/preset-io/agor/blob/main/context/README.md)**, and the
+contribution workflow is in
+**[CONTRIBUTING.md](https://github.com/preset-io/agor/blob/main/CONTRIBUTING.md)**.
+
+## Testing
+
+### Database Operations
+
+**SQLite:**
+
+```bash
+# Query database directly
+sqlite3 ~/.agor/agor.db "SELECT COUNT(*) FROM messages"
+sqlite3 ~/.agor/agor.db "SELECT * FROM sessions LIMIT 5"
+```
+
+**PostgreSQL:**
+
+```bash
+# Connect to postgres container
+docker compose exec postgres psql -U agor -d agor
+
+# Example queries
+docker compose exec postgres psql -U agor -d agor -c "SELECT COUNT(*) FROM messages"
+docker compose exec postgres psql -U agor -d agor -c "SELECT * FROM sessions LIMIT 5"
+```
+
+### Health Checks
+
+```bash
+# Daemon health
+curl http://localhost:3030/health
+
+# Check which database is active (admin auth required)
+curl -H "Authorization: Bearer YOUR_JWT_TOKEN" http://localhost:3030/health
+```
+
+### CLI Commands
+
+```bash
+# Test CLI (ensure clean exit, no hanging)
+pnpm agor session list
+pnpm agor repo list
+
+# CLI auto-detects database from environment
+# Works with both SQLite and PostgreSQL
+```
+
+## Troubleshooting
+
+### Build fails with `ERR_WORKER_OUT_OF_MEMORY` / `JS heap out of memory`
+
+`@agor/core` exports ~40 entry points and emits TypeScript declarations for
+both CJS and ESM. tsup's DTS pipeline peaks around **3 GB of memory**, which
+exceeds Node's default heap ceiling on smaller hosts (4 GB RAM containers,
+Raspberry Pis, etc.).
+
+Agor's standard build paths already raise the ceiling to 4 GB. If you wrap
+the build in your own script (or invoke `tsup` directly) and hit the OOM, set
+it yourself:
+
+```bash
+export NODE_OPTIONS="--max-old-space-size=4096"
+pnpm --filter @agor/core build
+```
+
+If 4 GB isn't enough on a particularly large feature branch, raise to 8192.
+
+### "Method is not a function" after editing @agor/core
+
+**Should NOT happen** with new 2-process workflow (daemon watches core and auto-restarts).
+
+**If it still happens:**
+
+```bash
+cd packages/core && pnpm build
+cd apps/agor-daemon && pnpm dev
+```
+
+### tsx watch not picking up changes
+
+```bash
+cd apps/agor-daemon
+rm -rf node_modules/.tsx
+pnpm dev
+```
+
+### Daemon hanging
+
+```bash
+lsof -ti:3030 | xargs kill -9
+cd apps/agor-daemon && pnpm dev
+```
+
+## Contributing to the MCP catalog
+
+The public catalog is `packages/core/src/mcp-catalog/curated.yaml`. `auth_type` is presentation policy, while the connect-time live probe remains authoritative. The readiness read itself is side-effect-free and does not probe. Every `credentials` entry must include a reviewed `credentials` block with `scheme: bearer`, an accurate vendor `acquisition_url`, and an optional user-facing label. Never put a secret in the catalog.
+
+Set `hidden: true` to withdraw an entry from discovery and new installs by name;
+omit it or set it to `false` and redeploy to offer the entry again. Hidden
+entries remain validated and retain the policy checks needed by saved connections.
+Hiding is not credential revocation.
+
+Review the exact endpoint, redirect behavior, vendor authentication documentation, permission disclosure, and acquisition link. Do not classify a non-OAuth challenge as bearer support without that evidence. OAuth-specific compatibility fields are escape hatches and should be added only after reviewing the provider's discovery behavior.
+
+The `MCP catalog health` workflow runs daily and on catalog/audit pull requests. It repeats a read-only initialize/auth probe and the side-effect-free production OAuth metadata/client-readiness validation. Third-party reachability failures remain annotated advisories, while authentication contradictions, invalid OAuth contracts, and a newly usable OAuth path for a reviewed bearer exception fail with an actionable annotation. Credential/PAT entries are reported as requiring a credential rather than fully verified because the audit never holds a user's secret.
+
+## What to Contribute
+
+Browse the **[open GitHub issues](https://github.com/preset-io/agor/issues)** for contribution ideas, or propose your own.
+
+## Getting Help
+
+- **[Discord](https://discord.gg/Qh4TrFQZpd)** - Join our Discord community for support and discussion
+- **[GitHub Discussions](https://github.com/preset-io/agor/discussions)** - Ask questions, share ideas
+- **[GitHub Issues](https://github.com/preset-io/agor/issues)** - Report bugs, request features
+
+## Next Steps
+
+- **[Architecture](/guide/architecture)** - System design and internals
+- Run `agor --help` for complete CLI documentation
+- **[API Reference](/api-reference)** - REST endpoints and WebSocket events
+- **[AGENTS.md](https://github.com/preset-io/agor/blob/main/AGENTS.md)** - Development patterns and project structure

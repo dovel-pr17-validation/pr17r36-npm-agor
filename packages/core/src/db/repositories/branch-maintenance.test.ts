@@ -1,0 +1,764 @@
+import { eq } from 'drizzle-orm';
+import { afterEach, expect, vi } from 'vitest';
+import { generateId } from '../../lib/ids';
+import type { TenantID, UploadMetadata, UploadOwner, UploadRef, UserID } from '../../types';
+import { lockBranchForAdmission } from '../branch-admission';
+import { runDatabaseTransaction, select, update } from '../database-wrapper';
+import { branches } from '../schema';
+import { ownedDbTest } from '../test-helpers';
+import {
+  BranchMaintenanceDiscoveryRepository,
+  BranchMaintenanceRepository,
+} from './branch-maintenance';
+import { BranchRepository } from './branches';
+import { EnvironmentCommandRepository } from './environment-commands';
+import {
+  createBranchAtPathForTest,
+  seedEnvironmentCommandBranch,
+  setBranchPathForTest,
+} from './environment-commands.test-support';
+import { RepoRepository } from './repos';
+import { SessionRepository } from './sessions';
+import { TaskRepository } from './tasks';
+import { UploadRepository } from './uploads';
+import { UserPrimaryTeammateRepository } from './user-primary-teammate';
+
+const test = ownedDbTest;
+afterEach(() => vi.useRealTimers());
+
+test('a stale deletion becomes visible as failed without releasing the original invocation', async ({
+  db,
+}) => {
+  const { branch } = await seedEnvironmentCommandBranch(db);
+  const maintenance = new BranchMaintenanceRepository(db);
+  const { claim } = await maintenance.claim(branch.branch_id, 'delete');
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(new Date('2026-09-15T00:00:00Z'));
+  const invocation = await maintenance.beginExecution(claim);
+  await expect(maintenance.withExecution(claim, invocation, async () => true)).rejects.toThrow(
+    'not claimed'
+  );
+  await maintenance.claimExecution(claim, invocation);
+  await expect(maintenance.claimExecution(claim, invocation)).rejects.toThrow('already claimed');
+  vi.setSystemTime(new Date('2026-09-15T00:01:00Z'));
+  await maintenance.heartbeatExecution(claim, invocation);
+  expect(await maintenance.markStaleDeletion(claim, 30_000)).toBe(false);
+  vi.setSystemTime(new Date('2026-09-15T00:02:00Z'));
+  expect(await maintenance.markStaleDeletion(claim, 30_000)).toBe(true);
+  expect((await maintenance.claim(branch.branch_id, 'delete')).acquired).toBe(false);
+  await expect(maintenance.beginExecution(claim)).rejects.toThrow('reconciliation');
+  await maintenance.heartbeatExecution(claim, invocation);
+  expect((await new BranchRepository(db).findById(branch.branch_id))?.deletion_status).toBe(
+    'deletion_failed'
+  );
+  // The original claimed executor can still report verified progress; a late
+  // heartbeat never starts a new invocation or hides the previous failure.
+  expect(await maintenance.withExecution(claim, invocation, async () => true)).toBe(true);
+});
+
+test('an unacknowledged dispatch cannot start after reconciliation marks it failed', async ({
+  db,
+}) => {
+  const { branch } = await seedEnvironmentCommandBranch(db);
+  const maintenance = new BranchMaintenanceRepository(db);
+  const { claim } = await maintenance.claim(branch.branch_id, 'delete');
+  const invocation = await maintenance.beginExecution(claim);
+  await maintenance.fail(claim, 'Dispatch outcome unknown');
+  await expect(maintenance.claimExecution(claim, invocation)).rejects.toThrow('no longer active');
+  await expect(maintenance.heartbeatExecution(claim, invocation)).rejects.toThrow('not claimed');
+  const retry = await maintenance.claim(branch.branch_id, 'delete');
+  expect(retry.acquired).toBe(true);
+  expect(retry.claim.generation).toBe(claim.generation + 1);
+  await expect(maintenance.claimExecution(claim, invocation)).rejects.toThrow('ownership changed');
+  await expect(maintenance.beginExecution(claim)).rejects.toThrow('ownership changed');
+  await expect(maintenance.markStaleDeletion(claim, 1)).rejects.toThrow('ownership changed');
+  expect((await maintenance.claim(branch.branch_id, 'delete')).acquired).toBe(false);
+});
+
+test('known unfinished tasks prevent claiming maintenance without changing branch state', async ({
+  db,
+}) => {
+  const { branch, user } = await seedEnvironmentCommandBranch(db);
+  const session = await new SessionRepository(db).create({
+    branch_id: branch.branch_id,
+    agentic_tool: 'codex',
+    created_by: user.user_id,
+  });
+  await new TaskRepository(db).create({
+    session_id: session.session_id,
+    created_by: user.user_id,
+    status: 'queued',
+  });
+  await expect(
+    new BranchMaintenanceRepository(db).claim(branch.branch_id, 'delete')
+  ).rejects.toThrow('unfinished tasks');
+  await expect(
+    new BranchMaintenanceRepository(db).claim(branch.branch_id, 'metadata_archive')
+  ).rejects.toThrow('unfinished tasks');
+  expect(
+    (await new BranchRepository(db).findById(branch.branch_id))?.deletion_status
+  ).toBeUndefined();
+});
+
+for (const status of ['failed', 'cleaned', 'deleted', 'ready', 'creating'] as const) {
+  for (const relation of ['equal', 'child', 'ancestor'] as const) {
+    test(`overlap guard protects ${status} ${relation} sibling for every filesystem claim`, async ({
+      db,
+    }) => {
+      const { branch, user } = await seedEnvironmentCommandBranch(db);
+      const branches = new BranchRepository(db);
+      await createBranchAtPathForTest(db, {
+        repo_id: branch.repo_id,
+        name: 'sibling',
+        ref: 'sibling',
+        branch_unique_id: 9600001,
+        path:
+          relation === 'equal'
+            ? branch.path
+            : relation === 'child'
+              ? `${branch.path}/child`
+              : '/tmp',
+        created_by: user.user_id,
+        filesystem_status: status,
+        archived: true,
+      });
+      const maintenance = new BranchMaintenanceRepository(db);
+      for (const kind of ['delete', 'cleanup', 'workspace_write'] as const) {
+        await expect(maintenance.claim(branch.branch_id, kind)).rejects.toThrow(
+          /overlaps another branch; use Archive → Leave untouched.*installation operator/
+        );
+      }
+      expect((await branches.findById(branch.branch_id))?.deletion_status).toBeUndefined();
+      const { claim } = await maintenance.claim(branch.branch_id, 'metadata_archive');
+      await expect(maintenance.beginExecution(claim)).rejects.toThrow('cannot launch');
+      await expect(maintenance.beginExecution({ ...claim, kind: 'cleanup' })).rejects.toThrow(
+        'ownership changed'
+      );
+      await maintenance.release(claim);
+    });
+  }
+}
+
+// Rows from before the documented data_home migration name the legacy alias;
+// deleting a current-root row must still see them as the same workspace.
+for (const relation of ['equal', 'child', 'ancestor'] as const) {
+  test(`overlap guard sees a legacy-alias ${relation} sibling`, async ({ db }) => {
+    vi.stubEnv('AGOR_HOME', '/fictional/home/.agor');
+    vi.stubEnv('AGOR_DATA_HOME', '/fictional/data');
+    try {
+      const { branch, user } = await seedEnvironmentCommandBranch(db, {
+        path: '/fictional/data/worktrees/org/v/feature',
+      });
+      const legacy = '/fictional/home/.agor/worktrees/org/v';
+      await createBranchAtPathForTest(db, {
+        repo_id: branch.repo_id,
+        name: 'legacy-sibling',
+        ref: 'legacy-sibling',
+        branch_unique_id: 9600003,
+        path:
+          relation === 'equal'
+            ? `${legacy}/feature`
+            : relation === 'child'
+              ? `${legacy}/feature/child`
+              : legacy,
+        created_by: user.user_id,
+        archived: true,
+      });
+      const maintenance = new BranchMaintenanceRepository(db);
+      for (const kind of ['delete', 'cleanup', 'workspace_write'] as const) {
+        await expect(maintenance.claim(branch.branch_id, kind)).rejects.toThrow('overlaps');
+      }
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+}
+
+for (const literal of ['percent%', 'under_score', 'escape!', 'back\\slash']) {
+  for (const relation of [
+    'equal',
+    'child',
+    'parent',
+    'unrelated-child',
+    'unrelated-parent',
+  ] as const) {
+    test(`overlap treats ${literal} literally for ${relation} paths`, async ({ db }) => {
+      const { branch, user } = await seedEnvironmentCommandBranch(db);
+      const path = `/tmp/${literal}`;
+      const lookalike = path
+        .replace('%', 'wildcard')
+        .replace('_', 'X')
+        .replace('!', '')
+        .replace('\\', '');
+      await setBranchPathForTest(
+        db,
+        branch.branch_id,
+        relation === 'parent'
+          ? `${path}/child`
+          : relation === 'unrelated-parent'
+            ? `${lookalike}/child`
+            : path
+      );
+      await createBranchAtPathForTest(db, {
+        repo_id: branch.repo_id,
+        name: 'literal-sibling',
+        ref: 'literal-sibling',
+        branch_unique_id: 9600002,
+        path:
+          relation === 'child'
+            ? `${path}/child`
+            : relation === 'unrelated-child'
+              ? `${lookalike}/child`
+              : path,
+        created_by: user.user_id,
+      });
+      const maintenance = new BranchMaintenanceRepository(db);
+      for (const kind of ['cleanup', 'workspace_write', 'delete'] as const) {
+        if (relation.startsWith('unrelated')) {
+          const { claim } = await maintenance.claim(branch.branch_id, kind);
+          if (kind !== 'delete') await maintenance.release(claim);
+        } else {
+          await expect(maintenance.claim(branch.branch_id, kind)).rejects.toThrow('overlaps');
+        }
+      }
+    });
+  }
+}
+
+test('environment admission and maintenance exclude each other under the branch lock', async ({
+  db,
+}) => {
+  const { branch, user } = await seedEnvironmentCommandBranch(db);
+  const maintenance = new BranchMaintenanceRepository(db);
+  const commands = new EnvironmentCommandRepository(db);
+  const input = { branch, userId: user.user_id, action: 'start' as const, attemptId: generateId() };
+  const cleanup = await maintenance.claim(branch.branch_id, 'cleanup');
+  await expect(commands.admit(input)).rejects.toThrow('maintenance');
+  await maintenance.release(cleanup.claim);
+  await commands.admit(input);
+  await expect(maintenance.claim(branch.branch_id, 'delete')).rejects.toThrow(
+    'environment is active'
+  );
+  await commands.dispatchFailed(branch.branch_id, input.attemptId);
+  const deletion = await maintenance.claim(branch.branch_id, 'delete');
+  await expect(commands.admit({ ...input, attemptId: generateId() })).rejects.toThrow('deletion');
+  await maintenance.fail(deletion.claim, 'Fixture failure');
+  await expect(commands.admit({ ...input, attemptId: generateId() })).rejects.toThrow('deletion');
+});
+
+test('retains failure on the branch, fences new work and rejects stale generations', async ({
+  db,
+}) => {
+  const repo = await new RepoRepository(db).create({
+    repo_id: generateId(),
+    slug: 'maintenance-fixture',
+    name: 'Fixture',
+    repo_type: 'remote',
+    remote_url: 'https://example.invalid/repo',
+    local_path: '/disposable/not-created',
+    default_branch: 'main',
+  });
+  const branches = new BranchRepository(db);
+  const branch = await branches.create({
+    repo_id: repo.repo_id,
+    name: 'fixture',
+    ref: 'fixture',
+    branch_unique_id: 1,
+    path: '/disposable/not-created/fixture',
+    created_by: 'test-user' as UserID,
+  });
+  const maintenance = new BranchMaintenanceRepository(db);
+  const first = await maintenance.claim(branch.branch_id, 'delete');
+  expect(first.acquired).toBe(true);
+  expect((await maintenance.claim(branch.branch_id, 'delete')).acquired).toBe(false);
+  expect(await branches.findById(branch.branch_id)).toMatchObject({ deletion_status: 'deleting' });
+  expect(await branches.findById(branch.branch_id)).not.toHaveProperty('maintenance');
+  await expect(
+    runDatabaseTransaction(db, (tx) => lockBranchForAdmission(tx, branch.branch_id))
+  ).rejects.toThrow('deletion');
+  await expect(
+    new SessionRepository(db).create({
+      branch_id: branch.branch_id,
+      agentic_tool: 'codex',
+      created_by: branch.created_by,
+    })
+  ).rejects.toThrow('deletion');
+  await maintenance.fail(first.claim, 'Workspace removal failed; check permissions and retry.');
+  expect(await branches.findById(branch.branch_id)).toMatchObject({
+    deletion_status: 'deletion_failed',
+    deletion_error: 'Workspace removal failed; check permissions and retry.',
+  });
+  await expect(
+    branches.update(branch.branch_id, { archived: false, deletion_status: undefined })
+  ).rejects.toThrow('irreversible');
+  await expect(maintenance.claim(branch.branch_id, 'cleanup')).rejects.toThrow('cancelled');
+  const retry = await maintenance.claim(branch.branch_id, 'delete');
+  expect(retry.claim.generation).toBe(first.claim.generation + 1);
+  await expect(maintenance.fail(first.claim, 'stale')).rejects.toThrow('ownership changed');
+  expect((await branches.findById(branch.branch_id))?.deletion_error).toBeUndefined();
+  const executionId = await maintenance.beginExecution(retry.claim);
+  await maintenance.claimExecution(retry.claim, executionId);
+  expect(await maintenance.withExecution(retry.claim, executionId, async () => 'accepted')).toBe(
+    'accepted'
+  );
+  await expect(
+    maintenance.withExecution(retry.claim, generateId(), async () => {
+      throw new Error('Stale invocation reached database work');
+    })
+  ).rejects.toThrow('Executor invocation changed');
+  await expect(maintenance.beginExecution(retry.claim)).rejects.toThrow('reconciliation');
+  await maintenance.fail(
+    retry.claim,
+    'Executor outcome is unknown; containment reconciliation is required.'
+  );
+  expect((await maintenance.claim(branch.branch_id, 'delete')).acquired).toBe(false);
+  await expect(maintenance.settleExecution(retry.claim, generateId())).rejects.toThrow(
+    'invocation changed'
+  );
+  await maintenance.settleExecution(retry.claim, executionId);
+  await expect(
+    maintenance.withExecution(retry.claim, executionId, async () => {
+      throw new Error('Settled invocation reached database work');
+    })
+  ).rejects.toThrow('Executor invocation changed');
+  const nextExecution = await maintenance.beginExecution(retry.claim);
+  await expect(maintenance.settleExecution(retry.claim, executionId)).rejects.toThrow(
+    'invocation changed'
+  );
+  await maintenance.settleExecution(retry.claim, nextExecution);
+  await maintenance.fail(retry.claim, 'Retry after verified containment.');
+  expect((await maintenance.claim(branch.branch_id, 'delete')).acquired).toBe(true);
+});
+
+test('a claim interrupted before invocation admission becomes retryable without admitting a late executor', async ({
+  db,
+}) => {
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(new Date('2026-09-15T00:00:00Z'));
+  const { branch } = await seedEnvironmentCommandBranch(db);
+  const maintenance = new BranchMaintenanceRepository(db);
+  const { claim } = await maintenance.claim(branch.branch_id, 'delete');
+  expect(await maintenance.markStaleDeletion(claim, 30_000)).toBe(false);
+  vi.setSystemTime(new Date('2026-09-15T00:01:00Z'));
+  expect(await maintenance.markStaleDeletion(claim, 30_000)).toBe(true);
+  await expect(maintenance.beginExecution(claim)).rejects.toThrow();
+  const retry = await maintenance.claim(branch.branch_id, 'delete');
+  expect(retry.acquired).toBe(true);
+  expect(retry.claim.generation).toBe(claim.generation + 1);
+});
+
+test('materialization and taskless writes exclude permanent deletion through the shared Branch fence', async ({
+  db,
+}) => {
+  const { branch } = await seedEnvironmentCommandBranch(db);
+  const branches = new BranchRepository(db);
+  const maintenance = new BranchMaintenanceRepository(db);
+  await branches.update(branch.branch_id, { filesystem_status: 'creating' });
+  await expect(maintenance.claim(branch.branch_id, 'delete')).rejects.toThrow('materialization');
+  await expect(maintenance.claim(branch.branch_id, 'metadata_archive')).rejects.toThrow(
+    'materialization'
+  );
+  await branches.update(branch.branch_id, { filesystem_status: 'ready' });
+  const { claim } = await maintenance.claim(branch.branch_id, 'workspace_write');
+  await expect(maintenance.claim(branch.branch_id, 'delete')).rejects.toThrow();
+  await expect(
+    branches.update(branch.branch_id, { filesystem_status: 'creating' })
+  ).rejects.toThrow();
+  const invocation = await maintenance.beginExecution(claim);
+  await expect(maintenance.release(claim)).rejects.toThrow();
+  await maintenance.settleExecution(claim, invocation);
+  await maintenance.release(claim);
+  expect((await maintenance.claim(branch.branch_id, 'delete')).acquired).toBe(true);
+});
+
+test('maintenance discovery returns only deleting routing identities and honors its cursor', async ({
+  db,
+}) => {
+  const { branch } = await seedEnvironmentCommandBranch(db);
+  const discovery = new BranchMaintenanceDiscoveryRepository(db);
+  expect(await discovery.findDeletingRefs({ tenantId: 'default' })).toEqual([]);
+  const maintenance = new BranchMaintenanceRepository(db);
+  const { claim } = await maintenance.claim(branch.branch_id, 'delete');
+  const refs = await discovery.findDeletingRefs({ tenantId: 'default' });
+  expect(refs).toEqual([{ tenant_id: 'default', branch_id: branch.branch_id }]);
+  expect(
+    await discovery.findDeletingRefs({ tenantId: 'default' as TenantID, after: refs[0] })
+  ).toEqual([]);
+  await maintenance.fail(claim, 'Fixture settled before dispatch');
+  expect(await discovery.findDeletingRefs({ tenantId: 'default' })).toEqual([]);
+  await expect(discovery.findDeletingRefs({})).rejects.toThrow('PostgreSQL');
+});
+
+for (const retire of [false, true]) {
+  test(`startup releases an interrupted ${retire ? 'teammate retirement' : 'metadata archive'} claim`, async ({
+    db,
+  }) => {
+    const { branch, user } = await seedEnvironmentCommandBranch(db);
+    const repo = new BranchRepository(db);
+    const maintenance = new BranchMaintenanceRepository(db);
+    if (retire)
+      await repo.update(branch.branch_id, {
+        custom_context: { teammate: { kind: 'teammate', displayName: 'Fixture' } },
+      });
+    const { claim } = retire
+      ? await maintenance.claimForTeammateRetirement(branch.branch_id, user.user_id, async () => {})
+      : await maintenance.claim(branch.branch_id, 'metadata_archive', user.user_id);
+    expect((await repo.findById(branch.branch_id))?.archived).toBe(retire);
+    expect(await maintenance.reconcileInterruptedMetadataArchives()).toEqual({
+      scanned: 1,
+      released: 1,
+    });
+    expect(await maintenance.reconcileInterruptedMetadataArchives()).toEqual({
+      scanned: 0,
+      released: 0,
+    });
+    expect(await repo.findById(branch.branch_id)).toMatchObject({
+      archived: retire,
+      path: branch.path,
+      filesystem_status: 'ready',
+    });
+    const row = await select(db)
+      .from(branches)
+      .where(eq(branches.branch_id, branch.branch_id))
+      .one();
+    expect(row?.data.maintenance).toBeUndefined();
+    await expect(maintenance.beginExecution(claim)).rejects.toThrow();
+    expect((await maintenance.claim(branch.branch_id, 'cleanup')).acquired).toBe(true);
+  });
+}
+
+for (const kind of ['delete', 'cleanup', 'workspace_write', 'metadata_archive'] as const) {
+  test(`startup retains ${kind} ownership when not safely reclaimable`, async ({ db }) => {
+    const { branch } = await seedEnvironmentCommandBranch(db);
+    const maintenance = new BranchMaintenanceRepository(db);
+    const { claim } = await maintenance.claim(branch.branch_id, kind);
+    if (kind === 'metadata_archive') {
+      // Defensive corruption guard: even this executor-ineligible kind must
+      // never release an unexpected invocation identity.
+      const row = (await select(db)
+        .from(branches)
+        .where(eq(branches.branch_id, branch.branch_id))
+        .one())!;
+      await update(db, branches)
+        .set({
+          data: {
+            ...row.data,
+            maintenance: { ...claim, execution_id: generateId() },
+          },
+        })
+        .where(eq(branches.branch_id, branch.branch_id))
+        .run();
+    }
+    expect((await maintenance.reconcileInterruptedMetadataArchives()).released).toBe(0);
+    const row = await select(db)
+      .from(branches)
+      .where(eq(branches.branch_id, branch.branch_id))
+      .one();
+    expect(row?.data.maintenance?.operation_id).toBe(claim.operation_id);
+  });
+}
+
+test('startup never releases a metadata claim behind a deletion fence', async ({ db }) => {
+  const { branch } = await seedEnvironmentCommandBranch(db);
+  const maintenance = new BranchMaintenanceRepository(db);
+  const { claim } = await maintenance.claim(branch.branch_id, 'metadata_archive');
+  await update(db, branches)
+    .set({ deletion_status: 'deletion_failed' })
+    .where(eq(branches.branch_id, branch.branch_id))
+    .run();
+  expect(await maintenance.reconcileInterruptedMetadataArchives()).toEqual({
+    scanned: 1,
+    released: 0,
+  });
+  const row = await select(db).from(branches).where(eq(branches.branch_id, branch.branch_id)).one();
+  expect(row?.data.maintenance?.operation_id).toBe(claim.operation_id);
+});
+
+for (const [guard, message] of [
+  ['primary', 'Primary teammate'],
+  ['queued', 'unfinished tasks'],
+  ['running', 'unfinished tasks'],
+  ['awaiting_permission', 'unfinished tasks'],
+  ['upload', 'upload staging'],
+  ['starting', 'environment is active'],
+  ['running-environment', 'environment is active'],
+  ['stopping', 'environment is active'],
+  ['command', 'environment is active'],
+  ['creating', 'materialization'],
+  ['deleting', 'deletion cannot be cancelled'],
+  ['deletion_failed', 'deletion cannot be cancelled'],
+  ['maintenance', 'maintenance is already in progress'],
+] as const) {
+  test(`metadata-only overlap escape retains the ${guard} guard without mutation`, async ({
+    db,
+  }) => {
+    const { branch, user } = await seedEnvironmentCommandBranch(db);
+    const repo = new BranchRepository(db);
+    const maintenance = new BranchMaintenanceRepository(db);
+    switch (guard) {
+      case 'primary':
+        await new UserPrimaryTeammateRepository(db).setPrimaryTeammate(
+          user.user_id,
+          branch.branch_id,
+          {
+            source: 'explicit',
+          }
+        );
+        break;
+      case 'queued':
+      case 'running':
+      case 'awaiting_permission':
+      case 'upload': {
+        const session = await new SessionRepository(db).create({
+          branch_id: branch.branch_id,
+          agentic_tool: 'codex',
+          created_by: user.user_id,
+        });
+        if (guard !== 'upload') {
+          await new TaskRepository(db).create({
+            session_id: session.session_id,
+            created_by: user.user_id,
+            status: guard,
+          });
+        } else {
+          const owner: UploadOwner = {
+            tenantId: 'default' as TenantID,
+            branchId: branch.branch_id,
+            sessionId: session.session_id,
+            createdBy: user.user_id,
+          };
+          const metadata: UploadMetadata = {
+            ref: `upl_${generateId()}` as UploadRef,
+            name: 'pending.txt',
+            mimeType: 'text/plain',
+            size: 4,
+            createdAt: new Date().toISOString(),
+            expiresAt: null,
+            provenance: 'browser',
+          };
+          await new UploadRepository(db).reserve(owner, metadata);
+        }
+        break;
+      }
+      case 'starting':
+      case 'running-environment':
+      case 'stopping':
+        await repo.update(branch.branch_id, {
+          environment_instance: { status: guard === 'running-environment' ? 'running' : guard },
+        });
+        break;
+      case 'command':
+        await new EnvironmentCommandRepository(db).admit({
+          branch,
+          userId: user.user_id,
+          action: 'stop',
+          attemptId: generateId(),
+        });
+        break;
+      case 'creating':
+        await repo.update(branch.branch_id, { filesystem_status: 'creating' });
+        break;
+      case 'deleting':
+      case 'deletion_failed':
+        await update(db, branches)
+          .set({ deletion_status: guard })
+          .where(eq(branches.branch_id, branch.branch_id))
+          .run();
+        break;
+      case 'maintenance':
+        await maintenance.claim(branch.branch_id, 'workspace_write');
+        break;
+    }
+    await createBranchAtPathForTest(db, {
+      repo_id: branch.repo_id,
+      name: 'guard-sibling',
+      ref: 'guard-sibling',
+      branch_unique_id: 9600008,
+      path: branch.path,
+      created_by: user.user_id,
+      filesystem_status: 'failed',
+    });
+    const before = await select(db)
+      .from(branches)
+      .where(eq(branches.branch_id, branch.branch_id))
+      .one();
+    await expect(maintenance.claim(branch.branch_id, 'metadata_archive')).rejects.toThrow(message);
+    const after = await select(db)
+      .from(branches)
+      .where(eq(branches.branch_id, branch.branch_id))
+      .one();
+    expect(after).toEqual(before);
+  });
+}
+
+const executionProcess = { pid: 4242, boot_id: 'boot-fixture', pid_namespace: 'pid:[1]' };
+
+test('a recorded executor identity is set once, before claim, for the exact invocation', async ({
+  db,
+}) => {
+  const { branch } = await seedEnvironmentCommandBranch(db);
+  const maintenance = new BranchMaintenanceRepository(db);
+  const { claim } = await maintenance.claim(branch.branch_id, 'delete');
+  const invocation = await maintenance.beginExecution(claim);
+  expect(await maintenance.recordExecutionProcess(claim, generateId(), executionProcess)).toBe(
+    false
+  );
+  expect(await maintenance.recordExecutionProcess(claim, invocation, executionProcess)).toBe(true);
+  await maintenance.claimExecution(claim, invocation);
+  // A late record after the executor claimed cannot rewrite the identity.
+  expect(
+    await maintenance.recordExecutionProcess(claim, invocation, { ...executionProcess, pid: 1 })
+  ).toBe(false);
+  const row = await select(db).from(branches).where(eq(branches.branch_id, branch.branch_id)).one();
+  expect(row?.data.maintenance?.execution_process).toEqual(executionProcess);
+});
+
+for (const stale of [false, true]) {
+  test(`a verified-exited ${stale ? 'stale-fenced' : 'running'} deletion becomes retryable and fences its old invocation`, async ({
+    db,
+  }) => {
+    const { branch } = await seedEnvironmentCommandBranch(db);
+    const maintenance = new BranchMaintenanceRepository(db);
+    const { claim } = await maintenance.claim(branch.branch_id, 'delete');
+    const invocation = await maintenance.beginExecution(claim);
+    await maintenance.recordExecutionProcess(claim, invocation, executionProcess);
+    await maintenance.claimExecution(claim, invocation);
+    if (stale) {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime(Date.now() + 10 * 60_000);
+      expect(await maintenance.markStaleDeletion(claim, 30_000)).toBe(true);
+      expect((await new BranchRepository(db).findById(branch.branch_id))?.deletion_error).toMatch(
+        /Retry unlocks once a daemon on the executor host verifies/
+      );
+      expect((await maintenance.claim(branch.branch_id, 'delete')).acquired).toBe(false);
+    }
+    expect(
+      await maintenance.releaseVerifiedExitedDeletion(branch.branch_id, generateId(), 'wrong')
+    ).toBe(false);
+    expect(
+      await maintenance.releaseVerifiedExitedDeletion(branch.branch_id, invocation, 'Exited')
+    ).toBe(true);
+    expect(
+      await maintenance.releaseVerifiedExitedDeletion(branch.branch_id, invocation, 'Again')
+    ).toBe(false);
+    expect(await new BranchRepository(db).findById(branch.branch_id)).toMatchObject({
+      deletion_status: 'deletion_failed',
+      deletion_error: 'Exited',
+    });
+    // Late DB requests from the dead invocation are rejected; a retry is admitted.
+    await expect(maintenance.withExecution(claim, invocation, async () => true)).rejects.toThrow(
+      'ownership changed'
+    );
+    const retry = await maintenance.claim(branch.branch_id, 'delete');
+    expect(retry.acquired).toBe(true);
+    expect(retry.claim.generation).toBe(claim.generation + 1);
+  });
+}
+
+test('releasing an already-finalized deletion is a no-op', async ({ db }) => {
+  const { branch } = await seedEnvironmentCommandBranch(db);
+  const maintenance = new BranchMaintenanceRepository(db);
+  expect(
+    await maintenance.releaseVerifiedExitedDeletion(generateId() as never, generateId(), 'x')
+  ).toBe(false);
+  expect(await maintenance.releaseVerifiedExitedDeletion(branch.branch_id, generateId(), 'x')).toBe(
+    false
+  );
+});
+
+test('administrator release only applies to a fenced failed deletion', async ({ db }) => {
+  const { branch } = await seedEnvironmentCommandBranch(db);
+  const maintenance = new BranchMaintenanceRepository(db);
+  await expect(
+    maintenance.forceReleaseFailedDeletion(branch.branch_id, 'Released', {})
+  ).rejects.toThrow('fenced failed deletion');
+  const { claim } = await maintenance.claim(branch.branch_id, 'delete');
+  const invocation = await maintenance.beginExecution(claim);
+  await maintenance.claimExecution(claim, invocation);
+  // Still deleting (heartbeat fresh): never released, even by an administrator.
+  await expect(
+    maintenance.forceReleaseFailedDeletion(branch.branch_id, 'Released', {
+      execution_id: invocation,
+    })
+  ).rejects.toThrow('fenced failed deletion');
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(Date.now() + 10 * 60_000);
+  await maintenance.markStaleDeletion(claim, 30_000);
+  expect(
+    await maintenance.forceReleaseFailedDeletion(branch.branch_id, 'Released', {
+      execution_id: invocation,
+    })
+  ).toMatchObject({
+    operation_id: claim.operation_id,
+    execution_id: invocation,
+  });
+  expect((await new BranchRepository(db).findById(branch.branch_id))?.deletion_error).toBe(
+    'Released'
+  );
+  await expect(maintenance.heartbeatExecution(claim, invocation)).rejects.toThrow(
+    'ownership changed'
+  );
+  expect((await maintenance.claim(branch.branch_id, 'delete')).acquired).toBe(true);
+});
+
+test('process discovery returns only deletions with a recorded executor identity', async ({
+  db,
+}) => {
+  const { branch } = await seedEnvironmentCommandBranch(db);
+  const discovery = new BranchMaintenanceDiscoveryRepository(db);
+  const maintenance = new BranchMaintenanceRepository(db);
+  const { claim } = await maintenance.claim(branch.branch_id, 'delete');
+  const invocation = await maintenance.beginExecution(claim);
+  expect(await discovery.findExecutionProcessRefs({ tenantId: 'default' })).toEqual([]);
+  await maintenance.recordExecutionProcess(claim, invocation, executionProcess);
+  const refs = await discovery.findExecutionProcessRefs({ tenantId: 'default' });
+  expect(refs).toEqual([{ tenant_id: 'default', branch_id: branch.branch_id }]);
+  expect(await discovery.findExecutionProcessRefs({ tenantId: 'default', after: refs[0] })).toEqual(
+    []
+  );
+  await maintenance.claimExecution(claim, invocation);
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(Date.now() + 10 * 60_000);
+  expect(await maintenance.markStaleDeletion(claim, 120_000)).toBe(true);
+  expect(await discovery.findExecutionProcessRefs({ tenantId: 'default' })).toEqual(refs);
+  await maintenance.releaseVerifiedExitedDeletion(branch.branch_id, invocation, 'Exited');
+  expect(await discovery.findExecutionProcessRefs({ tenantId: 'default' })).toEqual([]);
+  await expect(discovery.findExecutionProcessRefs({})).rejects.toThrow('PostgreSQL');
+});
+
+test('administrator release rechecks both the invocation and the probed process snapshot', async ({
+  db,
+}) => {
+  const { branch } = await seedEnvironmentCommandBranch(db);
+  const maintenance = new BranchMaintenanceRepository(db);
+  const { claim } = await maintenance.claim(branch.branch_id, 'delete');
+  const invocation = await maintenance.beginExecution(claim);
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(Date.now() + 10 * 60_000);
+  await maintenance.markStaleDeletion(claim, 30_000);
+  // A delayed dispatch can record an identity after the admin's read.
+  await maintenance.recordExecutionProcess(claim, invocation, executionProcess);
+  for (const expected of [
+    { execution_id: invocation },
+    { execution_id: generateId(), execution_process: executionProcess },
+    ...(['pid', 'boot_id', 'pid_namespace'] as const).map((field) => ({
+      execution_id: invocation,
+      execution_process: { ...executionProcess, [field]: field === 'pid' ? 4243 : 'different' },
+    })),
+  ]) {
+    await expect(
+      maintenance.forceReleaseFailedDeletion(branch.branch_id, 'Released', expected)
+    ).rejects.toThrow('invocation changed');
+    const row = await select(db)
+      .from(branches)
+      .where(eq(branches.branch_id, branch.branch_id))
+      .one();
+    expect(row?.data.maintenance?.execution_id).toBe(invocation);
+    expect(row?.data.maintenance?.execution_process).toEqual(executionProcess);
+  }
+  await maintenance.forceReleaseFailedDeletion(branch.branch_id, 'Released', {
+    execution_id: invocation,
+    execution_process: executionProcess,
+  });
+  expect((await maintenance.claim(branch.branch_id, 'delete')).acquired).toBe(true);
+});

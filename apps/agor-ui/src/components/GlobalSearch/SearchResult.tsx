@@ -1,0 +1,119 @@
+import { Typography, theme } from 'antd';
+import type React from 'react';
+import { HighlightMatch } from '../HighlightMatch';
+import { describeSearchResult } from './describeSearchResult';
+import type { SearchResultItem } from './types';
+
+const { Text } = Typography;
+
+interface SearchResultProps {
+  result: SearchResultItem;
+  selected: boolean;
+  onClick: () => void;
+  onHover?: () => void;
+  /** Stable DOM id so the input's aria-activedescendant can point at the row. */
+  rowId?: string;
+  /** Query tokens to highlight inside the visible title/secondary fields.
+   * Empty array (recents view, or a no-token query) disables highlighting. */
+  tokens?: string[];
+}
+
+/**
+ * Single result row in the global-search dropdown.
+ *
+ * Discriminated union by entity type → renders entity-specific icon, title,
+ * tag, secondary line, and relative time.
+ */
+export const SearchResult: React.FC<SearchResultProps> = ({
+  result,
+  selected,
+  onClick,
+  onHover,
+  rowId,
+  tokens = [],
+}) => {
+  const { token } = theme.useToken();
+  const { title, tag, secondary, time, icon } = describeSearchResult(result);
+
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      onMouseEnter={onHover}
+      aria-label={title}
+      role="option"
+      aria-selected={selected}
+      id={rowId}
+      style={{
+        display: 'flex',
+        alignItems: 'flex-start',
+        gap: 12,
+        width: '100%',
+        padding: '4px 12px',
+        border: 'none',
+        background: selected ? token.colorBgTextHover : 'transparent',
+        cursor: 'pointer',
+        textAlign: 'left',
+        borderRadius: token.borderRadiusSM,
+      }}
+    >
+      {/* Icon column is opt-in: rendered only when the entity itself has an
+          emoji (teammate `config.emoji`). For other types the section header
+          above already conveys the kind, so we drop the per-row glyph to keep
+          visual noise down. */}
+      {icon && <span style={{ fontSize: 18, lineHeight: '20px', flexShrink: 0 }}>{icon}</span>}
+      <div style={{ flex: 1, minWidth: 0 }}>
+        {/* Title row: title takes remaining width and ellipsizes; tag + time
+            stay on one line via whiteSpace:nowrap + flex-shrink:0. Plain flex
+            instead of antd Space because Space wraps each child in a div that
+            ignores parent's nowrap, which produced character-by-character
+            wrapping in the right column on long titles. */}
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'baseline',
+            gap: 8,
+            width: '100%',
+          }}
+        >
+          <Text
+            strong
+            style={{
+              flex: 1,
+              minWidth: 0,
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+            }}
+          >
+            <HighlightMatch text={title} terms={tokens} />
+          </Text>
+          {tag && (
+            <Text type="secondary" style={{ fontSize: 12, whiteSpace: 'nowrap', flexShrink: 0 }}>
+              <HighlightMatch text={tag} terms={tokens} />
+            </Text>
+          )}
+          {time && (
+            <Text type="secondary" style={{ fontSize: 12, whiteSpace: 'nowrap', flexShrink: 0 }}>
+              {time}
+            </Text>
+          )}
+        </div>
+        {secondary && (
+          <Text
+            type="secondary"
+            style={{
+              display: 'block',
+              fontSize: 12,
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+            }}
+          >
+            <HighlightMatch text={secondary} terms={tokens} />
+          </Text>
+        )}
+      </div>
+    </button>
+  );
+};

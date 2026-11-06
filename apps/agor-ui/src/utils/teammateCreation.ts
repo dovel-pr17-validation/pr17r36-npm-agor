@@ -1,0 +1,199 @@
+import {
+  type AgorClient,
+  type Board,
+  type BoardID,
+  type Branch,
+  defaultsToPublicTeammateTemplate,
+  type Repo,
+  TEAMMATE_FRAMEWORK_DEFAULT_BRANCH,
+  TEAMMATE_FRAMEWORK_REPO_URL,
+  type TeammateConfig,
+} from '@agor-live/client';
+import { slugify } from '@/utils/repoSlug';
+import { ensureTeammateWelcomeNote } from '@/utils/teammateWelcomeNote';
+
+export interface TeammateCreationInput {
+  displayName: string;
+  description?: string;
+  emoji?: string;
+  repoId: string;
+  /** Resolved destination repo, when the caller already holds it; otherwise looked up by repoId. */
+  repo?: Repo;
+  branchName?: string;
+  sourceBranch?: string;
+  /** Remote that owns sourceBranch when it differs from the destination repo. */
+  sourceRemoteUrl?: string;
+  /**
+   * Reuse an existing board for the teammate instead of creating a new one.
+   * The onboarding wizard already creates a board in its workspace step, so it
+   * passes that board here to avoid ending up with two boards for one teammate.
+   * When omitted (e.g. the CreateDialog flow), a fresh board is created.
+   */
+  boardId?: string;
+  /** Tags the teammate as onboarding-seeded so its card shows the right copy. */
+  createdViaOnboarding?: boolean;
+  /** Add the board welcome note (default true); skipped for boards that already hold work. */
+  welcomeNote?: boolean;
+  /** Never replace the board's primary; the server makes the new branch primary only if unset. */
+  keepExistingPrimary?: boolean;
+}
+
+export interface TeammateCreationDeps {
+  client: AgorClient | null;
+  repoById: Map<string, Repo>;
+  onCreateBranch: (
+    repoId: string,
+    data: {
+      name: string;
+      ref: string;
+      createBranch: boolean;
+      sourceBranch?: string;
+      sourceRemoteUrl?: string;
+      pullLatest: boolean;
+      boardId?: string;
+      custom_context?: Record<string, unknown>;
+      notes?: string | null;
+    },
+    options?: { silent?: boolean }
+  ) => Promise<Branch | null>;
+  onUpdateBranch: (
+    branchId: string,
+    updates: { board_id?: BoardID; custom_context?: Record<string, unknown>; notes?: string | null }
+  ) => void | Promise<void>;
+  /** Abort caller-owned follow-up mutations when its authenticated identity changes. */
+  shouldContinue?: () => boolean;
+}
+
+/**
+ * Whether `boardId` holds no active branch the caller can see, from a
+ * count-only read (the store holds only the loaded scopes' branches). An
+ * unknown count is false, so a welcome note never lands on a board with work.
+ */
+export async function boardHasNoActiveBranches(
+  client: AgorClient | null,
+  boardId: string
+): Promise<boolean> {
+  if (!client) return false;
+  try {
+    const found = await client
+      .service('branches')
+      .find({ query: { board_id: boardId, archived: false, $limit: 0 } });
+    return !Array.isArray(found) && found.total === 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Shared teammate creation logic used by CreateDialog (via App.tsx).
+ *
+ * Flow: resolve repo → create board → create branch → tag branch with
+ * teammate metadata → designate the branch as the board primary.
+ */
+export async function createTeammateBranch(
+  input: TeammateCreationInput,
+  deps: TeammateCreationDeps
+): Promise<Branch | null> {
+  const shouldContinue = deps.shouldContinue ?? (() => true);
+  if (!shouldContinue()) return null;
+
+  const repo =
+    (input.repo?.repo_id === input.repoId ? input.repo : undefined) ??
+    deps.repoById.get(input.repoId);
+  const branchName = input.branchName || `private-${slugify(input.displayName)}`;
+  // Like personas, a blank teammate on a github.com private fork starts from the public template, readable without a token.
+  const readPublicTemplate =
+    !input.sourceBranch?.trim() &&
+    !input.sourceRemoteUrl &&
+    !!repo &&
+    defaultsToPublicTeammateTemplate(repo);
+  // Otherwise preserve omission: the executor distinguishes a template default
+  // from an explicit user ref (even when the user typed the default branch name).
+  const source = readPublicTemplate
+    ? {
+        sourceBranch: TEAMMATE_FRAMEWORK_DEFAULT_BRANCH,
+        sourceRemoteUrl: TEAMMATE_FRAMEWORK_REPO_URL,
+      }
+    : {
+        sourceBranch: input.sourceBranch?.trim() || undefined,
+        ...(input.sourceRemoteUrl ? { sourceRemoteUrl: input.sourceRemoteUrl } : {}),
+      };
+
+  if (!deps.client) {
+    throw new Error('Not connected');
+  }
+
+  const displayName = input.displayName.trim() || 'My Teammate';
+  // Reuse the caller's board (onboarding) or create a fresh one (CreateDialog).
+  let boardId: string;
+  if (input.boardId) {
+    boardId = input.boardId;
+  } else {
+    if (!shouldContinue()) return null;
+    const newBoard = (await deps.client.service('boards').create({
+      name: `${displayName}'s Board`,
+      icon: input.emoji || '\u{1F916}',
+    })) as Board;
+    if (!shouldContinue()) return null;
+    boardId = newBoard.board_id;
+  }
+
+  if (!shouldContinue()) return null;
+  if (input.welcomeNote !== false) {
+    await ensureTeammateWelcomeNote({
+      client: deps.client,
+      boardId,
+      teammateName: displayName,
+      teammateEmoji: input.emoji,
+    });
+    if (!shouldContinue()) return null;
+  }
+
+  const teammateConfig: TeammateConfig = {
+    kind: 'teammate',
+    displayName: input.displayName.trim(),
+    emoji: input.emoji || undefined,
+    frameworkRepo: repo?.slug,
+    createdViaOnboarding: input.createdViaOnboarding ?? false,
+  };
+
+  // Create the branch with teammate metadata on the initial row. That keeps
+  // the board card consistent immediately and avoids a race where a later
+  // executor readiness patch can arrive before the UI sees the metadata patch.
+  const branch = await deps.onCreateBranch(
+    input.repoId,
+    {
+      name: branchName,
+      ref: branchName,
+      createBranch: true,
+      ...source,
+      pullLatest: true,
+      boardId,
+      custom_context: { teammate: teammateConfig },
+      ...(input.description?.trim() ? { notes: input.description.trim() } : {}),
+    },
+    // Suppress the generic "Branch created" toast; teammate creation surfaces its
+    // own completion feedback.
+    { silent: true }
+  );
+  if (!shouldContinue()) return null;
+
+  if (branch) {
+    // Assign to board (if not already passed via boardId above)
+    if (boardId && !branch.board_id) {
+      await deps.onUpdateBranch(branch.branch_id, {
+        board_id: boardId as BoardID,
+      });
+      if (!shouldContinue()) return null;
+    }
+    if (boardId && !input.keepExistingPrimary) {
+      if (!shouldContinue()) return null;
+      await deps.client
+        ?.service('boards')
+        .setPrimaryTeammate({ boardId, branchId: branch.branch_id });
+      if (!shouldContinue()) return null;
+    }
+  }
+
+  return branch;
+}

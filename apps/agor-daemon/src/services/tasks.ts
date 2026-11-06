@@ -1,0 +1,2133 @@
+/**
+ * Tasks Service
+ *
+ * Provides REST + WebSocket API for task management.
+ * Uses DrizzleService adapter with TaskRepository.
+ */
+
+import {
+  isHostedOpenCodeProvider,
+  resolveOpenCodeCapabilities,
+} from '@agor/agentic-tool-opencode/daemon';
+import { analyticsLogger } from '@agor/core/analytics';
+import {
+  type ChildCompletionContext,
+  renderChildCompletionCallback,
+} from '@agor/core/callbacks/child-completion-template';
+import {
+  PAGINATION,
+  resolveExecutorHeartbeatConfig,
+  resolveSdkWatchdogConfig,
+  TASK_PAGINATION,
+} from '@agor/core/config';
+import {
+  assertTenantWritable,
+  type CurrentTaskExecutorSessionTokenAuthority,
+  type ExecutorLaunchAuthority,
+  enqueueAfterTenantDatabaseCommit,
+  enqueueTenantDatabasePostCommitCallback,
+  getCurrentTenantId,
+  getPostgresSqlState,
+  isPostgresDatabaseHandle,
+  MAX_OPENCODE_CLEANUP_OBJECTS,
+  OpenCodeCheckpointRepository,
+  runWithTenantContext,
+  runWithTenantDatabaseScope,
+  SessionRepository,
+  shortId,
+  type TaskDispatchClaimResult,
+  TaskRepository,
+  type TaskRuntimeAuthorityScope,
+  type TaskTerminationCoordinationClaimInput,
+  type TaskTerminationCoordinationClaimResult,
+  type TenantScopeAwareDatabase,
+  type TerminationClaimInput,
+  type TerminationClaimResult,
+  type TerminationSettlementInput,
+  type TerminationSettlementResult,
+  UsersRepository,
+} from '@agor/core/db';
+import { type Application, BadRequest, Conflict, Forbidden } from '@agor/core/feathers';
+import { isValidUUID } from '@agor/core/ids';
+import { deriveTitleFromPrompt } from '@agor/core/sessions';
+import { escapePromptProvenanceSentinels } from '@agor/core/templates/prompt-provenance';
+import type {
+  AuthenticatedParams,
+  BranchID,
+  CancelQueuedTasksInput,
+  ContentBlock,
+  ExecutorInterruptionInput,
+  ExecutorTerminationCompleteInput,
+  MessageID,
+  OpenCodeCheckpointAdmission,
+  OpenCodeCheckpointBeginInput,
+  OpenCodeCheckpointCleanupInput,
+  OpenCodeCheckpointCompletion,
+  Paginated,
+  QueryParams,
+  ReorderQueuedTasksInput,
+  RuntimeTelemetryInput,
+  SdkFailure,
+  SdkHealthFailureInput,
+  Session,
+  SessionID,
+  Task,
+  TaskID,
+  TaskPendingDispatchStatus,
+  TaskQueueMutationResult,
+  UUID,
+} from '@agor/core/types';
+import {
+  AUTHORIZATION_REVOKED_TERMINATION_MESSAGE,
+  ExecutorPulseKind,
+  isTerminalTaskStatus,
+  SDK_WATCHDOG_FAILURE_REASONS,
+  type TaskMetadata,
+  TaskStatus,
+} from '@agor/core/types';
+import { DrizzleService, type Query } from '../adapters/drizzle';
+import { authenticatedTaskExecutorRuntimeAuthority } from '../auth/executor-runtime-scope.js';
+import { getDaemonMetrics } from '../metrics/index.js';
+import {
+  recordDispatchClaim,
+  recordExecutorConnected,
+  recordTaskSettlement,
+} from '../metrics/task-lifecycle.js';
+import {
+  beginExecutorTermination,
+  requestExecutorTermination,
+} from '../termination-coordinator.js';
+import { appendSystemMessage } from '../utils/append-system-message.js';
+import { completionCallbackTaskId } from '../utils/durable-task-id.js';
+import { emitServiceEvent } from '../utils/emit-service-event.js';
+import type { ExecutorCleanupCommandResult } from '../utils/executor-cleanup-command.js';
+import {
+  type ExecutorHeartbeatCallbackPayload,
+  ExecutorHeartbeatCallbackRunner,
+} from '../utils/executor-heartbeat-callback.js';
+import { ensureRepoOriginAlignedById } from '../utils/realign-repo-origin';
+import { taskFailureAnalytics } from '../utils/task-failure-analytics.js';
+import { deferWithTenantContext, withFreshTenantWrite } from '../utils/tenant-db-scope.js';
+import type { SessionParams, SessionsService } from './sessions';
+
+/** Internal settlement input; cleanup evidence is not persisted or accepted in Task patches. */
+export type TaskTerminationSettlementInput = TerminationSettlementInput & {
+  cleanupResult?: ExecutorCleanupCommandResult;
+};
+
+export interface TaskExecutorCredentialRevoker {
+  revokeTaskTokens(taskId: string): Promise<number>;
+  isTaskTokenAuthorityCurrent?(input: CurrentTaskExecutorSessionTokenAuthority): Promise<boolean>;
+}
+
+/**
+ * Task service params
+ */
+const COMPLETION_SIDE_EFFECT_TASK_STATUSES = new Set<Task['status']>([
+  TaskStatus.COMPLETED,
+  TaskStatus.FAILED,
+  TaskStatus.STOPPED,
+]);
+
+function isAnalyticsTerminalTaskStatus(status: Task['status'] | undefined): boolean {
+  return isTerminalTaskStatus(status);
+}
+
+function isCompletionSideEffectTaskStatus(status: Task['status'] | undefined): boolean {
+  return status !== undefined && COMPLETION_SIDE_EFFECT_TASK_STATUSES.has(status);
+}
+
+function elapsedMs(from: string | undefined, to: string | undefined): number | 'none' {
+  if (!from || !to) return 'none';
+  const ms = Date.parse(to) - Date.parse(from);
+  return Number.isFinite(ms) ? ms : 'none';
+}
+
+/**
+ * Detection facts for a winning termination claim. Ages are measured against
+ * the durable request time so daemon clock skew cannot distort them.
+ * `error_message` is deliberately omitted: a user Stop reason can reach it.
+ */
+function terminationRequestDiagnostics(task: Task): string {
+  const request = task.termination_request;
+  const pulse = task.latest_executor_pulse;
+  return (
+    `session_id=${shortId(task.session_id)} ` +
+    `executor_connected=${task.executor_connected_at ? 'true' : 'false'} ` +
+    `heartbeat_age_ms=${elapsedMs(task.last_executor_heartbeat_at, request?.requested_at)} ` +
+    `last_pulse=${pulse?.kind ?? 'none'} ` +
+    `last_pulse_age_ms=${elapsedMs(pulse?.observed_at, request?.requested_at)} ` +
+    `sdk_failure=${task.sdk_failure?.reason ?? 'none'}`
+  );
+}
+
+function terminationSettlementDiagnostics(task: Task): string {
+  const request = task.termination_request;
+  return (
+    `session_id=${shortId(task.session_id)} ` +
+    `cause=${request?.cause ?? 'unknown'} ` +
+    `containment=${task.sdk_failure?.termination ?? 'unknown'} ` +
+    `executor_quiesced=${request?.executor_quiesced_at ? 'true' : 'false'} ` +
+    `request_to_settle_ms=${elapsedMs(request?.requested_at, task.completed_at)}`
+  );
+}
+
+const TASK_SORT_FIELDS = new Set([
+  'task_id',
+  'session_id',
+  'status',
+  'created_at',
+  'created_by',
+  'queue_position',
+]);
+
+/**
+ * Public Task transport surface. `update` is deliberately absent so whole-row
+ * `PUT` never reaches the inherited DrizzleService implementation.
+ */
+export const TASKS_SERVICE_TRANSPORT_METHODS = [
+  'find',
+  'get',
+  'create',
+  'patch',
+  'remove',
+  'cancelQueued',
+  'reorderQueued',
+  'connectExecutor',
+  'reportTerminationComplete',
+  'reportExecutorInterruption',
+  'reportRuntimeTelemetry',
+  'reportSdkHealthFailure',
+  'beginOpenCodeCheckpoint',
+  'acknowledgeOpenCodeCleanup',
+] as const;
+
+export type TaskParams = QueryParams<{
+  task_id?:
+    | string
+    | {
+        $gt?: string;
+        $lte: string;
+      };
+  session_id?: string;
+  status?: Task['status'];
+  created_by?: string;
+}> &
+  AuthenticatedParams & {
+    /**
+     * Internal-only: terminal task patches normally drain queued work for the
+     * owning session. Heartbeat-loss handling must not auto-start queued prompts.
+     */
+    suppressTerminalQueueProcessing?: boolean;
+    /**
+     * Internal-only escape hatch for preserving an ephemeral BTW fork after
+     * terminal transition. Most callers should leave this unset.
+     */
+    suppressBtwCleanup?: boolean;
+    /** Internal RBAC SQL pushdown marker set by register-hooks for external regular users. */
+    _agorSqlSessionAccessUserId?: UUID;
+  };
+
+interface CompletionCallbackDispatchResult {
+  callbackTask?: Task;
+}
+
+/**
+ * Extended tasks service with custom methods
+ */
+export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams> {
+  private taskRepo: TaskRepository;
+  private app: Application;
+  private db: TenantScopeAwareDatabase;
+  private heartbeatCallbackRunner: ExecutorHeartbeatCallbackRunner;
+  private completionCallbackDispatches = new Map<
+    string,
+    Promise<CompletionCallbackDispatchResult>
+  >();
+
+  constructor(
+    db: TenantScopeAwareDatabase,
+    app: Application,
+    private readonly executorCredentialRevoker?: TaskExecutorCredentialRevoker
+  ) {
+    const taskRepo = new TaskRepository(db);
+    super(taskRepo, {
+      id: 'task_id',
+      resourceType: 'Task',
+      paginate: {
+        default: PAGINATION.DEFAULT_LIMIT,
+        max: PAGINATION.MAX_LIMIT,
+      },
+      multi: ['patch'],
+    });
+
+    this.taskRepo = taskRepo;
+    this.app = app;
+    this.db = db;
+    const heartbeatConfig = resolveExecutorHeartbeatConfig(app.get?.('config')?.execution);
+    this.heartbeatCallbackRunner = new ExecutorHeartbeatCallbackRunner(heartbeatConfig);
+  }
+
+  async cancelQueued(
+    data: CancelQueuedTasksInput,
+    params?: TaskParams
+  ): Promise<TaskQueueMutationResult> {
+    return this.manageQueue(data, false, params);
+  }
+
+  async reorderQueued(
+    data: ReorderQueuedTasksInput,
+    params?: TaskParams
+  ): Promise<TaskQueueMutationResult> {
+    return this.manageQueue(data, true, params);
+  }
+
+  private async manageQueue(
+    data: CancelQueuedTasksInput | ReorderQueuedTasksInput,
+    reorder: boolean,
+    params?: TaskParams
+  ): Promise<TaskQueueMutationResult> {
+    const validIds = (ids: unknown): ids is TaskID[] =>
+      Array.isArray(ids) &&
+      ids.every((id) => typeof id === 'string' && isValidUUID(id)) &&
+      new Set(ids).size === ids.length;
+    if (
+      !data ||
+      !isValidUUID(data.session_id) ||
+      !validIds(data.task_ids) ||
+      (!reorder && data.task_ids.length === 0) ||
+      (reorder && (!('expected_task_ids' in data) || !validIds(data.expected_task_ids)))
+    ) {
+      throw new BadRequest(
+        'Queue commands require a session UUID and unique full task UUIDs; reorder also requires expected_task_ids'
+      );
+    }
+    const result = await this.taskRepo.mutateQueued(
+      data.session_id,
+      reorder
+        ? { order: data.task_ids, expected: (data as ReorderQueuedTasksInput).expected_task_ids }
+        : { cancel: data.task_ids }
+    );
+    if (result.outcome === 'conflict') {
+      throw new Conflict(
+        'Queue changed or IDs are not queued in this session. Reread queued tasks and retry with the current order.',
+        { code: 'TASK_QUEUE_CONFLICT', session_id: data.session_id }
+      );
+    }
+    for (const task of reorder ? result.queue : result.removed) {
+      emitServiceEvent(this.app, {
+        path: 'tasks',
+        event: reorder ? 'patched' : 'removed',
+        data: task,
+        id: task.task_id,
+        params,
+      });
+    }
+    if (result.wake) {
+      // Postcommit, tenant-bound wakeup only. Never resume a failure-held queue
+      // or run completion side effects for prompts that were merely removed.
+      deferWithTenantContext(params, () =>
+        (this.app.service('sessions') as unknown as SessionsService).triggerQueueProcessing(
+          data.session_id,
+          { ...params, provider: undefined } as SessionParams
+        )
+      );
+    }
+    return {
+      session_id: data.session_id,
+      queue: result.queue.map(({ task_id, queue_position }) => ({ task_id, queue_position })),
+      cancelled_task_ids: result.removed.map((task) => task.task_id),
+    };
+  }
+
+  /** Atomic daemon-side launch-intent fence plus its Session projection. */
+  async claimDispatchAndProjectSession(
+    taskId: string,
+    expectedStatus: TaskPendingDispatchStatus,
+    updates: Partial<Task>,
+    params?: TaskParams
+  ): Promise<TaskDispatchClaimResult> {
+    const result = await this.taskRepo.claimDispatchAndProjectSession(
+      taskId,
+      expectedStatus,
+      updates
+    );
+    recordDispatchClaim(getDaemonMetrics(this.app), result);
+    if (result.outcome === 'claimed' || result.outcome === 'actor_missing') {
+      emitServiceEvent(this.app, {
+        path: 'tasks',
+        event: 'patched',
+        data: result.task,
+        params,
+        id: result.task.task_id,
+      });
+    }
+    return result;
+  }
+
+  /**
+   * Keep broad Task lists bounded in SQL. Exact Session hydration remains
+   * complete through the shared client's verified Task-ID keyset loop.
+   */
+  async find(params?: TaskParams): Promise<Task[] | Paginated<Task>> {
+    const query = (params?.query ?? {}) as Query;
+    if (query.$limit !== undefined && (!Number.isSafeInteger(query.$limit) || query.$limit < 0)) {
+      throw new BadRequest('$limit must be a finite non-negative integer');
+    }
+    const { limit, skip } = this.pageWindow(query);
+    if (!Number.isSafeInteger(skip) || skip < 0) {
+      throw new BadRequest('$skip must be a finite non-negative integer');
+    }
+    const sort = query.$sort;
+    if (sort) {
+      for (const [field, direction] of Object.entries(sort)) {
+        if (!TASK_SORT_FIELDS.has(field)) throw new BadRequest(`Unsupported $sort field: ${field}`);
+        if (direction !== 1 && direction !== -1) {
+          throw new BadRequest(`$sort direction for ${field} must be 1 or -1`);
+        }
+      }
+    }
+    if (query.updated_at !== undefined) {
+      throw new BadRequest('updated_at is not a Task field');
+    }
+
+    const pageOptions: Parameters<TaskRepository['findPage']>[0] = {
+      limit,
+      skip,
+      sort,
+      selectTaskIdOnly:
+        Array.isArray(query.$select) &&
+        query.$select.length === 1 &&
+        query.$select[0] === 'task_id',
+    };
+    const sessionId = query.session_id;
+    if (skip > PAGINATION.MAX_LIMIT && typeof sessionId !== 'string') {
+      throw new BadRequest('Deep Task pagination requires an exact session_id filter');
+    }
+    if (typeof query.task_id === 'string') {
+      pageOptions.taskId = query.task_id as TaskID;
+    } else if (query.task_id && typeof query.task_id === 'object' && '$in' in query.task_id) {
+      // A page of one Session's dispatch order (the lean transcript).
+      const ids = query.task_id.$in;
+      if (
+        typeof sessionId !== 'string' ||
+        !Array.isArray(ids) ||
+        ids.length > TASK_PAGINATION.MAX_TASK_IDS ||
+        !ids.every((id: unknown) => typeof id === 'string')
+      ) {
+        throw new BadRequest('task_id $in requires an exact session_id and a bounded ID list');
+      }
+      pageOptions.taskIds = ids as TaskID[];
+    } else if (query.task_id && typeof query.task_id === 'object') {
+      if (typeof sessionId !== 'string') {
+        throw new BadRequest('Task hydration cursors require an exact session_id filter');
+      }
+      if (typeof query.task_id.$gt === 'string') {
+        pageOptions.afterTaskId = query.task_id.$gt as TaskID;
+      }
+      if (typeof query.task_id.$lte !== 'string') {
+        throw new BadRequest('Task hydration cursor requires a $lte boundary');
+      }
+      pageOptions.throughTaskId = query.task_id.$lte as TaskID;
+    }
+    if (typeof sessionId === 'string') {
+      pageOptions.sessionId = sessionId as SessionID;
+    } else if (
+      sessionId &&
+      typeof sessionId === 'object' &&
+      Array.isArray(sessionId.$in) &&
+      sessionId.$in.every((value: unknown) => typeof value === 'string')
+    ) {
+      pageOptions.sessionIds = sessionId.$in as SessionID[];
+    }
+    if (query.status && typeof query.status === 'object' && '$ne' in query.status) {
+      if (query.status.$ne !== TaskStatus.QUEUED)
+        throw new BadRequest('Only queued status exclusion is supported');
+      pageOptions.excludeQueued = true;
+    }
+    if (typeof query.status === 'string') pageOptions.status = query.status as Task['status'];
+    if (typeof query.created_at === 'number' && Number.isFinite(query.created_at)) {
+      pageOptions.createdAt = new Date(query.created_at);
+    }
+    if (typeof query.created_by === 'string') pageOptions.createdBy = query.created_by as UUID;
+    if (params?._agorSqlSessionAccessUserId) {
+      pageOptions.visibleToUserId = params._agorSqlSessionAccessUserId;
+    }
+
+    const page = await this.taskRepo.findPage(pageOptions);
+    return {
+      total: page.total,
+      limit,
+      skip,
+      data: pageOptions.selectTaskIdOnly
+        ? (page.data as Task[])
+        : (this.selectFields(page.data as Task[], query.$select) as Task[]),
+    };
+  }
+
+  /**
+   * Override create to atomically update session status when task is created with RUNNING status
+   */
+  async create(data: Partial<Task>, params?: TaskParams): Promise<Task | Task[]> {
+    console.log(
+      `🔍 [TasksService.create] Called with status: ${data.status}, TaskStatus.RUNNING: ${TaskStatus.RUNNING}`
+    );
+    const result = await super.create(data, params);
+    console.log(
+      `🔍 [TasksService.create] Result is array: ${Array.isArray(result)}, this.app exists: ${!!this.app}`
+    );
+
+    if (!Array.isArray(result)) {
+      await this.autoTitleSession(result, params);
+    }
+
+    // If task is created with RUNNING status, atomically update session status to RUNNING
+    // NOTE: create() always returns a single Task (not an array) in practice
+    if (data.status === TaskStatus.RUNNING && !Array.isArray(result) && this.app) {
+      console.log(`🔍 [TasksService.create] ENTERING session status update block`);
+      console.log(`🔍 [TasksService.create] About to patch session ${shortId(result.session_id)}`);
+      try {
+        const patchResult = await this.app.service('sessions').patch(
+          result.session_id,
+          {
+            status: 'running',
+            ready_for_prompt: false,
+          },
+          params
+        );
+
+        console.log(
+          `✅ [TasksService] Session ${shortId(result.session_id)} status updated to RUNNING (task ${shortId(result.task_id)} created)`,
+          `Patch result status: ${patchResult.status}`
+        );
+      } catch (error) {
+        console.error('❌ [TasksService] Failed to update session status to RUNNING:', error);
+      }
+    }
+
+    if (!Array.isArray(result)) {
+      this.trackTaskCreated(result);
+      if (result.status === TaskStatus.RUNNING) {
+        this.trackTaskStarted(result);
+      }
+    }
+
+    return result;
+  }
+
+  /**
+   * Assign the deterministic title as soon as an eligible textual task exists.
+   *
+   * The prompt route also calls this after its repository-level pending-task
+   * insert, which deliberately bypasses create() to own queue positioning.
+   */
+  async autoTitleSession(task: Task, params?: TaskParams): Promise<void> {
+    if (!task.full_prompt) return;
+
+    const autoTitle = deriveTitleFromPrompt(task.full_prompt);
+    if (!autoTitle) return;
+
+    try {
+      const fresh = await this.app.service('sessions').get(task.session_id, params);
+      // null/undefined means unset. An empty string is an explicit user choice.
+      if (fresh.title == null) {
+        // Keep trusted metadata separate from prompt-flow patches so external
+        // collaborators do not need permission to edit session metadata.
+        await this.app
+          .service('sessions')
+          .patch(task.session_id, { title: autoTitle }, { ...params, provider: undefined });
+      }
+    } catch (titleError) {
+      const message = titleError instanceof Error ? titleError.message : String(titleError);
+      console.warn(
+        `⚠️  [TasksService] Auto-title failed for session ${shortId(task.session_id)}: ${message}`
+      );
+    }
+  }
+
+  private baseTaskAnalyticsProperties(task: Task): Record<string, unknown> {
+    return {
+      task_id: task.task_id,
+      session_id: task.session_id,
+      status: task.status,
+      model: task.model ?? task.normalized_sdk_response?.primaryModel ?? null,
+      queue_position: task.queue_position ?? null,
+      recorded_tool_count: task.recorded_tool_count ?? null,
+      is_callback: task.metadata?.is_agor_callback === true,
+      source: task.metadata?.source ?? null,
+    };
+  }
+
+  private trackTaskCreated(task: Task): void {
+    analyticsLogger.track('task.created', this.baseTaskAnalyticsProperties(task), {
+      userId: task.created_by,
+    });
+  }
+
+  private trackTaskStarted(task: Task): void {
+    analyticsLogger.track(
+      'task.started',
+      {
+        ...this.baseTaskAnalyticsProperties(task),
+        started_at: task.started_at ?? null,
+      },
+      { userId: task.created_by }
+    );
+  }
+
+  private trackTaskCompleted(task: Task, cleanupResult?: ExecutorCleanupCommandResult): void {
+    recordTaskSettlement(getDaemonMetrics(this.app), task);
+    const normalized = task.normalized_sdk_response;
+    analyticsLogger.track(
+      'task.completed',
+      {
+        ...this.baseTaskAnalyticsProperties(task),
+        completed_at: task.completed_at ?? null,
+        duration_ms: task.duration_ms ?? normalized?.durationMs ?? null,
+        input_tokens: normalized?.tokenUsage?.inputTokens ?? null,
+        output_tokens: normalized?.tokenUsage?.outputTokens ?? null,
+        total_tokens: normalized?.tokenUsage?.totalTokens ?? null,
+        cost_usd: normalized?.costUsd ?? null,
+        context_window_limit: normalized?.contextWindowLimit ?? null,
+        context_window_percentage: normalized?.contextUsageSnapshot?.percentage ?? null,
+        has_error: Boolean(task.error_message),
+        ...taskFailureAnalytics(task, cleanupResult),
+      },
+      { userId: task.created_by }
+    );
+  }
+
+  async getActiveWithExecutorHeartbeat(): Promise<Task[]> {
+    return this.taskRepo.findActiveWithExecutorHeartbeat();
+  }
+
+  async claimTermination(
+    input: TerminationClaimInput,
+    params?: TaskParams
+  ): Promise<TerminationClaimResult> {
+    const result = await this.taskRepo.claimTermination(input);
+    const claimed = result.outcome === 'claimed';
+    const retryingActiveRequest =
+      result.outcome === 'unchanged' &&
+      result.task.status === TaskStatus.STOPPING &&
+      !!result.task.termination_request &&
+      !result.task.termination_request.executor_quiesced_at;
+    if (!claimed && !retryingActiveRequest) return result;
+
+    await this.runAfterTenantDatabaseCommit('publish termination claim', async () => {
+      if (claimed) {
+        console.log(
+          `[task.termination] event=request_committed task_id=${shortId(result.task.task_id)} ` +
+            `cause=${result.task.termination_request?.cause ?? 'unknown'} ` +
+            `mode=${result.task.executor_mode ?? 'local'} ` +
+            terminationRequestDiagnostics(result.task)
+        );
+        emitServiceEvent(this.app, {
+          path: 'tasks',
+          event: 'patched',
+          data: result.task,
+          id: result.task.task_id,
+          params,
+        });
+      }
+      // A repeated claim keeps the original requested_at fence but
+      // re-publishes the private control event. This makes Stop retryable
+      // after a lost socket delivery without creating a new cancellation
+      // epoch.
+      emitServiceEvent(this.app, {
+        path: 'tasks',
+        event: 'termination_requested',
+        data: result.task,
+        id: result.task.task_id,
+        method: 'patch',
+        params,
+      });
+      if (claimed) {
+        const session = await this.app
+          .service('sessions')
+          .get(result.task.session_id, { ...(params ?? {}), provider: undefined });
+        emitServiceEvent(this.app, {
+          path: 'sessions',
+          event: 'patched',
+          data: session,
+          id: session.session_id,
+          params,
+        });
+      }
+    });
+    return result;
+  }
+
+  async claimTerminationCoordination(
+    input: TaskTerminationCoordinationClaimInput,
+    params?: TaskParams
+  ): Promise<TaskTerminationCoordinationClaimResult> {
+    const result = await this.taskRepo.claimTerminationCoordination(input);
+    if (result.outcome === 'claimed') {
+      await this.runAfterTenantDatabaseCommit('publish termination coordination', async () => {
+        emitServiceEvent(this.app, {
+          path: 'tasks',
+          event: 'patched',
+          data: result.task,
+          id: result.task.task_id,
+          params,
+        });
+      });
+    }
+    return result;
+  }
+
+  /** Internal only; the authenticated Stop route owns retry authorization. */
+  async retryTermination(
+    taskId: string,
+    requestedAt: string,
+    revision: string,
+    params?: TaskParams
+  ): Promise<Task | null> {
+    const task = await this.taskRepo.retryTermination(taskId, requestedAt, revision);
+    if (task) await this.publishRecoveryTask(task, params);
+    return task;
+  }
+
+  async beginCleanupAttempt(
+    taskId: string,
+    claimToken: string,
+    params?: TaskParams
+  ): Promise<Task | null> {
+    const task = await this.taskRepo.beginCleanupAttempt(taskId, claimToken);
+    if (task) await this.publishRecoveryTask(task, params);
+    return task;
+  }
+
+  private async publishRecoveryTask(task: Task, params?: TaskParams): Promise<void> {
+    await this.runAfterTenantDatabaseCommit('publish cleanup progress', async () => {
+      emitServiceEvent(this.app, {
+        path: 'tasks',
+        event: 'patched',
+        data: task,
+        id: task.task_id,
+        params,
+      });
+    });
+  }
+
+  async settleTermination(
+    input: TaskTerminationSettlementInput,
+    params?: TaskParams
+  ): Promise<TerminationSettlementResult> {
+    const { cleanupResult, ...settlementInput } = input;
+    const result = await this.taskRepo.settleTermination(settlementInput);
+    // Repository settlement is used by cooperative stop, watchdog, startup
+    // reconciliation, and force-fail paths. It must retire the same exact Task
+    // lease as a normal executor terminal patch.
+    await this.retireTaskExecutorCredentials(result.task);
+    if (result.outcome !== 'transitioned' && result.outcome !== 'unverified') return result;
+
+    await this.runAfterTenantDatabaseCommit('publish termination settlement', async () => {
+      if (result.outcome === 'unverified') {
+        getDaemonMetrics(this.app).increment('executor.cleanup_failures', 1, {
+          mode: result.task.executor_mode ?? 'local',
+          helper_configured: !!this.app.get('config')?.execution?.executor_cleanup_command_template,
+          helper_attempted: !!result.task.termination_request?.cleanup_attempt,
+        });
+        console.warn(
+          `[task.termination] event=settled task_id=${shortId(result.task.task_id)} ` +
+            `outcome=unverified mode=${result.task.executor_mode ?? 'local'} ` +
+            terminationSettlementDiagnostics(result.task)
+        );
+      } else {
+        console.log(
+          `[task.termination] event=settled task_id=${shortId(result.task.task_id)} ` +
+            `outcome=${result.task.status} mode=${result.task.executor_mode ?? 'local'} ` +
+            terminationSettlementDiagnostics(result.task)
+        );
+      }
+      emitServiceEvent(this.app, {
+        path: 'tasks',
+        event: 'patched',
+        data: result.task,
+        id: result.task.task_id,
+        params,
+      });
+      if (result.outcome === 'unverified') {
+        // Failure to contain is not completion: the task is still stopping.
+        // Emit only after the winning fenced write and tenant-bound publication.
+        analyticsLogger.track(
+          'task.termination_unverified',
+          {
+            ...this.baseTaskAnalyticsProperties(result.task),
+            succeeded: false,
+            failure_reason: 'termination_unverified',
+          },
+          { userId: result.task.created_by }
+        );
+        return;
+      }
+
+      this.trackTaskCompleted(
+        result.task,
+        input.outcome === 'verified_absent' ? cleanupResult : undefined
+      );
+      const internalParams = { ...(params ?? {}), provider: undefined } as TaskParams;
+      const isStop = result.task.status === TaskStatus.STOPPED;
+      const completionParams = {
+        ...internalParams,
+        // Avoid a second eager hand-off from the settlement path. The durable
+        // all-daemon queue worker will independently reevaluate the committed
+        // Task outcome and Session projection; user Stop may still delegate
+        // an immediate hand-off to its caller while the Session lock is held.
+        suppressTerminalQueueProcessing:
+          !isStop || params?.suppressTerminalQueueProcessing === true,
+      };
+      // The repository committed the authoritative Task settlement and
+      // minimal Session projection atomically. Post-commit work must never
+      // patch that projection again: a new Task may already have claimed the
+      // Session, and an unconditional retry here would clobber
+      // RUNNING/ready=false.
+      await this.processTerminalTaskTransition(result.task, result.task.status, completionParams);
+    });
+    return result;
+  }
+
+  private async handleExecutorHeartbeat(task: Task, heartbeatAt: string): Promise<void> {
+    const payload: ExecutorHeartbeatCallbackPayload = {
+      event: 'executor_heartbeat',
+      task_id: task.task_id,
+      session_id: task.session_id,
+      last_executor_heartbeat_at: heartbeatAt,
+    };
+
+    try {
+      const branchId = await this.findHeartbeatBranchId(task.session_id);
+      if (branchId) payload.branch_id = branchId;
+    } catch (error) {
+      console.warn(
+        `⚠️  [TasksService] Could not resolve branch_id for heartbeat task ${shortId(task.task_id)}:`,
+        error instanceof Error ? error.message : String(error)
+      );
+    }
+
+    this.heartbeatCallbackRunner.run(payload);
+  }
+
+  /**
+   * The opt-in heartbeat callback needs only the Session's branch pointer.
+   * Re-enter a fresh tenant DB unit after the heartbeat request commits and
+   * avoid a fully enriched Feathers sessions.get on every ten-second tick.
+   */
+  private async findHeartbeatBranchId(sessionId: string): Promise<BranchID | null> {
+    const tenantId = getCurrentTenantId();
+    if (!tenantId) throw new Error('Missing tenant context for executor heartbeat callback');
+    return runWithTenantDatabaseScope(this.db, tenantId, (tenantDb) =>
+      new SessionRepository(tenantDb).findBranchIdBySessionId(sessionId)
+    );
+  }
+
+  private async runAfterTenantDatabaseCommit(
+    label: string,
+    work: () => Promise<void>,
+    scope: 'database' | 'identity' = 'database'
+  ): Promise<void> {
+    const tenantId = getCurrentTenantId();
+    const run = async () => {
+      try {
+        if (scope === 'identity' && tenantId) await runWithTenantContext(tenantId, work);
+        else await work();
+      } catch (error) {
+        console.warn(
+          `[tasks.after_commit] operation=${label} sqlstate=${getPostgresSqlState(error) ?? 'unknown'} outcome=failed`
+        );
+      }
+    };
+
+    // Identity-only fanout must open separate short DB units, not inherit a
+    // fresh transaction spanning parent-message injection and Git I/O.
+    const queued =
+      scope === 'identity'
+        ? enqueueAfterTenantDatabaseCommit(run)
+        : enqueueTenantDatabasePostCommitCallback(run);
+    if (queued) {
+      return;
+    }
+
+    await run();
+  }
+
+  private async retireTaskExecutorCredentials(task: Task): Promise<void> {
+    if (!isTerminalTaskStatus(task.status)) return;
+    await this.executorCredentialRevoker?.revokeTaskTokens(task.task_id);
+  }
+
+  private async triggerQueueProcessingAfterCommit(
+    sessionId: string,
+    params?: TaskParams
+  ): Promise<void> {
+    const sessionsService = this.app.service('sessions') as unknown as SessionsService;
+    const sessionParams = params as Parameters<SessionsService['triggerQueueProcessing']>[1];
+
+    await this.runAfterTenantDatabaseCommit('triggerQueueProcessing', () =>
+      sessionsService.triggerQueueProcessing(sessionId, sessionParams)
+    );
+  }
+
+  private async dispatchCompletionCallbacksAfterCommit(
+    task: Task,
+    session: Session,
+    params?: TaskParams
+  ): Promise<void> {
+    await this.runAfterTenantDatabaseCommit('dispatchCompletionCallbacks', () =>
+      this.dispatchCompletionCallbacks(task, session, params)
+    );
+  }
+
+  private async processTerminalTaskTransition(
+    task: Task,
+    status: Task['status'],
+    params?: TaskParams
+  ): Promise<boolean> {
+    if (!task.session_id || !this.app) return false;
+    const runCompletionSideEffects = isCompletionSideEffectTaskStatus(status);
+    try {
+      // Internal read: caller params can hold the Session its auth hooks cached before commit.
+      const session = await this.app
+        .service('sessions')
+        .get(task.session_id, { tenant: params?.tenant } as TaskParams);
+
+      if (session.branch_id) {
+        // Preserve fire-and-forget behavior, but never let Git orchestration
+        // inherit a live (or already committed) completion transaction.
+        deferWithTenantContext(
+          params,
+          async () => {
+            const branch = await this.app.service('branches').get(session.branch_id!, params);
+            if (branch?.repo_id)
+              await ensureRepoOriginAlignedById(this.app, branch.repo_id, params);
+          },
+          (error) => {
+            console.warn(
+              `[tasks.origin_alignment] failed sqlstate=${getPostgresSqlState(error) ?? 'unknown'}`
+            );
+          }
+        );
+      }
+
+      const latestTaskId = session.tasks?.[session.tasks.length - 1];
+      const suppressBtwCleanup = params?.suppressBtwCleanup === true;
+      const isStop = status === TaskStatus.STOPPED;
+      const isTermination = task.termination_request !== undefined;
+
+      if (latestTaskId && latestTaskId !== task.task_id && !isTermination) {
+        console.log(
+          `⏭️ [TasksService] Skipping session terminal-state update - task ${shortId(task.task_id)} is not the latest (latest: ${shortId(latestTaskId)})`
+        );
+        if (runCompletionSideEffects && !isStop) {
+          await this.dispatchCompletionCallbacksAfterCommit(task, session, params);
+        }
+        return false;
+      }
+
+      // The repository committed the Task terminal state and its minimal
+      // Session projection in one transaction. Publish the latest Session fact
+      // rather than rewriting it: another Task may already have claimed it.
+      emitServiceEvent(this.app, {
+        path: 'sessions',
+        event: 'patched',
+        data: session,
+        id: session.session_id,
+        params,
+      });
+
+      // Timeouts are terminal lifecycle results, but they are not successful,
+      // failed, or stopped provider completions. Publish the projection and
+      // drain queued work without dispatching completion callbacks or cleaning
+      // up ephemeral forks as though the provider had completed its turn.
+      if (!runCompletionSideEffects) {
+        if (!params?.suppressTerminalQueueProcessing) {
+          await this.triggerQueueProcessingAfterCommit(task.session_id, params);
+        }
+        return true;
+      }
+
+      // Defensive fallback for tasks created before create-time auto-title
+      // ran (or after a transient title-patch failure). Later completed
+      // textual tasks can still title a session left unset by blank or
+      // image-only prompts.
+      if (status === TaskStatus.COMPLETED) {
+        await this.autoTitleSession(task, params);
+      }
+
+      if (!isStop) {
+        await this.dispatchCompletionCallbacksAfterCommit(task, session, params);
+      }
+
+      if (session.fork_origin === 'btw') {
+        // Keep archive atomic with completion: deferring it could re-archive
+        // a Session that a newer prompt has already restored.
+        if (!suppressBtwCleanup) {
+          try {
+            const tenantId = getCurrentTenantId() ?? params?.tenant?.tenant_id;
+            if (!tenantId) throw new Error('Missing tenant context for BTW archive cleanup');
+            await runWithTenantDatabaseScope(this.db, tenantId, async (tenantDb) => {
+              await assertTenantWritable(tenantDb, tenantId);
+              const sessionsService = this.app.service('sessions') as unknown as SessionsService;
+              const archiveParams: SessionParams = {
+                ...params,
+                query: undefined,
+                provider: undefined,
+              };
+              await sessionsService.archiveBtwSession(session.session_id, archiveParams);
+            });
+            console.log(
+              `📦 [TasksService] Auto-archived btw fork session ${shortId(session.session_id)}`
+            );
+          } catch (error) {
+            console.warn(
+              `[tasks.btw_archive] failed sqlstate=${getPostgresSqlState(error) ?? 'unknown'}`
+            );
+          }
+        }
+
+        if (!isStop && !isTermination) {
+          // Parent transcript fanout must not inherit the child Task/Session
+          // locks: message admission takes Branch first. The original task,
+          // terminal projection and archive commit before this fresh unit.
+          await this.runAfterTenantDatabaseCommit(
+            'btw_result',
+            async () => {
+              const tenantId = getCurrentTenantId() ?? params?.tenant?.tenant_id;
+              if (!tenantId) throw new Error('Missing tenant context for BTW result injection');
+              await runWithTenantDatabaseScope(this.db, tenantId, () =>
+                this.injectBtwResultMessage(task, session, params)
+              );
+            },
+            'identity'
+          );
+        }
+      }
+
+      if (!params?.suppressTerminalQueueProcessing) {
+        await this.triggerQueueProcessingAfterCommit(task.session_id, params);
+      } else {
+        console.log(
+          `⏭️  [TasksService] Queue trigger suppressed for session ${shortId(task.session_id)} (suppressTerminalQueueProcessing)`
+        );
+      }
+      return true;
+    } catch (error) {
+      console.error('❌ [TasksService] Failed to process task completion:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Override patch to detect task completion and:
+   * 1. Publish the Session status projected atomically by the repository
+   * 2. Set ready_for_prompt flag
+   * 3. Queue callback to parent session (if exists)
+   *
+   * NOTE: Tasks are only ever patched one at a time (never in bulk), so we don't need to loop.
+   */
+  async patch(
+    id: string,
+    patch: Partial<Task> & { opencode_checkpoint?: OpenCodeCheckpointCompletion },
+    params?: TaskParams
+  ): Promise<Task | Task[]> {
+    const { opencode_checkpoint: checkpoint, ...data } = patch;
+    if (checkpoint && !params?.provider) {
+      throw new BadRequest('opencode_checkpoint is accepted only from the task executor');
+    }
+    const nextStatus = data.status;
+    const currentTask = nextStatus !== undefined ? await this.get(id, params) : undefined;
+    if (
+      currentTask?.status === TaskStatus.STOPPING &&
+      currentTask.termination_request &&
+      params?.provider &&
+      isTerminalTaskStatus(nextStatus)
+    ) {
+      console.log(
+        `⏭️ [TasksService] Coordinator owns terminality for stopping task ${shortId(currentTask.task_id)}`
+      );
+      return currentTask;
+    }
+    if (currentTask && isTerminalTaskStatus(currentTask.status) && nextStatus !== undefined) {
+      // A prior terminal patch may have committed before durable credential
+      // revocation failed. Treat any idempotent terminal retry as a repair
+      // opportunity instead of returning a still-live executor lease.
+      await this.retireTaskExecutorCredentials(currentTask);
+      console.warn(
+        `⏭️ [TasksService] Ignoring status rewrite for terminal task ${shortId(currentTask.task_id)} ` +
+          `(${currentTask.status} → ${nextStatus})`
+      );
+      return currentTask;
+    }
+    const isTerminalTransition =
+      isAnalyticsTerminalTaskStatus(nextStatus) &&
+      !isAnalyticsTerminalTaskStatus(currentTask?.status);
+    const isRunningTransition =
+      nextStatus === TaskStatus.RUNNING && currentTask?.status !== TaskStatus.RUNNING;
+
+    const result = checkpoint
+      ? await this.taskRepo.updateFromExecutor(id, data, {
+          holderId: checkpoint.holder_instance_id,
+          manifest: checkpoint.manifest,
+        })
+      : params?.provider
+        ? await this.taskRepo.updateFromExecutor(id, data)
+        : await super.patch(id, data, params);
+
+    // Task terminality is the one lifecycle boundary shared by local and
+    // off-host executors. Retire every bearer for this exact task before any
+    // completion orchestration can advertise it as finished.
+    if (isTerminalTransition && !Array.isArray(result)) {
+      await this.retireTaskExecutorCredentials(result);
+    }
+
+    if (isRunningTransition && !Array.isArray(result)) {
+      this.trackTaskStarted(result as Task);
+    }
+
+    // Emit analytics for terminal task transitions, including timeouts that do not
+    // run the broader task-completion side effects below.
+    if (isTerminalTransition) {
+      const task = result as Task;
+      this.trackTaskCompleted(task);
+    }
+
+    // Task terminality is the authoritative lifecycle boundary. Project every
+    // terminal result onto the Session inside this daemon request; an executor
+    // cannot safely make a second request after this transition because the
+    // terminal Task patch revokes its task-scoped credential.
+    if (isTerminalTransition) {
+      await this.processTerminalTaskTransition(result as Task, data.status!, params);
+    }
+
+    return result;
+  }
+
+  /**
+   * Inject a btw result message into the parent session's conversation.
+   * This is a system message that appears in the UI but does NOT trigger a prompt cycle.
+   * Shows: originating session (if remote), the question asked, and the response.
+   */
+  private async injectBtwResultMessage(
+    task: Task,
+    btwSession: Session,
+    _params?: TaskParams
+  ): Promise<void> {
+    const parentSessionId = btwSession.genealogy?.forked_from_session_id;
+    if (!parentSessionId) return;
+
+    try {
+      const messagesService = this.app.service('messages');
+
+      // Only the boundary messages are needed; do not hydrate the whole fork.
+      const [firstUserResult, lastAssistantResult] = await Promise.all([
+        messagesService.find({
+          query: {
+            session_id: btwSession.session_id,
+            task_id: task.task_id,
+            role: 'user',
+            $sort: { index: 1 },
+            $limit: 1,
+          },
+        }),
+        messagesService.find({
+          query: {
+            session_id: btwSession.session_id,
+            task_id: task.task_id,
+            role: 'assistant',
+            $sort: { index: -1 },
+            $limit: 1,
+          },
+        }),
+      ]);
+      const firstUserMessages = Array.isArray(firstUserResult)
+        ? firstUserResult
+        : firstUserResult.data;
+      const lastAssistantMessages = Array.isArray(lastAssistantResult)
+        ? lastAssistantResult
+        : lastAssistantResult.data;
+
+      // Extract the original prompt (first user message or task description)
+      let promptText = '';
+      if (firstUserMessages.length > 0) {
+        const firstUser = firstUserMessages[0];
+        promptText =
+          typeof firstUser.content === 'string'
+            ? firstUser.content
+            : Array.isArray(firstUser.content)
+              ? firstUser.content
+                  // biome-ignore lint/suspicious/noExplicitAny: Content block types vary by SDK
+                  .filter((b: any) => b.type === 'text')
+                  // biome-ignore lint/suspicious/noExplicitAny: Content block types vary by SDK
+                  .map((b: any) => b.text || '')
+                  .join('\n\n')
+              : '';
+      }
+      if (!promptText) {
+        promptText = task.full_prompt?.substring(0, 120) || btwSession.title || '(no prompt)';
+      }
+
+      // Extract the last assistant response
+      let responseText = '';
+      if (lastAssistantMessages.length > 0) {
+        const lastMsg = lastAssistantMessages[0];
+        responseText =
+          typeof lastMsg.content === 'string'
+            ? lastMsg.content
+            : Array.isArray(lastMsg.content)
+              ? lastMsg.content
+                  // biome-ignore lint/suspicious/noExplicitAny: Content block types vary by SDK
+                  .filter((block: any) => block.type === 'text')
+                  // biome-ignore lint/suspicious/noExplicitAny: Content block types vary by SDK
+                  .map((block: any) => block.text || '')
+                  .join('\n\n')
+              : '';
+      }
+
+      if (!responseText) {
+        responseText = `(btw fork completed with status: ${task.status}, but no text response was found)`;
+      }
+
+      // Find the parent's current running task to attach the message to
+      const parentSession = await this.app.service('sessions').get(parentSessionId);
+      const parentLatestTaskId = parentSession.tasks?.[parentSession.tasks.length - 1];
+
+      // For remote btw, fetch the caller session's title
+      const callerSessionId = btwSession.callback_config?.callback_session_id;
+      let callerTitle: string | undefined;
+      if (callerSessionId) {
+        try {
+          const callerSession = await this.app.service('sessions').get(callerSessionId);
+          callerTitle = callerSession.title;
+        } catch {
+          // Caller session may have been deleted — not critical
+        }
+      }
+
+      // Build preview from prompt + response
+      const previewText = `Q: ${promptText.substring(0, 80)} → A: ${responseText.substring(0, 100)}`;
+
+      // Create via service so FeathersJS broadcasts the `created` event to all clients
+      await appendSystemMessage({
+        app: this.app,
+        db: this.db,
+        sessionId: parentSessionId,
+        taskId: parentLatestTaskId as string | undefined,
+        content: [{ type: 'text', text: responseText } as ContentBlock],
+        contentPreview: previewText.substring(0, 200),
+        metadata: {
+          is_btw_result: true,
+          // The ephemeral btw fork session
+          btw_session_id: btwSession.session_id,
+          btw_task_id: task.task_id,
+          btw_status: task.status,
+          btw_title: btwSession.title,
+          btw_prompt: promptText,
+          // For remote btw: the session that initiated the btw (via MCP callback_session_id).
+          // Absent for local btw (user clicked btw button from parent session's UI).
+          btw_caller_session_id: btwSession.callback_config?.callback_session_id,
+          btw_caller_title: callerTitle,
+          source: 'agor',
+        },
+      });
+
+      console.log(
+        `💬 [TasksService] Injected btw result message into parent session ${shortId(parentSessionId)} from btw fork ${shortId(btwSession.session_id)}`
+      );
+    } catch (error) {
+      console.warn(`[tasks.btw_result] failed sqlstate=${getPostgresSqlState(error) ?? 'unknown'}`);
+      // Non-critical — don't break task completion
+    }
+  }
+
+  /**
+   * Centralized completion-callback dispatcher.
+   *
+   * Task-level and session-configured callbacks resolve to the same
+   * target/event pair: `task_completion` delivered to
+   * `callback_config.callback_session_id`, with a genealogy-parent fallback for
+   * legacy spawned sessions. Keeping all routing here prevents a completed child
+   * from notifying its parent once via the rich/template path and again via a
+   * second generic/raw path.
+   */
+  private async dispatchCompletionCallbacks(
+    task: Task,
+    childSession: Session,
+    params?: TaskParams
+  ): Promise<void> {
+    const sessionTargetId = this.resolveCompletionCallbackTarget(childSession);
+    const taskTargetId = task.metadata?.completion_callback?.target_session_id;
+    const targetSessionIds = [
+      ...new Set([sessionTargetId, taskTargetId].filter(Boolean)),
+    ] as SessionID[];
+
+    for (const targetSessionId of targetSessionIds) {
+      const dispatchResult = await this.dispatchCompletionCallbackOnce(
+        task,
+        childSession,
+        targetSessionId,
+        params
+      );
+
+      if (dispatchResult.callbackTask?.status === TaskStatus.QUEUED) {
+        // CRITICAL: After queuing callback, ALWAYS trigger target's queue processing.
+        // The queue processor uses a promise-based lock that will:
+        // - If target is busy: wait for current processing, then retry (self-healing)
+        // - If target is promptable: immediately process the callback
+        // - If target becomes promptable while waiting: the retry will catch it
+        //
+        // DO NOT check target status before triggering - let the queue processor handle it.
+        // This ensures callbacks are never missed due to timing issues.
+        try {
+          console.log(
+            `🔄 [TasksService] Triggering callback target queue processing for ${shortId(targetSessionId)} (callback queued)`
+          );
+          // Pass empty params to avoid leaking child's auth context to target.
+          // The queue processor reconstructs target auth from queued task metadata.
+          await this.triggerQueueProcessingAfterCommit(targetSessionId, {});
+        } catch (error) {
+          // Don't throw - target issues shouldn't break child queue processing.
+          console.warn(
+            `⚠️  [TasksService] Failed to trigger callback target queue processing (target may be deleted):`,
+            error
+          );
+        }
+      }
+
+      // Consume only the session-level one-shot that participated in this
+      // delivery. A task-only callback must never mutate session callback state.
+      const callbackMode = childSession.callback_config?.callback_mode ?? 'persistent';
+      if (
+        dispatchResult.callbackTask &&
+        targetSessionId === sessionTargetId &&
+        callbackMode === 'once'
+      ) {
+        try {
+          await this.app.service('sessions').patch(childSession.session_id, {
+            callback_config: {
+              ...childSession.callback_config,
+              enabled: false,
+            },
+          });
+          console.log(
+            `🔕 [TasksService] Auto-disabled callback for session ${shortId(childSession.session_id)} (once mode)`
+          );
+        } catch (error) {
+          console.warn(`⚠️  [TasksService] Failed to auto-disable callback:`, error);
+        }
+      }
+    }
+  }
+
+  private resolveCompletionCallbackTarget(childSession: Session): SessionID | undefined {
+    // callback_config.callback_session_id is the single source of truth for both:
+    // - Subsessions (spawn sets it to parent session ID)
+    // - Remote sessions (create sets it when enableCallback is true)
+    // Fallback: legacy spawned sessions may only have genealogy.parent_session_id.
+    return (
+      childSession.callback_config?.callback_session_id ?? childSession.genealogy?.parent_session_id
+    );
+  }
+
+  private callbackDispatchMetadataKey(targetSessionId: SessionID): string {
+    return `task_completion:${targetSessionId}`;
+  }
+
+  private hasCompletionCallbackDispatch(
+    metadata: TaskMetadata | undefined,
+    targetSessionId: SessionID
+  ): boolean {
+    return (metadata?.callback_dispatches ?? []).some(
+      (dispatch) =>
+        (dispatch.event === 'task_completion' || dispatch.event === 'session_completion') &&
+        dispatch.target_session_id === targetSessionId
+    );
+  }
+
+  private async markCompletionCallbackDispatched(
+    task: Task,
+    targetSessionId: SessionID,
+    queuedTaskId: TaskID | undefined,
+    params?: TaskParams
+  ): Promise<void> {
+    const latestTask = (await this.taskRepo.findById(task.task_id)) ?? task;
+    if (this.hasCompletionCallbackDispatch(latestTask.metadata, targetSessionId)) return;
+
+    const metadata: TaskMetadata = {
+      ...(latestTask.metadata ?? {}),
+      callback_dispatches: [
+        ...(latestTask.metadata?.callback_dispatches ?? []),
+        {
+          event: 'task_completion',
+          target_session_id: targetSessionId,
+          queued_task_id: queuedTaskId,
+          dispatched_at: new Date().toISOString(),
+        },
+      ],
+    };
+
+    await super.patch(task.task_id, { metadata } as Partial<Task>, params);
+  }
+
+  private async dispatchCompletionCallbackOnce(
+    task: Task,
+    childSession: Session,
+    targetSessionId: SessionID,
+    params?: TaskParams
+  ): Promise<CompletionCallbackDispatchResult> {
+    const dispatchKey = `${task.task_id}:${this.callbackDispatchMetadataKey(targetSessionId)}`;
+    const existingDispatch = this.completionCallbackDispatches.get(dispatchKey);
+    if (existingDispatch) {
+      await existingDispatch;
+      return {};
+    }
+
+    const dispatch = (async (): Promise<CompletionCallbackDispatchResult> => {
+      const latestTask = (await this.taskRepo.findById(task.task_id)) ?? task;
+      if (this.hasCompletionCallbackDispatch(latestTask.metadata, targetSessionId)) {
+        console.log(
+          `⏭️  [TasksService] Completion callback for task ${shortId(task.task_id)} to ${shortId(targetSessionId)} already dispatched`
+        );
+        return {};
+      }
+
+      const queuedCallbackTask = await this.queueCallbackToSession(
+        task,
+        childSession,
+        targetSessionId,
+        params
+      );
+      if (queuedCallbackTask) {
+        try {
+          await this.markCompletionCallbackDispatched(
+            task,
+            targetSessionId,
+            queuedCallbackTask.task_id,
+            params
+          );
+        } catch (error) {
+          console.warn(
+            `⚠️  [TasksService] Failed to mark completion callback dispatched for task ${shortId(task.task_id)} to ${shortId(targetSessionId)} after queueing:`,
+            error
+          );
+        }
+      }
+
+      return { callbackTask: queuedCallbackTask };
+    })();
+
+    this.completionCallbackDispatches.set(dispatchKey, dispatch);
+    try {
+      return await dispatch;
+    } finally {
+      this.completionCallbackDispatches.delete(dispatchKey);
+    }
+  }
+
+  /**
+   * Queue callback message to a target session when a session completes.
+   * The target is always callback_config.callback_session_id, set by both
+   * spawn (defaults to parent) and create (when enableCallback is true).
+   */
+  private async queueCallbackToSession(
+    task: Task,
+    childSession: Session,
+    targetSessionId: SessionID,
+    params?: TaskParams
+  ): Promise<Task | undefined> {
+    if (!targetSessionId) return undefined;
+
+    try {
+      // Get target session to check callback config
+      // NOTE: DO NOT pass params here - params are from child session context (executor),
+      // but we need to access target session without child's authentication constraints
+      const targetSession = await this.app.service('sessions').get(targetSessionId);
+
+      // Check callback config - child overrides take precedence over target defaults
+      // For subsessions (parent_session_id), default is enabled=true
+      // For remote sessions (callback_session_id), enabled is explicitly set at creation time
+      const isExactTaskCallback =
+        task.metadata?.completion_callback?.target_session_id === targetSessionId;
+      const callbackEnabled =
+        isExactTaskCallback ||
+        (childSession.callback_config?.enabled ?? targetSession.callback_config?.enabled ?? true);
+
+      if (!callbackEnabled) {
+        console.log(
+          `⏭️  [TasksService] Callbacks disabled for child session ${shortId(childSession.session_id)}`
+        );
+        return undefined;
+      }
+
+      // Check if we should include original spawn prompt - child overrides take precedence
+      const includeOriginalPrompt =
+        childSession.callback_config?.include_original_prompt ??
+        targetSession.callback_config?.include_original_prompt ??
+        false;
+
+      // Get the original prompt from the completed task. When requested, it is
+      // rendered as a section inside the single templated callback body (never
+      // queued as its own callback/message).
+      const spawnPrompt = includeOriginalPrompt
+        ? task.full_prompt || '(no prompt available)'
+        : undefined;
+
+      // Fetch last assistant message from child session (if callback config allows)
+      let lastAssistantMessage: string | undefined;
+
+      // Check if we should include last message - child overrides take precedence
+      const includeLastMessage =
+        childSession.callback_config?.include_last_message ??
+        targetSession.callback_config?.include_last_message ??
+        true;
+
+      if (includeLastMessage) {
+        try {
+          // Query messages service for last assistant message in this task
+          const messagesService = this.app.service('messages');
+          const messages = await messagesService.find({
+            ...params,
+            query: {
+              session_id: childSession.session_id,
+              task_id: task.task_id,
+              role: 'assistant',
+              $sort: { index: -1 },
+              $limit: 1,
+            },
+          });
+
+          const allMessages = messages.data || messages;
+          const assistantMessages = Array.isArray(allMessages) ? allMessages : [];
+
+          if (assistantMessages.length > 0) {
+            const lastMsg = assistantMessages[0];
+            // Extract text content from content blocks or string
+            if (typeof lastMsg.content === 'string') {
+              lastAssistantMessage = lastMsg.content;
+            } else if (Array.isArray(lastMsg.content)) {
+              // Find text blocks and concatenate
+              const textBlocks = lastMsg.content
+                // biome-ignore lint/suspicious/noExplicitAny: Content block types vary by SDK
+                .filter((block: any) => block.type === 'text')
+                // biome-ignore lint/suspicious/noExplicitAny: Content block types vary by SDK
+                .map((block: any) => block.text || '')
+                .join('\n\n');
+              lastAssistantMessage = textBlocks || undefined;
+            }
+          }
+        } catch (error) {
+          console.warn(
+            `⚠️  [TasksService] Could not fetch last assistant message for callback:`,
+            error
+          );
+          // Continue without last message - not critical
+        }
+      }
+
+      // Build callback context
+      const context: ChildCompletionContext = {
+        childSessionId: shortId(childSession.session_id),
+        childSessionFullId: childSession.session_id,
+        childSessionTitle: childSession.title || '',
+        childTaskId: shortId(task.task_id),
+        childTaskFullId: task.task_id,
+        parentSessionId: shortId(targetSessionId), // backward compat
+        callbackSessionId: shortId(targetSessionId),
+        spawnPrompt,
+        status: task.status, // COMPLETED, FAILED, etc.
+        completedAt: task.completed_at || new Date().toISOString(),
+        messageCount:
+          task.message_range?.end_index !== undefined &&
+          task.message_range?.start_index !== undefined
+            ? task.message_range.end_index - task.message_range.start_index + 1
+            : 0,
+        recordedToolCount: task.recorded_tool_count,
+        lastAssistantMessage,
+      };
+
+      // Render callback message using template
+      const customTemplate = targetSession.callback_config?.template;
+      // The callback quotes child-controlled text (its last assistant message,
+      // and optionally its own stamped prompt). The default template's
+      // Handlebars escaping already defuses the reserved provenance tag, but a
+      // custom template can emit raw text through `{{{...}}}`, so neutralize
+      // it here regardless of template.
+      const callbackMessage = escapePromptProvenanceSentinels(
+        renderChildCompletionCallback(context, customTemplate)
+      ).text;
+
+      // Validate target session has a creator for authentication
+      if (!targetSession.created_by) {
+        console.warn(
+          `⚠️  [TasksService] Cannot queue callback: target session ${shortId(targetSessionId)} has no creator (anonymous session)`
+        );
+        return undefined;
+      }
+
+      // Create QUEUED task on the target session carrying the callback prompt.
+      // The metadata bag survives the queue → run transition: spawnTaskExecutor
+      // re-stamps `is_agor_callback` and `source` onto the synthesized
+      // user-message row so the UI's callback styling (MessageBlock.tsx) holds.
+      //
+      // IMPORTANT: created_by is the executor principal (identity, env, and
+      // credentials), so it is the server-stamped callback setter — never the
+      // target session owner, who did not ask for this work. Callbacks without a
+      // stored setter (legacy rows, internal writes) run as the user whose task
+      // completed; queue admission rechecks that principal's authority on the target.
+      const taskCallback = task.metadata?.completion_callback;
+      const callbackCreator =
+        (taskCallback?.target_session_id === targetSessionId
+          ? taskCallback.requested_by_user_id
+          : undefined) ??
+        childSession.callback_config?.callback_created_by ??
+        task.created_by;
+      const callbackTaskId = completionCallbackTaskId(task.task_id, targetSessionId);
+      const createCallbackTask = () =>
+        this.taskRepo.createPending({
+          task_id: callbackTaskId,
+          session_id: targetSessionId,
+          full_prompt: callbackMessage,
+          created_by: callbackCreator,
+          status: TaskStatus.QUEUED,
+          metadata: {
+            is_agor_callback: true,
+            source: 'agor',
+            child_session_id: childSession.session_id,
+            child_task_id: task.task_id,
+            queued_by_user_id: callbackCreator,
+            initial_message_id: callbackTaskId as MessageID,
+          },
+        });
+      const tenantId = getCurrentTenantId() ?? params?.tenant?.tenant_id;
+      const callbackTask = tenantId
+        ? await runWithTenantDatabaseScope(this.db, tenantId, async (tenantDb) => {
+            await assertTenantWritable(tenantDb, tenantId);
+            return createCallbackTask();
+          })
+        : await createCallbackTask();
+
+      if (callbackTask.status === TaskStatus.QUEUED) {
+        // Stable identity can return a previously admitted Task. Only publish
+        // a queue notification while it is actually queued; a concurrently
+        // claimed or completed callback needs reconciliation, not another
+        // apparent enqueue.
+        this.emit?.('queued', callbackTask);
+        console.log(
+          `🔔 Queued callback task ${shortId(callbackTask.task_id)} on session ${shortId(targetSessionId)} from child ${shortId(childSession.session_id)}`
+        );
+      }
+
+      // NOTE: Queue processing is handled by the centralized dispatcher after
+      // it confirms a callback task was actually queued.
+      return callbackTask;
+    } catch (error) {
+      console.error(
+        `❌ [TasksService] Failed to queue callback to ${targetSessionId} for session ${childSession.session_id}:`,
+        error
+      );
+      // Don't throw - callback failure shouldn't break task completion
+      return undefined;
+    }
+  }
+
+  /**
+   * Custom method: Get running tasks across all sessions
+   */
+  async getRunning(_params?: TaskParams): Promise<Task[]> {
+    return this.taskRepo.findRunning();
+  }
+
+  /**
+   * Custom method: Get orphaned tasks (dispatching, running, stopping, awaiting permission)
+   */
+  async getOrphaned(_params?: TaskParams): Promise<Task[]> {
+    return this.taskRepo.findOrphaned();
+  }
+
+  async findByIdForScopeCheck(taskId: TaskID): Promise<Task | null> {
+    return this.taskRepo.findById(taskId);
+  }
+
+  async connectExecutor(data: { task_id: string }, params?: TaskParams): Promise<Task> {
+    const connection = await this.taskRepo.connectExecutor(data.task_id);
+    if (!connection) {
+      const current = await this.taskRepo.findById(data.task_id);
+      throw new Conflict(
+        `Task ${shortId(data.task_id)} cannot connect an executor from status ${current?.status ?? 'unknown'}`
+      );
+    }
+    if (connection.transitioned) {
+      recordExecutorConnected(getDaemonMetrics(this.app), connection.task);
+      const startedAt = Date.parse(connection.task.started_at ?? '');
+      const connectedAt = Date.parse(connection.task.executor_connected_at ?? '');
+      if (Number.isFinite(startedAt) && Number.isFinite(connectedAt)) {
+        console.log(
+          `🔌 [TasksService] Executor connected for task ${shortId(connection.task.task_id)} ` +
+            `in ${Math.max(0, connectedAt - startedAt)}ms`
+        );
+      }
+      this.trackTaskStarted(connection.task);
+      emitServiceEvent(this.app, {
+        path: 'tasks',
+        event: 'patched',
+        data: connection.task,
+        id: connection.task.task_id,
+        params,
+      });
+    }
+    return connection.task;
+  }
+
+  async reportExecutorInterruption(
+    data: ExecutorInterruptionInput,
+    params?: TaskParams
+  ): Promise<Task> {
+    if (data.signal !== 'SIGTERM' && data.signal !== 'SIGINT') {
+      throw new BadRequest('invalid executor interruption signal');
+    }
+    const tenantId = getCurrentTenantId() ?? params?.tenant?.tenant_id;
+    const current = await this.get(data.task_id, params);
+    if (isTerminalTaskStatus(current.status)) return current;
+    const session = await this.app.service('sessions').get(current.session_id, params);
+    // The task-scoped runtime hook authenticates this report. The existing
+    // row-locked claim preserves a winning Stop/completion and owns all release;
+    // receiving a signal itself never proves that the provider has stopped.
+    return beginExecutorTermination({
+      app: this.app,
+      taskId: data.task_id,
+      cause: 'executor_interrupted',
+      errorMessage: `Executor received ${data.signal}; execution was interrupted.`,
+      sdkFailure: {
+        reason: 'executor_interrupted',
+        detected_at: new Date().toISOString(),
+        tool: session.agentic_tool,
+        last_pulse: current.latest_executor_pulse,
+        termination: 'requested',
+      },
+      params,
+      runInFreshTenantWriteDatabase: (work) => withFreshTenantWrite(this.db, tenantId, work),
+    });
+  }
+
+  async reportTerminationComplete(
+    data: ExecutorTerminationCompleteInput,
+    params?: TaskParams
+  ): Promise<Task> {
+    const terminationTenantId = getCurrentTenantId() ?? params?.tenant?.tenant_id;
+    const runInFreshTerminationTenantWriteDatabase = <T>(work: () => Promise<T>) =>
+      withFreshTenantWrite(this.db, terminationTenantId, work);
+    const task = await runInFreshTerminationTenantWriteDatabase(() =>
+      this.taskRepo.recordExecutorQuiescence(data)
+    );
+    if (!task?.termination_request) {
+      throw new Conflict(
+        `Task ${shortId(data.task_id)} has no matching active termination request`
+      );
+    }
+    const terminationRequest = task.termination_request;
+
+    emitServiceEvent(this.app, {
+      path: 'tasks',
+      event: 'patched',
+      data: task,
+      id: task.task_id,
+      params,
+    });
+
+    // Do not await containment here. A local executor must receive this RPC
+    // response before it can exit, while the coordinator verifies that process
+    // group only after the wrapper exits. Start recovery after this service
+    // transaction commits and outside its ALS database scope; the durable
+    // quiescence timestamp makes the deferred recovery restart/retry safe.
+    const coordinatorParams = { ...(params ?? {}), provider: undefined };
+    deferWithTenantContext(
+      params,
+      () => {
+        console.log(
+          `[task.termination] event=executor_quiescence_committed ` +
+            `task_id=${shortId(task.task_id)} mode=${task.executor_mode ?? 'local'}`
+        );
+        return requestExecutorTermination({
+          app: this.app,
+          taskId: task.task_id,
+          cause: terminationRequest.cause,
+          errorMessage: terminationRequest.error_message ?? 'Executor stopped cooperatively.',
+          params: coordinatorParams,
+          runInFreshTenantWriteDatabase: runInFreshTerminationTenantWriteDatabase,
+        }).then(() => undefined);
+      },
+      (error) =>
+        console.error(
+          `[termination] Failed to settle executor report for Task ${shortId(task.task_id)}:`,
+          error
+        )
+    );
+
+    return task;
+  }
+
+  async recordExecutorStartupWarning(
+    taskId: string,
+    warning: string,
+    params?: TaskParams
+  ): Promise<Task | null> {
+    const task = await this.taskRepo.recordExecutorStartupWarning(taskId, warning);
+    if (task) {
+      emitServiceEvent(this.app, {
+        path: 'tasks',
+        event: 'patched',
+        data: task,
+        id: task.task_id,
+        params,
+      });
+    }
+    return task;
+  }
+
+  /** Internal launch boundary; not exposed through the Feathers transport. */
+  bindExecutorLaunchAuthority(taskId: string): Promise<ExecutorLaunchAuthority> {
+    return this.taskRepo.bindExecutorLaunchAuthority(taskId);
+  }
+
+  async reportRuntimeTelemetry(data: RuntimeTelemetryInput, params?: TaskParams): Promise<Task> {
+    if (data.pulse) {
+      const { sequence, kind, detail } = data.pulse;
+      if (!Number.isSafeInteger(sequence) || sequence <= 0) {
+        throw new BadRequest('pulse sequence must be a positive safe integer');
+      }
+      if (!Object.values(ExecutorPulseKind).includes(kind)) {
+        throw new BadRequest('invalid executor pulse kind');
+      }
+      if (
+        detail !== undefined &&
+        (!/^[A-Za-z0-9._:/-]+$/.test(detail) || Buffer.byteLength(detail, 'utf8') > 128)
+      ) {
+        throw new BadRequest('pulse detail must be a bounded identifier');
+      }
+    }
+
+    const authority = authenticatedTaskExecutorRuntimeAuthority(params);
+    if (!authority || authority.taskId !== data.task_id) {
+      throw new Forbidden('A token scoped to this executor task is required');
+    }
+    const scope = await this.runtimeAuthorityScope(authority);
+
+    const persistTelemetry = () =>
+      this.taskRepo.reportRuntimeTelemetry(data.task_id, scope, data.pulse);
+
+    // PostgreSQL tenant-owned services run inside a request transaction. The
+    // repository takes the Task row lock while deciding whether this heartbeat
+    // may refresh liveness. Commit that short unit before a denial enters the
+    // termination coordinator, whose fresh claim must lock the same Task row.
+    // SQLite services carry tenant identity only, so their repository mutation
+    // already commits before this method continues.
+    const report = isPostgresDatabaseHandle(this.db)
+      ? await withFreshTenantWrite(this.db, authority.tenantId, persistTelemetry)
+      : await persistTelemetry();
+
+    if (report.outcome === 'scope_mismatch') {
+      // Do not let a wrong-scope credential stop somebody else's runtime.
+      throw new Forbidden('Executor task authority does not match this runtime');
+    }
+    if (report.outcome === 'authorization_revoked') {
+      console.warn(
+        `[task.authorization] event=runtime_revoked task_id=${shortId(data.task_id)} ` +
+          `reason=${report.reason}`
+      );
+      return beginExecutorTermination({
+        app: this.app,
+        taskId: report.task.task_id,
+        cause: 'authorization_revoked',
+        errorMessage: AUTHORIZATION_REVOKED_TERMINATION_MESSAGE,
+        params,
+        runInFreshTenantWriteDatabase: (work) =>
+          withFreshTenantWrite(this.db, authority.tenantId, work),
+      });
+    }
+    if (report.outcome === 'control') {
+      // Heartbeat responses are also the executor's durable control-plane
+      // read. A reconnected executor observes STOPPING through any daemon even
+      // if a realtime notification was missed.
+      if (report.task.status === TaskStatus.STOPPING && report.task.termination_request) {
+        return report.task;
+      }
+      throw new Conflict(`Task ${shortId(data.task_id)} is not connected and active`);
+    }
+    const task = report.task;
+    analyticsLogger.track(
+      'executor.heartbeat',
+      {
+        task_id: task.task_id,
+        session_id: task.session_id,
+        status: task.status,
+        last_executor_heartbeat_at: task.last_executor_heartbeat_at,
+      },
+      { userId: task.created_by }
+    );
+    if (this.heartbeatCallbackRunner.isConfigured()) {
+      // Heartbeats arrive inside the request's tenant DB transaction. The
+      // optional callback performs a later branch-pointer projection, so
+      // retain only the trusted tenant identity and re-enter after commit
+      // instead of inheriting a committed DB scope into detached work.
+      deferWithTenantContext(
+        params,
+        () => this.handleExecutorHeartbeat(task, task.last_executor_heartbeat_at!),
+        (error) => console.warn('Executor heartbeat callback failed:', error)
+      );
+    }
+    emitServiceEvent(this.app, {
+      path: 'tasks',
+      event: 'patched',
+      data: task,
+      id: task.task_id,
+      params,
+    });
+    return task;
+  }
+
+  /** PostgreSQL checks the durable token row in-transaction; SQLite uses the in-process map. */
+  private async runtimeAuthorityScope(
+    authority: NonNullable<ReturnType<typeof authenticatedTaskExecutorRuntimeAuthority>>
+  ): Promise<TaskRuntimeAuthorityScope> {
+    const scope: TaskRuntimeAuthorityScope = {
+      token_fingerprint: authority.tokenFingerprint,
+      principal_user_id: authority.userId,
+      session_id: authority.sessionId,
+      branch_id: authority.branchId,
+    };
+    if (isPostgresDatabaseHandle(this.db)) return scope;
+    const check = this.executorCredentialRevoker?.isTaskTokenAuthorityCurrent;
+    if (!check) throw new Error('Executor task token authority is unavailable');
+    scope.standalone_token_current = await check.call(this.executorCredentialRevoker, {
+      tenantId: authority.tenantId,
+      tokenFingerprint: authority.tokenFingerprint,
+      sessionId: authority.sessionId,
+      taskId: authority.taskId,
+      branchId: authority.branchId,
+      userId: authority.userId,
+    });
+    return scope;
+  }
+
+  /** Require the live executor of a hosted OpenCode Task and its checkpoint holder id. */
+  private async openCodeCheckpointAuthority(
+    taskId: string,
+    holderId: unknown,
+    params?: TaskParams
+  ): Promise<{ userId: string; sessionId: string }> {
+    if (typeof holderId !== 'string' || !isValidUUID(holderId)) {
+      throw new BadRequest('holder_instance_id must be a UUID');
+    }
+    const authority = authenticatedTaskExecutorRuntimeAuthority(params);
+    if (!authority || authority.taskId !== taskId) {
+      throw new Forbidden('A token scoped to this executor task is required');
+    }
+    if (resolveOpenCodeCapabilities(this.app.get('config')).mode !== 'managed-projection') {
+      throw new BadRequest('Hosted OpenCode checkpoints are not enabled for this deployment');
+    }
+    await this.taskRepo.assertRuntimeCredentialAuthority(
+      taskId as TaskID,
+      await this.runtimeAuthorityScope(authority)
+    );
+    return { userId: authority.userId, sessionId: authority.sessionId };
+  }
+
+  async beginOpenCodeCheckpoint(
+    data: OpenCodeCheckpointBeginInput,
+    params?: TaskParams
+  ): Promise<OpenCodeCheckpointAdmission> {
+    const { userId, sessionId } = await this.openCodeCheckpointAuthority(
+      data.task_id,
+      data.holder_instance_id,
+      params
+    );
+    const admission = await new OpenCodeCheckpointRepository(this.db).begin(
+      data.task_id,
+      data.holder_instance_id,
+      userId
+    );
+    if (admission.outcome !== 'admitted') return admission;
+    // Only the selected provider's key is decrypted, and only for the prompter's admitted executor.
+    const session = await new SessionRepository(this.db).findById(sessionId);
+    const provider = session?.model_config?.provider?.trim();
+    const key =
+      provider && isHostedOpenCodeProvider(provider)
+        ? (
+            await new UsersRepository(this.db).getToolConfigField(userId, 'opencode', provider)
+          )?.trim()
+        : undefined;
+    return { ...admission, providerKey: provider && key ? { providerId: provider, key } : null };
+  }
+
+  async acknowledgeOpenCodeCleanup(
+    data: OpenCodeCheckpointCleanupInput,
+    params?: TaskParams
+  ): Promise<void> {
+    await this.openCodeCheckpointAuthority(data.task_id, data.holder_instance_id, params);
+    if (
+      !Array.isArray(data.deleted) ||
+      data.deleted.length > MAX_OPENCODE_CLEANUP_OBJECTS ||
+      !data.deleted.every((object) => isValidUUID(object?.sessionId) && isValidUUID(object?.taskId))
+    ) {
+      throw new BadRequest('deleted must list canonical checkpoint objects within the limit');
+    }
+    await new OpenCodeCheckpointRepository(this.db).acknowledgeCleanup(
+      data.task_id,
+      data.holder_instance_id,
+      data.deleted
+    );
+  }
+
+  async reportSdkHealthFailure(data: SdkHealthFailureInput, params?: TaskParams): Promise<Task> {
+    if (!SDK_WATCHDOG_FAILURE_REASONS.includes(data.reason))
+      throw new BadRequest('invalid SDK health reason');
+    for (const [name, value] of Object.entries({
+      elapsed_ms: data.elapsed_ms,
+      unknown_event_count: data.unknown_event_count,
+    })) {
+      if (value !== undefined && (!Number.isSafeInteger(value) || value < 0)) {
+        throw new BadRequest(`${name} must be a non-negative safe integer`);
+      }
+    }
+    if (
+      data.sdk_version !== undefined &&
+      (!/^[A-Za-z0-9@/._-]+$/.test(data.sdk_version) || data.sdk_version.length > 128)
+    ) {
+      throw new BadRequest('sdk_version must be a bounded identifier');
+    }
+
+    const terminationTenantId = getCurrentTenantId() ?? params?.tenant?.tenant_id;
+    const runInFreshTerminationTenantWriteDatabase = <T>(work: () => Promise<T>) =>
+      withFreshTenantWrite(this.db, terminationTenantId, work);
+
+    const current = await this.get(data.task_id, params);
+    const mode = current.sdk_watchdog_mode ?? 'observe';
+    if (mode === 'disabled') throw new Conflict('SDK watchdog is disabled for this Task');
+    const action =
+      data.reason === 'unknown_activity' || mode === 'observe' ? 'would_fire' : 'enforced';
+    if (data.watchdog_action !== action) {
+      throw new BadRequest(`watchdog_action must be ${action} for this Task`);
+    }
+    const duplicate =
+      current.sdk_failure?.reason === data.reason &&
+      current.sdk_failure.watchdog_action === action &&
+      (action === 'would_fire' ||
+        isTerminalTaskStatus(current.status) ||
+        (current.status === TaskStatus.STOPPING &&
+          current.termination_request?.cause === 'sdk_health_failure'));
+    if (duplicate) return current;
+    if (
+      isTerminalTaskStatus(current.status) ||
+      current.status === TaskStatus.STOPPING ||
+      !current.executor_connected_at
+    ) {
+      throw new Conflict(`Task ${shortId(data.task_id)} is not connected and active`);
+    }
+    const session = await this.app.service('sessions').get(current.session_id, params);
+    const failure: SdkFailure = {
+      reason: data.reason,
+      detected_at: new Date().toISOString(),
+      tool: session.agentic_tool,
+      last_pulse: current.latest_executor_pulse,
+      elapsed_ms: data.elapsed_ms,
+      watchdog_action: action,
+      unknown_event_count: data.unknown_event_count,
+      sdk_version: data.sdk_version,
+      termination: action === 'enforced' ? 'requested' : 'not_requested',
+    };
+    if (action === 'would_fire') {
+      const observed = await runInFreshTerminationTenantWriteDatabase(() =>
+        this.taskRepo.recordSdkHealthObservation(data.task_id, failure)
+      );
+      if (!observed) throw new Conflict(`Task ${shortId(data.task_id)} is no longer active`);
+      emitServiceEvent(this.app, {
+        path: 'tasks',
+        event: 'patched',
+        data: observed,
+        id: observed.task_id,
+        params,
+      });
+      return observed;
+    }
+
+    return beginExecutorTermination({
+      app: this.app,
+      taskId: current.task_id,
+      cause: 'sdk_health_failure',
+      errorMessage: `SDK activity stalled (${data.reason}).`,
+      params,
+      signalDelayMs: resolveSdkWatchdogConfig(this.app.get?.('config')?.execution).abort_grace_ms,
+      sdkFailure: failure,
+      runInFreshTenantWriteDatabase: runInFreshTerminationTenantWriteDatabase,
+    });
+  }
+
+  /**
+   * Custom method: Complete a task
+   */
+  async complete(
+    id: string,
+    data: { report?: Task['report'] },
+    params?: TaskParams
+  ): Promise<Task> {
+    // Terminal timing is computed atomically by TaskRepository.update().
+    const completedTask = (await this.patch(
+      id,
+      {
+        status: TaskStatus.COMPLETED,
+        completed_at: new Date().toISOString(),
+        report: data.report,
+      },
+      params
+    )) as Task;
+
+    // Set the session's ready_for_prompt flag to true when task completes successfully
+    if (completedTask.session_id && this.app) {
+      try {
+        await this.app.service('sessions').patch(
+          completedTask.session_id,
+          {
+            ready_for_prompt: true,
+          },
+          params
+        );
+      } catch (error) {
+        console.error('❌ Failed to set ready_for_prompt flag:', error);
+      }
+    } else {
+      console.warn(
+        `⚠️ Cannot set ready_for_prompt: session_id=${completedTask.session_id}, app=${!!this.app}`
+      );
+    }
+
+    return completedTask;
+  }
+
+  /**
+   * Custom method: Fail a task
+   */
+  async fail(id: string, data: { error?: string }, params?: TaskParams): Promise<Task> {
+    // Terminal timing is computed atomically by TaskRepository.update().
+    return this.patch(
+      id,
+      {
+        status: TaskStatus.FAILED,
+        completed_at: new Date().toISOString(),
+        error_message: data.error,
+      },
+      params
+    ) as Promise<Task>;
+  }
+}
+
+/**
+ * Service factory function
+ */
+export function createTasksService(
+  db: TenantScopeAwareDatabase,
+  app: Application,
+  executorCredentialRevoker?: TaskExecutorCredentialRevoker
+): TasksService {
+  return new TasksService(db, app, executorCredentialRevoker);
+}

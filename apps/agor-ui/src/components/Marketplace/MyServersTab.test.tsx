@@ -1,0 +1,1218 @@
+import type { MCPMarketplaceOverview, MCPServerID } from '@agor/core/types';
+import type { AgorClient } from '@agor-live/client';
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render as rtlRender,
+  screen,
+  waitFor,
+  within,
+} from '@testing-library/react';
+import { ConfigProvider } from 'antd';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { MyServersTab } from './MyServersTab';
+import { marketplaceCredentialPresentation } from './marketplacePresentation';
+import { ServerSettingsDrawer } from './ServerSettingsDrawer';
+
+const toast = vi.hoisted(() => ({
+  showSuccess: vi.fn(),
+  showError: vi.fn(),
+  showInfo: vi.fn(),
+  showWarning: vi.fn(),
+}));
+vi.mock('@/utils/message', () => ({ useThemedMessage: () => toast }));
+
+// All mounts use the same motion policy. Mixing animated mounts with one
+// motion:false mount leaves cached AntD motion styles in jsdom (no animationend).
+const render = (ui: React.ReactElement) =>
+  rtlRender(ui, {
+    wrapper: ({ children }) => (
+      <ConfigProvider theme={{ token: { motion: false } }}>{children}</ConfigProvider>
+    ),
+  });
+
+const overview: MCPMarketplaceOverview = {
+  servers: [
+    {
+      mcp_server_id: 'server-1' as MCPServerID,
+      name: 'github',
+      display_name: 'GitHub',
+      source: 'user',
+      transport: 'http',
+      enabled: true,
+      tools: [{ name: 'issues.create', description: 'Create an issue', permission: 'default' }],
+      capabilities_discovered_at: new Date().toISOString(),
+      session_count: 0,
+      created_at: new Date(0).toISOString(),
+      updated_at: new Date(0).toISOString(),
+    },
+  ],
+  attachments: [],
+  credentials: [
+    {
+      mcp_server_id: 'server-1' as MCPServerID,
+      server_name: 'github',
+      server_display_name: 'GitHub',
+      method: 'oauth',
+      status: 'active',
+    },
+  ],
+  generated_at: new Date(0).toISOString(),
+};
+
+function client(policy = 'allow_private_only', canConfigure = true) {
+  const create = vi.fn(
+    async (data?: Record<string, unknown>): Promise<unknown> =>
+      data && typeof data.tool_name === 'string'
+        ? {
+            mcp_server_id: data.mcp_server_id,
+            tool_name: data.tool_name,
+            permission: data.enabled ? 'default' : 'deny',
+          }
+        : {
+            success: true,
+            tools: [
+              { name: 'issues.create', description: 'Create an issue' },
+              { name: 'issues.read', description: 'Read an issue' },
+            ],
+          }
+  );
+  const get = vi.fn(async (mcpServerId: string) => ({
+    mcp_server_id: mcpServerId,
+    name: 'github',
+    display_name: 'GitHub',
+    transport: 'http',
+    url: 'https://example.invalid/mcp',
+    scope: 'session',
+    enabled: true,
+    source: 'user',
+    auth: { type: 'bearer', token: '••••••••' },
+    config_version: 1,
+    created_at: new Date(0),
+    updated_at: new Date(0),
+  }));
+  const service = vi.fn((path: string) =>
+    path === 'mcp-member-policy'
+      ? { find: vi.fn(async () => ({ policy, can_configure: canConfigure })) }
+      : { create, get, on: vi.fn(), removeListener: vi.fn() }
+  );
+  return { value: { service } as unknown as AgorClient, service, create, get };
+}
+
+function renderTab(
+  value: MCPMarketplaceOverview = overview,
+  options: { policy?: string; canConfigure?: boolean; role?: string } = {}
+) {
+  const mocked = client(options.policy, options.canConfigure);
+  const refresh = vi.fn(async () => undefined);
+  const onEditServer = vi.fn();
+  render(
+    <MyServersTab
+      client={mocked.value}
+      connected
+      connecting={false}
+      authGeneration={1}
+      currentUser={{ user_id: 'alice', role: options.role ?? 'member' } as never}
+      overview={value}
+      loading={false}
+      error={null}
+      refresh={refresh}
+      onEditServer={onEditServer}
+    />
+  );
+  return { ...mocked, refresh, onEditServer };
+}
+
+function settingsAction(serverId: string): HTMLButtonElement {
+  const action = document.querySelector<HTMLButtonElement>(
+    `[data-marketplace-settings-server-id="${serverId}"]`
+  );
+  if (!action) throw new Error(`Settings action for ${serverId} not found`);
+  return action;
+}
+
+async function confirmServerRemoval(title: string): Promise<void> {
+  const remove = await screen.findByLabelText(`Remove ${title} server`);
+  // The drawer renders before the asynchronous member-policy request settles.
+  await waitFor(() => expect(remove).toBeEnabled());
+  await act(async () => {
+    fireEvent.click(remove);
+  });
+  const prompt = await screen.findByText(`Delete ${title}?`);
+  let confirm: HTMLButtonElement | undefined;
+  await waitFor(() => {
+    const popover = prompt.closest('.ant-popover');
+    confirm = Array.from(popover?.querySelectorAll<HTMLButtonElement>('button') ?? []).find(
+      (button) => /^Delete(?: and detach)?$/.test(button.textContent?.trim() ?? '')
+    );
+    expect(confirm).toBeDefined();
+  });
+  if (!confirm) throw new Error(`Removal confirmation for ${title} not found`);
+  fireEvent.click(confirm);
+}
+
+describe('Marketplace server inventory and settings', () => {
+  beforeEach(() => {
+    for (const show of Object.values(toast)) show.mockClear();
+  });
+  it('warns with the attachment count, cancels without writes, and sends explicit confirmed deletion', async () => {
+    const value = { ...overview, servers: [{ ...overview.servers[0], session_count: 2 }] };
+    const { create, service } = renderTab(value);
+    fireEvent.click(screen.getByRole('button', { name: 'Settings for GitHub' }));
+    const remove = await screen.findByRole('button', { name: 'Remove GitHub server' });
+    await waitFor(() => expect(remove).toBeEnabled());
+    await act(async () => {
+      fireEvent.click(remove);
+    });
+    await waitFor(() =>
+      expect(screen.getByText(/2 sessions are attached to this server/)).toBeVisible()
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(create).not.toHaveBeenCalled();
+    await confirmServerRemoval('GitHub');
+    await waitFor(() => expect(service).toHaveBeenCalledWith('mcp-marketplace/remove-unattached'));
+    expect(create).toHaveBeenCalledWith({
+      mcp_server_id: 'server-1' as MCPServerID,
+      detach: true,
+      expected_session_count: 2,
+    });
+  });
+
+  it('names the failed removal and refreshes the confirmed count', async () => {
+    const { create, refresh } = renderTab();
+    create.mockRejectedValueOnce(
+      new Error('Session attachments changed. Review the current count and confirm deletion again.')
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Settings for GitHub' }));
+    await confirmServerRemoval('GitHub');
+    await waitFor(() =>
+      expect(toast.showError).toHaveBeenCalledWith(
+        "Couldn't remove the server. (Session attachments changed. Review the current count and confirm deletion again.)"
+      )
+    );
+    await waitFor(() => expect(refresh).toHaveBeenCalled());
+  });
+
+  it('names a failed OAuth disconnect', async () => {
+    const { create } = renderTab();
+    create.mockResolvedValueOnce({ success: false, error: 'Token revocation was refused' });
+    fireEvent.click(settingsAction('server-1'));
+    fireEvent.click(await screen.findByLabelText('Disconnect GitHub OAuth connection'));
+    const prompt = await screen.findByText('Disconnect GitHub?');
+    const confirm = Array.from(
+      prompt.closest('.ant-popover')?.querySelectorAll<HTMLButtonElement>('button') ?? []
+    ).find((button) => button.textContent?.trim() === 'Disconnect');
+    if (!confirm) throw new Error('OAuth disconnect confirmation not found');
+    fireEvent.click(confirm);
+    await waitFor(() =>
+      expect(toast.showError).toHaveBeenCalledWith(
+        "Couldn't remove the sign-in. (Token revocation was refused)"
+      )
+    );
+  });
+
+  it('offers Delete without detachment wording for a server with no attachments', async () => {
+    renderTab();
+    fireEvent.click(screen.getByRole('button', { name: 'Settings for GitHub' }));
+    const remove = await screen.findByRole('button', { name: 'Remove GitHub server' });
+    await waitFor(() => expect(remove).toBeEnabled());
+    await act(async () => {
+      fireEvent.click(remove);
+    });
+    const confirm = await screen.findByRole('button', { name: 'Delete' });
+    await waitFor(() => expect(confirm).toBeVisible());
+    expect(screen.getByText(/Delete this server and its saved connection/)).toBeVisible();
+    expect(screen.queryByText(/0 sessions are attached/)).not.toBeInTheDocument();
+  });
+
+  it('dismisses an open deletion confirmation when its attachment count changes', async () => {
+    const onRemove = vi.fn();
+    const props = {
+      server: { ...overview.servers[0], session_count: 2 },
+      connection: marketplaceCredentialPresentation(undefined),
+      attachments: [],
+      cursorAttached: false,
+      canRefresh: true,
+      canChangeTools: true,
+      canReconnect: true,
+      canRemove: true,
+      busy: new Set<string>(),
+      onClose: vi.fn(),
+      onAfterOpenChange: vi.fn(),
+      onRefreshTools: vi.fn(),
+      onToggleTool: vi.fn(),
+      onRemove,
+    };
+    const view = render(<ServerSettingsDrawer {...props} />);
+    const trigger = await screen.findByRole('button', { name: 'Remove GitHub server' });
+    await waitFor(() => expect(trigger).toBeVisible());
+    await act(async () => {
+      fireEvent.click(trigger);
+    });
+    const confirm = await screen.findByRole('button', { name: 'Delete and detach' });
+    // Poll the mounted node, not the whole drawer's accessible tree: repeated
+    // role/style walks can starve rc-trigger's prepare frames under CPU load.
+    await waitFor(() => expect(confirm).toBeVisible());
+    view.rerender(
+      <ServerSettingsDrawer {...props} server={{ ...props.server, session_count: 3 }} />
+    );
+    await waitFor(() =>
+      expect(screen.queryByRole('button', { name: 'Delete and detach' })).not.toBeInTheDocument()
+    );
+    expect(onRemove).not.toHaveBeenCalled();
+    expect(screen.getByRole('status')).toHaveTextContent('Attachment count changed');
+    expect(trigger).toHaveFocus();
+    fireEvent.click(screen.getByRole('button', { name: 'Remove GitHub server' }));
+    await waitFor(() => expect(screen.getByText(/3 sessions are attached/)).toBeVisible());
+    fireEvent.click(screen.getByRole('button', { name: 'Delete and detach' }));
+    expect(onRemove).toHaveBeenCalledWith({ ...props.server, session_count: 3 });
+  });
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it('renders a production empty state with a catalog route action', () => {
+    const browse = vi.fn();
+    render(
+      <MyServersTab
+        client={null}
+        connected={false}
+        connecting={false}
+        authGeneration={0}
+        currentUser={null}
+        overview={{ ...overview, servers: [], credentials: [] }}
+        loading={false}
+        error={null}
+        refresh={vi.fn(async () => undefined)}
+        onBrowseCatalog={browse}
+      />
+    );
+
+    expect(screen.getByText('No MCP servers installed')).toBeVisible();
+    fireEvent.click(screen.getByRole('button', { name: 'Browse catalog' }));
+    expect(browse).toHaveBeenCalledOnce();
+  });
+
+  it('keeps loading distinct from empty and offers recovery after an overview error', () => {
+    const empty = { ...overview, servers: [], credentials: [] };
+    const refresh = vi.fn(async () => undefined);
+    const props = {
+      client: null,
+      connected: false,
+      connecting: false,
+      authGeneration: 0,
+      currentUser: null,
+      overview: empty,
+      refresh,
+    };
+    const view = render(<MyServersTab {...props} loading error={null} />);
+
+    expect(screen.queryByText('No MCP servers installed')).not.toBeInTheDocument();
+    expect(screen.getByRole('table', { name: 'Installed MCP servers' })).toBeInTheDocument();
+
+    view.rerender(<MyServersTab {...props} loading={false} error="Overview read failed" />);
+    expect(screen.getByText('Could not load your servers')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    expect(refresh).toHaveBeenCalledOnce();
+  });
+
+  it('shows concise truthful inventory columns without inventing update state', async () => {
+    renderTab();
+    await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument());
+    expect(screen.getByRole('table', { name: 'Installed MCP servers' })).toBeVisible();
+    expect(screen.getByText('Connected')).toBeVisible();
+    expect(screen.getByText('1 of 1 enabled')).toBeVisible();
+    expect(screen.queryByText(/update available/i)).not.toBeInTheDocument();
+  });
+
+  it('describes a healthy open server as needing no account', async () => {
+    renderTab({ ...overview, credentials: [] });
+    await waitFor(() => expect(screen.getByText('No account needed')).toBeVisible());
+    fireEvent.click(screen.getByRole('button', { name: 'Settings for GitHub' }));
+    expect(await screen.findAllByText('No account needed')).not.toHaveLength(0);
+    expect(screen.queryByText('No credential status')).not.toBeInTheDocument();
+  });
+
+  it('shows disabled separately when a stale active OAuth projection is present', async () => {
+    renderTab({
+      ...overview,
+      servers: [{ ...overview.servers[0], enabled: false }],
+    });
+    await waitFor(() => expect(screen.getAllByText('Disabled').length).toBeGreaterThan(0));
+    expect(screen.queryByText('Connected')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Settings for GitHub' }));
+    const drawer = await screen.findByRole('dialog');
+    expect(within(drawer).getAllByText('Disabled').length).toBeGreaterThan(0);
+    expect(within(drawer).queryByText('OAuth · Connected')).not.toBeInTheDocument();
+    expect(within(drawer).queryByRole('button', { name: /Reconnect/ })).not.toBeInTheDocument();
+    expect(drawer).toHaveTextContent(/Disabling removes its saved OAuth connection/i);
+  });
+
+  it('opens the existing secure credential editor even with no session attachments', async () => {
+    const value: MCPMarketplaceOverview = {
+      ...overview,
+      // A Catalog install: custom servers reach the same editor via Edit configuration.
+      servers: [{ ...overview.servers[0], source: 'catalog' }],
+      credentials: [
+        {
+          ...overview.credentials[0],
+          method: 'bearer',
+          status: 'configured',
+        },
+      ],
+    };
+    const { service, get, onEditServer } = renderTab(value);
+    fireEvent.click(screen.getByRole('button', { name: 'Settings for GitHub' }));
+    const drawer = await screen.findByRole('dialog');
+    expect(within(drawer).getByText('No sessions are attached.')).toBeVisible();
+    fireEvent.click(within(drawer).getByRole('button', { name: 'Edit GitHub credential' }));
+
+    await waitFor(() => expect(service).toHaveBeenCalledWith('mcp-servers'));
+    expect(get).toHaveBeenCalledWith('server-1');
+    // The host's in-place editor gets the full server, not a modal over the Catalog.
+    await waitFor(() =>
+      expect(onEditServer).toHaveBeenCalledWith(
+        expect.objectContaining({ mcp_server_id: 'server-1' }),
+        'credential'
+      )
+    );
+  });
+
+  it('opens the host editor from Edit configuration for a custom server', async () => {
+    const { get, onEditServer } = renderTab();
+    expect(screen.getByText('Private')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Settings for GitHub' }));
+    const edit = await screen.findByRole('button', { name: 'Edit GitHub configuration' });
+    await waitFor(() => expect(edit).toBeEnabled());
+    fireEvent.click(edit);
+    await waitFor(() => expect(get).toHaveBeenCalledWith('server-1'));
+    await waitFor(() =>
+      expect(onEditServer).toHaveBeenCalledWith(
+        expect.objectContaining({ mcp_server_id: 'server-1' }),
+        'configuration'
+      )
+    );
+  });
+
+  it('offers one editor entry point for a custom server with a stored credential', async () => {
+    renderTab({
+      ...overview,
+      credentials: [{ ...overview.credentials[0], method: 'bearer', status: 'configured' }],
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Settings for GitHub' }));
+    await screen.findByRole('button', { name: 'Edit GitHub configuration' });
+    expect(
+      screen.queryByRole('button', { name: 'Edit GitHub credential' })
+    ).not.toBeInTheDocument();
+  });
+
+  it('links each session attachment to its session', async () => {
+    const onOpenSession = vi.fn();
+    const mocked = client();
+    render(
+      <MyServersTab
+        client={mocked.value}
+        connected
+        connecting={false}
+        authGeneration={1}
+        currentUser={{ user_id: 'alice', role: 'member' } as never}
+        overview={{
+          ...overview,
+          servers: [{ ...overview.servers[0], session_count: 1 }],
+          attachments: [
+            {
+              session_id: 'session-1',
+              mcp_server_id: 'server-1',
+              enabled: true,
+              session_title: 'Fix the build',
+            } as unknown as MCPMarketplaceOverview['attachments'][number],
+          ],
+        }}
+        loading={false}
+        error={null}
+        refresh={vi.fn(async () => undefined)}
+        onOpenSession={onOpenSession}
+      />
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Settings for GitHub' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Open session Fix the build' }));
+    expect(onOpenSession).toHaveBeenCalledWith('session-1');
+  });
+
+  it('does not offer Edit configuration for a Catalog install', async () => {
+    renderTab({ ...overview, servers: [{ ...overview.servers[0], source: 'catalog' }] });
+    fireEvent.click(screen.getByRole('button', { name: 'Settings for GitHub' }));
+    await screen.findByRole('button', { name: 'Refresh tools' });
+    expect(
+      screen.queryByRole('button', { name: 'Edit GitHub configuration' })
+    ).not.toBeInTheDocument();
+  });
+
+  it('disables Edit configuration without edit permission', async () => {
+    renderTab(overview, { policy: 'use_existing_only', canConfigure: false });
+    fireEvent.click(screen.getByRole('button', { name: 'Settings for GitHub' }));
+    expect(await screen.findByRole('button', { name: 'Edit GitHub configuration' })).toBeDisabled();
+  });
+
+  it('gives each settings action a contextual accessible name', async () => {
+    renderTab({
+      ...overview,
+      servers: [
+        overview.servers[0],
+        {
+          ...overview.servers[0],
+          mcp_server_id: 'server-2' as MCPServerID,
+          name: 'linear',
+          display_name: 'Linear',
+        },
+      ],
+    });
+
+    await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument());
+    expect(screen.getByRole('button', { name: 'Settings for GitHub' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Settings for Linear' })).toBeInTheDocument();
+  });
+
+  it('restores focus to the connected settings trigger after close', async () => {
+    renderTab();
+    const trigger = screen.getByRole('button', { name: 'Settings for GitHub' });
+    trigger.focus();
+    await act(async () => {
+      fireEvent.click(trigger);
+    });
+    await screen.findByRole('dialog');
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }));
+    await waitFor(() => expect(trigger).toHaveFocus());
+  });
+
+  it('closes the settings portal when its route tab becomes inactive', async () => {
+    const mocked = client();
+    const props = {
+      client: mocked.value,
+      connected: true,
+      connecting: false,
+      authGeneration: 1,
+      currentUser: { user_id: 'alice', role: 'member' } as never,
+      overview,
+      loading: false,
+      error: null,
+      refresh: vi.fn(async () => undefined),
+    };
+    const view = render(<MyServersTab {...props} active />);
+    fireEvent.click(screen.getByRole('button', { name: 'Settings for GitHub' }));
+    await screen.findByRole('dialog');
+
+    view.rerender(<MyServersTab {...props} active={false} />);
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+  });
+
+  it('closes after removing the last server and focuses the mounted empty inventory', async () => {
+    const mocked = client();
+    const emptyOverview = { ...overview, servers: [], credentials: [] };
+    const baseProps = {
+      client: mocked.value,
+      connected: true,
+      connecting: false,
+      authGeneration: 1,
+      currentUser: { user_id: 'alice', role: 'member' } as never,
+      loading: false,
+      error: null,
+    };
+    let view!: ReturnType<typeof render>;
+    const refresh = vi.fn(async () => {
+      view.rerender(<MyServersTab {...baseProps} overview={emptyOverview} refresh={refresh} />);
+    });
+    view = render(<MyServersTab {...baseProps} overview={overview} refresh={refresh} />);
+
+    fireEvent.click(settingsAction('server-1'));
+    await confirmServerRemoval('GitHub');
+
+    await waitFor(() => expect(refresh).toHaveBeenCalledOnce());
+    await waitFor(() => expect(screen.queryByText('Server settings')).not.toBeInTheDocument());
+    expect(screen.getByText('No MCP servers installed')).toBeVisible();
+    await waitFor(() =>
+      expect(screen.getByLabelText('Installed MCP server inventory')).toHaveFocus()
+    );
+  });
+
+  it.each(['stale', 'failed'] as const)(
+    'uses one bounded focus fallback after a %s removal refresh and ignores a late overview',
+    async (refreshResult) => {
+      const mocked = client();
+      const linear = {
+        ...overview.servers[0],
+        mcp_server_id: 'server-2' as MCPServerID,
+        name: 'linear',
+        display_name: 'Linear',
+      };
+      const twoServers = {
+        ...overview,
+        servers: [overview.servers[0], linear],
+        credentials: [
+          ...overview.credentials,
+          {
+            ...overview.credentials[0],
+            mcp_server_id: 'server-2' as MCPServerID,
+            server_name: 'linear',
+            server_display_name: 'Linear',
+          },
+        ],
+      };
+      const remaining = {
+        ...twoServers,
+        servers: [linear],
+        credentials: twoServers.credentials.filter(
+          (credential) => credential.mcp_server_id === 'server-2'
+        ),
+      };
+      const refresh =
+        refreshResult === 'failed'
+          ? vi.fn(async () => {
+              throw new Error('Removal refresh failed');
+            })
+          : vi.fn(async () => undefined);
+      const props = {
+        client: mocked.value,
+        connected: true,
+        connecting: false,
+        authGeneration: 1,
+        currentUser: { user_id: 'alice', role: 'member' } as never,
+        loading: false,
+        error: null,
+        refresh,
+      };
+      const view = render(<MyServersTab {...props} overview={twoServers} />);
+
+      fireEvent.click(settingsAction('server-1'));
+      await confirmServerRemoval('GitHub');
+
+      await waitFor(() => expect(refresh).toHaveBeenCalledOnce());
+      await waitFor(() => expect(screen.queryByText('Server settings')).not.toBeInTheDocument());
+      const inventory = screen.getByLabelText('Installed MCP server inventory');
+      await waitFor(() => expect(inventory).toHaveFocus());
+
+      const survivingAction = settingsAction('server-2');
+      survivingAction.focus();
+      await act(async () => {
+        view.rerender(<MyServersTab {...props} overview={remaining} />);
+        await new Promise((resolve) => window.setTimeout(resolve, 10));
+      });
+      expect(survivingAction).toHaveFocus();
+    }
+  );
+
+  it('opens settings with tools, redacted credential summary, sessions, and secure recovery', async () => {
+    const secret = 'oauth-live-secret-that-must-not-render';
+    const value = {
+      ...overview,
+      servers: [{ ...overview.servers[0], session_count: 1 }],
+      attachments: [
+        {
+          session_id: 'session-1',
+          mcp_server_id: 'server-1' as MCPServerID,
+          enabled: false,
+          added_at: new Date(0).toISOString(),
+          session_title: 'Triage bugs',
+          session_status: 'idle',
+          agentic_tool: 'claude-code',
+          branch_id: 'branch-1',
+          branch_name: 'fixes',
+        },
+      ],
+      credentials: [
+        {
+          ...overview.credentials[0],
+          status: 'attention',
+          detail_status: 'reauthentication_required',
+          oauth_access_token: secret,
+          masked_token: '••••1234',
+        },
+      ],
+    } as unknown as MCPMarketplaceOverview;
+    const { service } = renderTab(value);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Settings for GitHub' }));
+    const drawer = await screen.findByRole('dialog');
+    expect(within(drawer).getByText('Enabled tools')).toBeInTheDocument();
+    expect(within(drawer).getByText('Triage bugs · Disabled')).toBeInTheDocument();
+    expect(within(drawer).getByText('OAuth · Reconnect required')).toBeInTheDocument();
+    expect(drawer).not.toHaveTextContent(secret);
+    expect(drawer).not.toHaveTextContent('••••1234');
+    fireEvent.click(within(drawer).getByRole('button', { name: 'Reconnect GitHub account' }));
+    await waitFor(() => expect(service).toHaveBeenCalledWith('mcp-servers/oauth-start'));
+    expect(within(drawer).getByRole('button', { name: 'Remove GitHub server' })).toBeEnabled();
+  });
+
+  it('renders one deterministic drawer switch for a duplicate legacy tool identity', async () => {
+    renderTab({
+      ...overview,
+      servers: [
+        {
+          ...overview.servers[0],
+          tools: [
+            { name: 'issues.create', description: 'First description', permission: 'default' },
+            { name: 'issues.create', description: 'Conflicting duplicate', permission: 'deny' },
+          ],
+        },
+      ],
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Settings for GitHub' }));
+    const drawer = await screen.findByRole('dialog');
+
+    expect(within(drawer).getAllByText('issues.create')).toHaveLength(1);
+    expect(within(drawer).getByText('First description')).toBeVisible();
+    expect(within(drawer).queryByText('Conflicting duplicate')).not.toBeInTheDocument();
+    expect(
+      within(drawer).getAllByRole('switch', { name: 'GitHub: issues.create on' })
+    ).toHaveLength(1);
+  });
+
+  it('updates one tool locally without remounting, losing focus, or reloading the overview', async () => {
+    // Keep static AntD notifications out of jsdom teardown; tool updates stay local.
+    const success = toast.showSuccess;
+    const { service, create, refresh } = renderTab();
+    fireEvent.click(screen.getByRole('button', { name: 'Settings for GitHub' }));
+    const drawer = await screen.findByRole('dialog');
+    const control = await screen.findByRole('switch', { name: 'GitHub: issues.create on' });
+    await waitFor(() => expect(control).toBeEnabled());
+    control.focus();
+    fireEvent.click(control);
+
+    const optimistic = await screen.findByRole('switch', { name: 'GitHub: issues.create off' });
+    expect(optimistic).toBe(control);
+    expect(optimistic).not.toBeDisabled();
+    await waitFor(() => expect(success).toHaveBeenCalledWith('issues.create is off.'));
+    expect(screen.getByRole('dialog')).toBe(drawer);
+
+    await waitFor(() => expect(service).toHaveBeenCalledWith('mcp-marketplace/tool-permission'));
+    expect(create).toHaveBeenCalledWith({
+      mcp_server_id: 'server-1' as MCPServerID,
+      tool_name: 'issues.create',
+      enabled: false,
+    });
+    expect(refresh).not.toHaveBeenCalled();
+    expect(screen.getByRole('dialog')).toBe(drawer);
+  });
+
+  it('rolls back a failed optimistic tool change without remounting the drawer or switch', async () => {
+    const error = toast.showError;
+    const mocked = renderTab();
+    mocked.create.mockRejectedValueOnce(new Error('Permission write failed'));
+    fireEvent.click(screen.getByRole('button', { name: 'Settings for GitHub' }));
+    const drawer = await screen.findByRole('dialog');
+    const control = await screen.findByRole('switch', { name: 'GitHub: issues.create on' });
+    control.focus();
+
+    fireEvent.click(control);
+    expect(await screen.findByRole('switch', { name: 'GitHub: issues.create off' })).toBe(control);
+
+    await waitFor(() =>
+      expect(error).toHaveBeenCalledWith(
+        "Couldn't change the tool's permission. (Permission write failed)"
+      )
+    );
+    const rolledBack = screen.getByRole('switch', { name: 'GitHub: issues.create on' });
+    expect(rolledBack).toBe(control);
+    expect(rolledBack).not.toBeDisabled();
+    expect(rolledBack).toHaveAttribute('aria-busy', 'false');
+    expect(screen.getByRole('dialog')).toBe(drawer);
+    expect(mocked.refresh).not.toHaveBeenCalled();
+  });
+
+  it('keeps an in-flight tool override through conflicting overview snapshots', async () => {
+    let resolveMutation!: (value: unknown) => void;
+    const mutation = new Promise((resolve) => {
+      resolveMutation = resolve;
+    });
+    const mocked = client();
+    mocked.create.mockReturnValueOnce(mutation);
+    const props = {
+      client: mocked.value,
+      connected: true,
+      connecting: false,
+      authGeneration: 1,
+      currentUser: { user_id: 'alice', role: 'member' } as never,
+      loading: false,
+      error: null,
+      refresh: vi.fn(async () => undefined),
+    };
+    const view = render(<MyServersTab {...props} overview={overview} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Settings for GitHub' }));
+    const drawer = await screen.findByRole('dialog');
+    const control = await screen.findByRole('switch', { name: 'GitHub: issues.create on' });
+    fireEvent.click(control);
+    expect(await screen.findByRole('switch', { name: 'GitHub: issues.create off' })).toBe(control);
+
+    view.rerender(
+      <MyServersTab
+        {...props}
+        overview={{
+          ...overview,
+          servers: [
+            {
+              ...overview.servers[0],
+              tools: [{ ...overview.servers[0].tools[0], permission: 'deny' }],
+            },
+          ],
+        }}
+      />
+    );
+    view.rerender(<MyServersTab {...props} overview={overview} />);
+    expect(screen.getByRole('switch', { name: 'GitHub: issues.create off' })).toBe(control);
+    expect(screen.getByRole('dialog')).toBe(drawer);
+
+    resolveMutation({
+      mcp_server_id: 'server-1' as MCPServerID,
+      tool_name: 'issues.create',
+      permission: 'deny',
+    });
+    await waitFor(() => expect(control).toHaveAttribute('aria-busy', 'false'));
+  });
+
+  it('keeps multiple tool switches focusable while serializing permission writes with feedback', async () => {
+    const info = toast.showInfo;
+    let resolveMutation!: (value: unknown) => void;
+    const mutation = new Promise((resolve) => {
+      resolveMutation = resolve;
+    });
+    const value: MCPMarketplaceOverview = {
+      ...overview,
+      servers: [
+        {
+          ...overview.servers[0],
+          tools: [
+            ...overview.servers[0].tools,
+            { name: 'issues.read', description: 'Read an issue', permission: 'default' },
+          ],
+        },
+      ],
+    };
+    const mocked = client();
+    mocked.create.mockReturnValueOnce(mutation);
+    render(
+      <MyServersTab
+        client={mocked.value}
+        connected
+        connecting={false}
+        authGeneration={1}
+        currentUser={{ user_id: 'alice', role: 'member' } as never}
+        overview={value}
+        loading={false}
+        error={null}
+        refresh={vi.fn(async () => undefined)}
+      />
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Settings for GitHub' }));
+    const first = await screen.findByRole('switch', { name: 'GitHub: issues.create on' });
+    const second = screen.getByRole('switch', { name: 'GitHub: issues.read on' });
+    await waitFor(() => expect(first).toBeEnabled());
+    first.focus();
+    fireEvent.click(first);
+
+    await waitFor(() => expect(first).toHaveAttribute('aria-disabled', 'true'));
+    expect(first).not.toBeDisabled();
+    expect(first).toHaveFocus();
+    expect(first).toHaveAttribute('aria-disabled', 'true');
+    expect(first).toHaveAttribute('aria-busy', 'true');
+    expect(second).not.toBeDisabled();
+    expect(second).toHaveAttribute('aria-disabled', 'true');
+    fireEvent.click(second);
+    expect(mocked.create).toHaveBeenCalledTimes(1);
+    expect(info).toHaveBeenCalledWith(
+      'Wait for the current tool change to finish before changing another tool'
+    );
+
+    resolveMutation({
+      mcp_server_id: 'server-1' as MCPServerID,
+      tool_name: 'issues.create',
+      permission: 'deny',
+    });
+    await waitFor(() => expect(second).toHaveAttribute('aria-disabled', 'false'));
+    fireEvent.click(second);
+    await waitFor(() => expect(mocked.create).toHaveBeenCalledTimes(2));
+  });
+
+  it('does not start a tool toggle while automatic discovery is in flight', async () => {
+    const info = toast.showInfo;
+    const discovery = new Promise(() => undefined);
+    const value: MCPMarketplaceOverview = {
+      ...overview,
+      servers: [
+        {
+          ...overview.servers[0],
+          capabilities_discovered_at: new Date(0).toISOString(),
+        },
+      ],
+    };
+    const mocked = renderTab(value);
+    mocked.create.mockReturnValueOnce(discovery);
+    fireEvent.click(screen.getByRole('button', { name: 'Settings for GitHub' }));
+    const drawer = await screen.findByRole('dialog');
+    await within(drawer).findByText('Discovering tools…');
+    const control = within(drawer).getByRole('switch', { name: 'GitHub: issues.create on' });
+    control.focus();
+    expect(control).not.toBeDisabled();
+    expect(control).toHaveAttribute('aria-disabled', 'true');
+    expect(control).toHaveAttribute('aria-busy', 'true');
+
+    fireEvent.click(control);
+    fireEvent.click(within(drawer).getByRole('button', { name: 'Refresh tools' }));
+    expect(mocked.create).toHaveBeenCalledTimes(1);
+    expect(info).toHaveBeenCalledWith('Wait for tool discovery to finish before changing a tool.');
+    expect(within(drawer).getByRole('switch', { name: 'GitHub: issues.create on' })).toBe(control);
+    expect(control).toHaveFocus();
+    expect(within(drawer).getByRole('button', { name: 'Refresh tools' })).toHaveClass(
+      'ant-btn-loading'
+    );
+  });
+
+  it('disconnects OAuth only after confirmation and refreshes the redacted overview', async () => {
+    const { create, refresh } = renderTab();
+    fireEvent.click(settingsAction('server-1'));
+    fireEvent.click(await screen.findByLabelText('Disconnect GitHub OAuth connection'));
+    expect(create).not.toHaveBeenCalled();
+    const prompt = await screen.findByText('Disconnect GitHub?');
+    const confirm = Array.from(
+      prompt.closest('.ant-popover')?.querySelectorAll<HTMLButtonElement>('button') ?? []
+    ).find((button) => button.textContent?.trim() === 'Disconnect');
+    expect(confirm).toBeDefined();
+    if (!confirm) throw new Error('OAuth disconnect confirmation not found');
+    fireEvent.click(confirm);
+
+    await waitFor(() => expect(create).toHaveBeenCalledWith({ mcp_server_id: 'server-1' }));
+    await waitFor(() => expect(refresh).toHaveBeenCalledOnce());
+  });
+
+  it('auto-discovers absent tools once on drawer open and keeps manual refresh available', async () => {
+    let resolveDiscovery!: (value: unknown) => void;
+    const discovery = new Promise((resolve) => {
+      resolveDiscovery = resolve;
+    });
+    const value: MCPMarketplaceOverview = {
+      ...overview,
+      servers: [
+        {
+          ...overview.servers[0],
+          tools: [],
+          capabilities_discovered_at: undefined,
+        },
+      ],
+    };
+    const mocked = renderTab(value);
+    mocked.create.mockReturnValueOnce(discovery);
+
+    fireEvent.click(settingsAction('server-1'));
+    const discovering = await screen.findByText('Discovering tools…');
+    const drawerNode = discovering.closest('[role="dialog"]');
+    if (!(drawerNode instanceof HTMLElement)) throw new Error('Server settings drawer not found');
+    const drawer = within(drawerNode);
+    expect(discovering).toBeVisible();
+    expect(mocked.create).toHaveBeenCalledOnce();
+    expect(mocked.create).toHaveBeenCalledWith({ mcp_server_id: 'server-1' });
+
+    resolveDiscovery({
+      success: true,
+      tools: [
+        { name: 'read_wiki_contents', description: 'Read wiki pages' },
+        { name: 'read_wiki_contents', description: 'Conflicting duplicate' },
+        { name: 'read_wiki_structure', description: 'Read wiki structure' },
+      ],
+    });
+    expect(await drawer.findByText('read_wiki_contents')).toBeVisible();
+    expect(drawer.getAllByText('read_wiki_contents')).toHaveLength(1);
+    expect(drawer.getByText('Read wiki pages')).toBeVisible();
+    expect(drawer.queryByText('Conflicting duplicate')).not.toBeInTheDocument();
+    expect(drawer.getAllByLabelText('GitHub: read_wiki_contents on')).toHaveLength(1);
+    const refreshTools = drawer.getByText('Refresh tools').closest('button');
+    expect(refreshTools).toBeEnabled();
+    expect(mocked.refresh).toHaveBeenCalledTimes(1);
+
+    const close = drawer.getByLabelText('Close');
+    fireEvent.click(close);
+    await waitFor(() => expect(screen.queryByText('Server settings')).not.toBeInTheDocument());
+    fireEvent.click(settingsAction('server-1'));
+    await screen.findByText('Server settings');
+    expect(mocked.create).toHaveBeenCalledOnce();
+  });
+
+  it('auto-refreshes stale discovered tools and shows an honest inline failure', async () => {
+    const value: MCPMarketplaceOverview = {
+      ...overview,
+      servers: [
+        {
+          ...overview.servers[0],
+          capabilities_discovered_at: new Date(0).toISOString(),
+        },
+      ],
+    };
+    const mocked = renderTab(value);
+    mocked.create.mockResolvedValueOnce({ success: false, error: 'Provider is unavailable' });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Settings for GitHub' }));
+    const drawer = await screen.findByRole('dialog');
+    expect(await within(drawer).findByText("Couldn't refresh tools.")).toBeVisible();
+    fireEvent.click(within(drawer).getByRole('button', { name: 'Details' }));
+    expect(within(drawer).getByText('Provider is unavailable')).toBeVisible();
+    expect(within(drawer).getByText('issues.create')).toBeVisible();
+    expect(mocked.create).toHaveBeenCalledOnce();
+
+    fireEvent.click(within(drawer).getByRole('button', { name: 'Close' }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: 'Settings for GitHub' }));
+    const reopened = await screen.findByRole('dialog');
+    expect(within(reopened).queryByText("Couldn't refresh tools.")).not.toBeInTheDocument();
+    expect(within(reopened).queryByText('Provider is unavailable')).not.toBeInTheDocument();
+  });
+
+  it('waits for credential recovery, then auto-discovers while the drawer remains open', async () => {
+    const mocked = client();
+    const baseProps = {
+      client: mocked.value,
+      connected: true,
+      connecting: false,
+      authGeneration: 1,
+      currentUser: { user_id: 'alice', role: 'member' } as never,
+      loading: false,
+      error: null,
+      refresh: vi.fn(async () => undefined),
+    };
+    const unavailable: MCPMarketplaceOverview = {
+      ...overview,
+      servers: [{ ...overview.servers[0], tools: [], capabilities_discovered_at: undefined }],
+      credentials: [
+        {
+          ...overview.credentials[0],
+          status: 'attention',
+          detail_status: 'reauthentication_required',
+        },
+      ],
+    };
+    const view = render(<MyServersTab {...baseProps} overview={unavailable} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Settings for GitHub' }));
+    const drawer = await screen.findByRole('dialog');
+    await waitFor(() =>
+      expect(within(drawer).getByRole('button', { name: 'Refresh tools' })).toBeEnabled()
+    );
+    expect(mocked.create).not.toHaveBeenCalled();
+
+    view.rerender(
+      <MyServersTab
+        {...baseProps}
+        overview={{
+          ...unavailable,
+          credentials: [
+            {
+              ...overview.credentials[0],
+              status: 'active',
+              updated_at: new Date().toISOString(),
+            },
+          ],
+        }}
+      />
+    );
+
+    await waitFor(() => expect(mocked.create).toHaveBeenCalledWith({ mcp_server_id: 'server-1' }));
+    expect(screen.getByRole('dialog')).toBe(drawer);
+  });
+
+  it('waits for canonical OAuth refresh before automatically discovering expired credentials', async () => {
+    const mocked = client();
+    const baseProps = {
+      client: mocked.value,
+      connected: true,
+      connecting: false,
+      authGeneration: 1,
+      currentUser: { user_id: 'alice', role: 'member' } as never,
+      loading: false,
+      error: null,
+      refresh: vi.fn(async () => undefined),
+    };
+    const refreshable: MCPMarketplaceOverview = {
+      ...overview,
+      servers: [{ ...overview.servers[0], tools: [], capabilities_discovered_at: undefined }],
+      credentials: [
+        {
+          ...overview.credentials[0],
+          status: 'expired',
+          detail_status: 'refreshable',
+          expires_at: new Date(0).toISOString(),
+        },
+      ],
+    };
+    const view = render(<MyServersTab {...baseProps} overview={refreshable} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Settings for GitHub' }));
+    const drawer = await screen.findByRole('dialog');
+    await waitFor(() =>
+      expect(within(drawer).getByRole('button', { name: 'Refresh tools' })).toBeEnabled()
+    );
+    expect(mocked.create).not.toHaveBeenCalled();
+
+    view.rerender(
+      <MyServersTab
+        {...baseProps}
+        overview={{
+          ...refreshable,
+          credentials: [
+            {
+              ...refreshable.credentials[0],
+              status: 'active',
+              updated_at: new Date().toISOString(),
+            },
+          ],
+        }}
+      />
+    );
+
+    await waitFor(() => expect(mocked.create).toHaveBeenCalledWith({ mcp_server_id: 'server-1' }));
+    expect(screen.getByRole('dialog')).toBe(drawer);
+  });
+
+  it('shows a manual tool refresh failure inline with Try again, not as a toast', async () => {
+    const error = toast.showError;
+    const success = toast.showSuccess;
+    const mocked = client();
+    mocked.create.mockResolvedValue({ success: false, error: 'Provider is unavailable' });
+    const refresh = vi.fn(async () => undefined);
+    render(
+      <MyServersTab
+        client={mocked.value}
+        connected
+        connecting={false}
+        authGeneration={1}
+        currentUser={{ user_id: 'alice', role: 'member' } as never}
+        overview={overview}
+        loading={false}
+        error={null}
+        refresh={refresh}
+      />
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Settings for GitHub' }));
+    const refreshTools = await screen.findByRole('button', { name: 'Refresh tools' });
+    await waitFor(() => expect(refreshTools).toBeEnabled());
+    fireEvent.click(refreshTools);
+
+    expect(await screen.findByText("Couldn't refresh tools.")).toBeVisible();
+    expect(error).not.toHaveBeenCalled();
+    expect(success).not.toHaveBeenCalled();
+    expect(refresh).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByRole('button', { name: 'Try again' }));
+    await waitFor(() => expect(mocked.create).toHaveBeenCalledTimes(2));
+  });
+
+  it('fails closed when member policy permits reuse but not configuration', async () => {
+    renderTab(overview, { policy: 'use_existing_only', canConfigure: false });
+    fireEvent.click(screen.getByRole('button', { name: 'Settings for GitHub' }));
+    const tool = await screen.findByRole('switch', { name: 'GitHub: issues.create on' });
+    await waitFor(() => expect(tool).toBeDisabled());
+    expect(screen.getByRole('button', { name: 'Remove GitHub server' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Refresh tools' })).toBeEnabled();
+  });
+
+  const sharedOverview: MCPMarketplaceOverview = {
+    ...overview,
+    servers: [{ ...overview.servers[0], shared: true }],
+  };
+
+  it('tags a Shared server and lets a member manage it under allow_crud', async () => {
+    renderTab(sharedOverview, { policy: 'allow_crud' });
+    expect(screen.getByText('Shared')).toBeInTheDocument();
+    expect(screen.queryByText('Private')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Settings for GitHub' }));
+    const remove = await screen.findByRole('button', { name: 'Remove GitHub server' });
+    await waitFor(() => expect(remove).toBeEnabled());
+    expect(screen.getByRole('switch', { name: 'GitHub: issues.create on' })).toBeEnabled();
+  });
+
+  it('does not treat a Shared server as the member own under allow_private_only', async () => {
+    renderTab(sharedOverview, { policy: 'allow_private_only' });
+    fireEvent.click(screen.getByRole('button', { name: 'Settings for GitHub' }));
+    const tool = await screen.findByRole('switch', { name: 'GitHub: issues.create on' });
+    await waitFor(() => expect(tool).toBeDisabled());
+    expect(screen.getByRole('button', { name: 'Remove GitHub server' })).toBeDisabled();
+    // Discovery on a Shared row stays admin-only, as for any server the member does not own.
+    expect(screen.getByRole('button', { name: 'Refresh tools' })).toBeDisabled();
+  });
+
+  it.each([
+    { role: 'member', oauthMode: 'shared', allowed: false },
+    { role: 'admin', oauthMode: 'shared', allowed: true },
+    { role: 'member', oauthMode: 'per_user', allowed: true },
+  ] as const)(
+    'gates a Shared server $oauthMode OAuth grant for a $role under allow_crud',
+    async ({ role, oauthMode, allowed }) => {
+      renderTab(
+        {
+          ...sharedOverview,
+          credentials: [
+            {
+              ...overview.credentials[0],
+              oauth_mode: oauthMode,
+              status: 'attention',
+              detail_status: 'reauthentication_required',
+            },
+          ],
+        },
+        { policy: 'allow_crud', role }
+      );
+      fireEvent.click(screen.getByRole('button', { name: 'Settings for GitHub' }));
+      // Configuration authority lands first; the grant actions follow the grant mode.
+      const remove = await screen.findByRole('button', { name: 'Remove GitHub server' });
+      await waitFor(() => expect(remove).toBeEnabled());
+      const reconnect = screen.getByRole('button', { name: 'Reconnect GitHub account' });
+      const disconnect = screen.getByLabelText('Disconnect GitHub OAuth connection');
+      if (allowed) {
+        expect(reconnect).toBeEnabled();
+        expect(disconnect).toBeEnabled();
+      } else {
+        expect(reconnect).toBeDisabled();
+        expect(disconnect).toBeDisabled();
+        expect(screen.getByRole('switch', { name: 'GitHub: issues.create on' })).toBeEnabled();
+      }
+    }
+  );
+
+  it('keeps transport authority narrow for member-owned stdio servers', async () => {
+    renderTab({
+      ...overview,
+      servers: [{ ...overview.servers[0], transport: 'stdio' }],
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Settings for GitHub' }));
+    expect(await screen.findByRole('button', { name: 'Refresh tools' })).toBeDisabled();
+    expect(screen.getByRole('switch', { name: 'GitHub: issues.create on' })).toBeDisabled();
+  });
+
+  it('closes an open removal confirmation when authority is demoted', async () => {
+    const mocked = client();
+    const baseProps = {
+      client: mocked.value,
+      connected: true,
+      connecting: false,
+      authGeneration: 1,
+      overview,
+      loading: false,
+      error: null,
+      refresh: vi.fn(async () => undefined),
+    };
+    const view = render(
+      <MyServersTab {...baseProps} currentUser={{ user_id: 'alice', role: 'member' } as never} />
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Settings for GitHub' }));
+    const remove = await screen.findByRole('button', { name: 'Remove GitHub server' });
+    await waitFor(() => expect(remove).toBeEnabled());
+    await act(async () => {
+      fireEvent.click(remove);
+    });
+    await waitFor(() => expect(remove).toHaveClass('ant-popover-open'));
+
+    view.rerender(
+      <MyServersTab
+        {...baseProps}
+        authGeneration={2}
+        currentUser={{ user_id: 'alice', role: 'viewer' } as never}
+      />
+    );
+    await waitFor(() => expect(remove).not.toHaveClass('ant-popover-open'));
+  });
+});

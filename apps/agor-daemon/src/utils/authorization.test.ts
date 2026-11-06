@@ -1,0 +1,267 @@
+/**
+ * Authorization Utilities Tests
+ *
+ * Tests for role hierarchy, minimum role enforcement, and superadmin/owner backwards compat.
+ * Also verifies that `provider` presence controls whether auth hooks run.
+ */
+
+import { BadRequest, Forbidden, NotAuthenticated } from '@agor/core/feathers';
+import type { AuthenticatedParams, HookContext } from '@agor/core/types';
+import { BRANCH_ENVIRONMENT_SNAPSHOT_FIELDS, ROLES } from '@agor/core/types';
+import { describe, expect, it } from 'vitest';
+import {
+  ensureMinimumRole,
+  registerAuthenticatedRoute,
+  rejectNonScalarExternalId,
+  requireAdminForEnvConfig,
+  requireMinimumRole,
+} from './authorization';
+
+/** Helper to create authenticated params for a given role and provider */
+function makeParams(role: string, provider: string | undefined = 'rest'): AuthenticatedParams {
+  return {
+    user: {
+      user_id: 'user-test-0001',
+      email: 'test@example.com',
+      role,
+    },
+    authenticated: true,
+    provider,
+  } as AuthenticatedParams;
+}
+
+describe('environment configuration clears', () => {
+  it.each([null, undefined])(
+    'requires admin for explicit %s clears, including bulk patches',
+    (value) => {
+      const hook = requireAdminForEnvConfig();
+      for (const field of [
+        ...BRANCH_ENVIRONMENT_SNAPSHOT_FIELDS,
+        'environment',
+        'environment_config',
+        'cleanup_policy',
+        'environment_variant',
+      ]) {
+        for (const data of [{ [field]: value }, [{ notes: 'unchanged' }, { [field]: value }]]) {
+          const context = { data, params: makeParams(ROLES.MEMBER) } as HookContext;
+          expect(() => hook(context)).toThrow(Forbidden);
+          context.params = makeParams(ROLES.ADMIN);
+          expect(() => hook(context)).not.toThrow();
+        }
+      }
+      expect(() =>
+        hook({
+          data: { notes: 'not environment config' },
+          params: makeParams(ROLES.MEMBER),
+        } as HookContext)
+      ).not.toThrow();
+    }
+  );
+});
+
+describe('ensureMinimumRole', () => {
+  describe('role hierarchy', () => {
+    it('superadmin passes admin check', () => {
+      expect(() => ensureMinimumRole(makeParams(ROLES.SUPERADMIN), ROLES.ADMIN)).not.toThrow();
+    });
+
+    it('admin passes member check', () => {
+      expect(() => ensureMinimumRole(makeParams(ROLES.ADMIN), ROLES.MEMBER)).not.toThrow();
+    });
+
+    it('member fails admin check', () => {
+      expect(() => ensureMinimumRole(makeParams(ROLES.MEMBER), ROLES.ADMIN)).toThrow(Forbidden);
+    });
+
+    it('viewer fails member check', () => {
+      expect(() => ensureMinimumRole(makeParams(ROLES.VIEWER), ROLES.MEMBER)).toThrow(Forbidden);
+    });
+
+    it('deprecated owner role treated as superadmin rank', () => {
+      expect(() => ensureMinimumRole(makeParams('owner'), ROLES.ADMIN)).not.toThrow();
+      expect(() => ensureMinimumRole(makeParams('owner'), ROLES.SUPERADMIN)).not.toThrow();
+    });
+  });
+
+  describe('provider gating', () => {
+    it('skips auth check when params is undefined (internal call)', () => {
+      expect(() => ensureMinimumRole(undefined, ROLES.ADMIN)).not.toThrow();
+    });
+
+    it('skips auth check when provider is absent (internal call)', () => {
+      // Params object without provider property — simulates daemon-internal calls
+      const params = {
+        user: { user_id: 'u1', email: 'a@b.c', role: ROLES.VIEWER },
+        authenticated: true,
+      } as AuthenticatedParams;
+      expect(() => ensureMinimumRole(params, ROLES.ADMIN)).not.toThrow();
+    });
+
+    it('enforces auth check when provider is set', () => {
+      expect(() => ensureMinimumRole(makeParams(ROLES.VIEWER, 'rest'), ROLES.ADMIN)).toThrow(
+        Forbidden
+      );
+    });
+
+    it('enforces auth check when provider is "mcp"', () => {
+      expect(() => ensureMinimumRole(makeParams(ROLES.VIEWER, 'mcp'), ROLES.ADMIN)).toThrow(
+        Forbidden
+      );
+    });
+
+    it('enforces auth check when provider is "socketio"', () => {
+      expect(() => ensureMinimumRole(makeParams(ROLES.VIEWER, 'socketio'), ROLES.ADMIN)).toThrow(
+        Forbidden
+      );
+    });
+  });
+
+  describe('MCP auth parity with REST', () => {
+    const roles = [ROLES.SUPERADMIN, ROLES.ADMIN, ROLES.MEMBER, ROLES.VIEWER] as const;
+    const minimumRoles = [ROLES.SUPERADMIN, ROLES.ADMIN, ROLES.MEMBER, ROLES.VIEWER] as const;
+
+    for (const role of roles) {
+      for (const minRole of minimumRoles) {
+        it(`${role} vs ${minRole}: MCP and REST produce same result`, () => {
+          const restParams = makeParams(role, 'rest');
+          const mcpParams = makeParams(role, 'mcp');
+
+          let restResult: 'pass' | string;
+          let mcpResult: 'pass' | string;
+
+          try {
+            ensureMinimumRole(restParams, minRole);
+            restResult = 'pass';
+          } catch (e) {
+            restResult = (e as Error).constructor.name;
+          }
+
+          try {
+            ensureMinimumRole(mcpParams, minRole);
+            mcpResult = 'pass';
+          } catch (e) {
+            mcpResult = (e as Error).constructor.name;
+          }
+
+          expect(mcpResult).toBe(restResult);
+        });
+      }
+    }
+  });
+
+  describe('edge cases', () => {
+    it('throws NotAuthenticated when params is undefined', () => {
+      // With provider set but no user
+      const params = { provider: 'rest' } as AuthenticatedParams;
+      expect(() => ensureMinimumRole(params, ROLES.MEMBER)).toThrow(NotAuthenticated);
+    });
+
+    it('skips check for service accounts', () => {
+      const params = {
+        user: {
+          user_id: 'svc-001',
+          email: 'svc@internal',
+          role: ROLES.VIEWER,
+          _isServiceAccount: true,
+        },
+        authenticated: true,
+        provider: 'rest',
+      } as AuthenticatedParams;
+      expect(() => ensureMinimumRole(params, ROLES.ADMIN)).not.toThrow();
+    });
+  });
+});
+
+describe('requireMinimumRole (hook factory)', () => {
+  it('returns a function that checks role on hook context', () => {
+    const hook = requireMinimumRole(ROLES.ADMIN, 'test action');
+    expect(typeof hook).toBe('function');
+
+    // Simulate hook context with admin user and provider set
+    const context = {
+      params: makeParams(ROLES.ADMIN, 'rest'),
+    } as import('@agor/core/types').HookContext;
+
+    expect(() => hook(context)).not.toThrow();
+  });
+
+  it('throws when role is insufficient', () => {
+    const hook = requireMinimumRole(ROLES.ADMIN, 'test action');
+    const context = {
+      params: makeParams(ROLES.MEMBER, 'mcp'),
+    } as import('@agor/core/types').HookContext;
+
+    expect(() => hook(context)).toThrow(Forbidden);
+  });
+});
+
+describe('registerAuthenticatedRoute', () => {
+  it('authorizes an executor credential as its delegated user on custom routes', async () => {
+    const installed: { before?: Record<string, Array<(context: HookContext) => unknown>> } = {};
+    const app = {
+      use: () => undefined,
+      service: () => ({
+        hooks: (hooks: { before: Record<string, Array<(context: HookContext) => unknown>> }) => {
+          installed.before = hooks.before;
+        },
+      }),
+    };
+    const requireAuth = async (context: HookContext) => context;
+
+    registerAuthenticatedRoute(
+      app,
+      '/messages/streaming',
+      { async create() {} },
+      { create: { role: ROLES.MEMBER, action: 'stream messages' } },
+      requireAuth
+    );
+
+    const context = {
+      path: 'messages/streaming',
+      method: 'create',
+      data: { event: 'streaming:start', data: { task_id: 'other-task' } },
+      params: {
+        provider: 'rest',
+        user: { user_id: 'u1', email: 'a@b.c', role: ROLES.MEMBER },
+        authentication: {
+          strategy: 'jwt',
+          payload: {
+            type: 'executor-session',
+            purpose: 'executor-task',
+            session_id: 'session-1',
+            task_id: 'task-1',
+          },
+        },
+      },
+    } as HookContext;
+
+    const hooks = installed.before?.create ?? [];
+    expect(hooks).toHaveLength(2);
+    for (const hook of hooks) {
+      await expect(Promise.resolve(hook(context))).resolves.toBe(context);
+    }
+  });
+});
+
+describe('rejectNonScalarExternalId', () => {
+  const context = (method: string, id: unknown, provider?: string) =>
+    ({ method, id, params: { provider } }) as unknown as HookContext;
+
+  it('rejects array and object IDs from transports on single-record methods', () => {
+    for (const method of ['get', 'update', 'patch', 'remove']) {
+      for (const id of [['a'], { id: 'a' }]) {
+        expect(() => rejectNonScalarExternalId(context(method, id, 'socketio'))).toThrow(
+          BadRequest
+        );
+      }
+    }
+  });
+
+  it('keeps scalar, multi (null) and internal calls unchanged', () => {
+    for (const id of ['a', 7, null, undefined]) {
+      expect(() => rejectNonScalarExternalId(context('patch', id, 'rest'))).not.toThrow();
+    }
+    expect(() => rejectNonScalarExternalId(context('patch', ['a']))).not.toThrow();
+    expect(() => rejectNonScalarExternalId(context('find', ['a'], 'rest'))).not.toThrow();
+  });
+});

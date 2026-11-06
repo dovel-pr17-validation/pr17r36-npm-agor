@@ -1,0 +1,227 @@
+/**
+ * App-level constants for Agor
+ *
+ * Centralized configuration values that can be easily tweaked.
+ */
+
+/**
+ * Daemon Constants
+ */
+export const DAEMON = {
+  /**
+   * Default daemon port
+   */
+  DEFAULT_PORT: 3030,
+
+  /**
+   * Default daemon host
+   */
+  DEFAULT_HOST: 'localhost',
+} as const;
+
+/**
+ * Environment Management Constants
+ */
+export const ENVIRONMENT = {
+  /** Maximum operator guidance length, also enforced before Markdown rendering. */
+  DISCLAIMER_MAX_LENGTH: 4000,
+
+  /**
+   * Health check interval in milliseconds
+   * How often to poll environment health when status is 'running'
+   */
+  HEALTH_CHECK_INTERVAL_MS: 5000, // 5 seconds
+
+  /**
+   * Health check timeout in milliseconds
+   * How long to wait for health check response before considering it failed
+   */
+  HEALTH_CHECK_TIMEOUT_MS: 1000, // 1 second
+
+  /**
+   * Maximum number of log lines to store per branch
+   * (Not stored in DB - reference for future log file implementation)
+   */
+  MAX_LOG_LINES: 100,
+
+  /**
+   * Process startup grace period in milliseconds
+   * How long to wait after starting before running health checks
+   */
+  STARTUP_GRACE_PERIOD_MS: 3000, // 3 seconds
+
+  /**
+   * Maximum consecutive health check failures before marking as 'error'
+   */
+  MAX_HEALTH_CHECK_FAILURES: 3,
+
+  /**
+   * Logs command timeout in milliseconds
+   * How long to wait for logs command to complete
+   */
+  LOGS_TIMEOUT_MS: 30_000, // 30 seconds
+
+  /**
+   * Maximum number of log lines to return from logs command
+   * Prevents daemon crashes from massive log outputs
+   */
+  LOGS_MAX_LINES: 500,
+
+  /**
+   * Maximum bytes to read from logs command output
+   * Prevents memory issues (100KB limit)
+   */
+  LOGS_MAX_BYTES: 100_000, // 100KB
+} as const;
+
+/**
+ * WebSocket Constants
+ */
+export const WEBSOCKET = {
+  /**
+   * Cursor position broadcast throttle in milliseconds
+   */
+  CURSOR_THROTTLE_MS: 100,
+
+  /**
+   * Presence timeout in milliseconds (when to mark user as stale)
+   */
+  PRESENCE_TIMEOUT_MS: 10000, // 10 seconds
+} as const;
+
+/** Shared Socket.IO packet ceiling used by the daemon transport. */
+export const SOCKET_IO_MAX_BUFFER_SIZE_BYTES = 1_000_000;
+
+/** Executor Feathers RPC acknowledgement deadline. */
+export const EXECUTOR_FEATHERS_ACK_TIMEOUT_MS = 60_000;
+
+/**
+ * Browser Feathers RPC acknowledgement deadline. Any deadline makes Socket.IO
+ * reject calls in flight at disconnect instead of silently dropping them; the
+ * value only bounds a connected daemon that never replies. It must exceed the
+ * slowest awaited browser call (an environment restart waits on its stop
+ * command for up to ~29 minutes).
+ */
+export const BROWSER_FEATHERS_ACK_TIMEOUT_MS = 60 * 60_000;
+
+/** Extra time for bounded transport cleanup after the executor RPC deadline. */
+export const EXECUTOR_REVOCATION_TRANSPORT_CLEANUP_MARGIN_MS = 5_000;
+
+export const EXECUTOR_REVOCATION_TRANSPORT_CLEANUP_TIMEOUT_MS =
+  EXECUTOR_FEATHERS_ACK_TIMEOUT_MS + EXECUTOR_REVOCATION_TRANSPORT_CLEANUP_MARGIN_MS;
+
+/**
+ * Pagination Constants
+ *
+ * High limits to avoid silent truncation of results.
+ * FeathersJS pagination defaults were causing data loss when collections grew.
+ */
+export const PAGINATION = {
+  /**
+   * Default limit for services/UI - high enough to fetch "all" in practice
+   */
+  DEFAULT_LIMIT: 10_000,
+
+  /**
+   * Maximum allowed limit - prevents accidental DoS from unbounded queries
+   */
+  MAX_LIMIT: 10_000,
+
+  /** Offset ceiling for services using the common Feathers query schema. */
+  MAX_SKIP: 10_000,
+
+  /**
+   * Default limit for CLI list commands - reasonable for terminal display
+   */
+  CLI_DEFAULT_LIMIT: 50,
+
+  /**
+   * Maximum ids in one `{ $in: [...] }` id-list read (`session_id`,
+   * `branch_id`). Larger sets are split into chunks by the caller.
+   */
+  MAX_ID_LIST: 200,
+
+  /** Maximum rows returned by one `branches.find({ teammate: true })` read. */
+  MAX_TEAMMATE_BRANCHES: 1_000,
+} as const;
+
+/**
+ * Error message thrown by the client `findAll()` helper when offset pagination
+ * sees the collection change between pages.
+ */
+export const PAGINATION_CHURN_MESSAGE = 'Paginated findAll() changed while pages were being read';
+
+/**
+ * Knowledge document list pages. Access, sort and paging are evaluated in SQL,
+ * and only the returned page is attributed or hydrated, so a list never pulls
+ * the whole corpus. Callers that genuinely need every readable document (the
+ * Knowledge sidebar tree, CLI listings) walk pages with the client's
+ * `findAll()`; the query schema therefore leaves `$skip` unbounded.
+ */
+export const KNOWLEDGE_DOCUMENT_PAGINATION = {
+  DEFAULT_LIMIT: 100,
+  MAX_LIMIT: 500,
+} as const;
+
+/**
+ * Messages carry transcript/tool payloads and are materially heavier than most
+ * list resources. Keep each transport page small; callers that intentionally
+ * need a complete Task transcript use the client's paginated `findAll()` loop.
+ */
+export const MESSAGE_PAGINATION = {
+  /** Maximum task IDs in one session-scoped transcript query. */
+  MAX_TASK_IDS: 100,
+  DEFAULT_LIMIT: 100,
+  MAX_LIMIT: 1_000,
+} as const;
+
+/**
+ * Tasks loaded by ID: the lean transcript reads a page of its Session's
+ * dispatch order (`Session.tasks`) in one session-scoped `task_id: { $in }`.
+ */
+export const TASK_PAGINATION = {
+  /** Maximum task IDs in one session-scoped Task query. */
+  MAX_TASK_IDS: 100,
+} as const;
+
+/**
+ * Git Constants
+ */
+export const GIT = {
+  /**
+   * Default branch base path (relative to ~/.agor)
+   */
+  BRANCH_BASE_PATH: 'branches',
+
+  /**
+   * Default repo clone path (relative to ~/.agor)
+   */
+  REPO_BASE_PATH: 'repos',
+} as const;
+
+/**
+ * MCP Token Constants
+ */
+export const MCP_TOKEN = {
+  /**
+   * Default lifetime for internal MCP session tokens in milliseconds.
+   * Keep short to bound the blast radius of a leaked token — there is no
+   * revocation mechanism; `exp` is the only backstop.
+   */
+  DEFAULT_EXPIRATION_MS: 24 * 60 * 60 * 1000, // 24 hours
+} as const;
+
+/**
+ * Session Constants
+ */
+export const SESSION = {
+  /**
+   * Maximum number of messages to load initially
+   */
+  INITIAL_MESSAGE_LOAD: 100,
+
+  /**
+   * Message streaming chunk size
+   */
+  STREAMING_CHUNK_SIZE: 1,
+} as const;

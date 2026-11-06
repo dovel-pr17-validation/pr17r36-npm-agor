@@ -1,0 +1,130 @@
+import { chmod, copyFile, mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { resolveManagedAgenticToolPackageDirectory } from '@agor/core/agentic-integrations';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { OPENCODE_VERSION } from '../shared/known-models.js';
+import {
+  assertOpenCodeBinaryCompatibility,
+  getOpenCodeNativePackageName,
+  readOpenCodeBinaryVersion,
+  resolvePackagedOpenCodeBinary,
+} from './binary.js';
+
+vi.mock('@agor/core/agentic-integrations', () => ({
+  resolveManagedAgenticToolPackageDirectory: vi.fn(),
+}));
+
+const temporaryDirectories: string[] = [];
+
+async function versionBinary(output: string) {
+  const directory = await mkdtemp(join(tmpdir(), 'agor-opencode-version-'));
+  temporaryDirectories.push(directory);
+  const binary = join(directory, 'opencode');
+  await writeFile(binary, `#!/bin/sh\nprintf '%s\\n' '${output}'\n`);
+  await chmod(binary, 0o755);
+  return binary;
+}
+
+afterEach(async () => {
+  vi.unstubAllEnvs();
+  vi.resetAllMocks();
+  await Promise.all(
+    temporaryDirectories
+      .splice(0)
+      .map((directory) => rm(directory, { recursive: true, force: true }))
+  );
+});
+
+describe.skipIf(process.platform === 'win32')('OpenCode binary compatibility', () => {
+  it('executes the managed native optional package without a postinstall launcher or Node', async () => {
+    vi.stubEnv('AGOR_MANAGED_AGENTIC_TOOLS', '1');
+    vi.stubEnv('AGOR_VERSION', '1.2.3');
+    const fixture = await versionBinary(OPENCODE_VERSION);
+    const directory = dirname(fixture);
+    await mkdir(join(directory, 'bin'));
+    const binary = join(directory, 'bin', 'opencode');
+    await copyFile(fixture, binary);
+    vi.mocked(resolveManagedAgenticToolPackageDirectory).mockResolvedValue(directory);
+
+    await expect(resolvePackagedOpenCodeBinary()).resolves.toEqual({
+      executable: binary,
+      argsPrefix: [],
+    });
+    expect(resolveManagedAgenticToolPackageDirectory).toHaveBeenCalledWith(
+      'opencode',
+      '1.2.3',
+      expect.stringMatching(/^opencode-(linux|darwin)-/),
+      'opencode-ai'
+    );
+  });
+
+  it('does not fall back to a host binary when the managed package fails containment', async () => {
+    vi.stubEnv('AGOR_MANAGED_AGENTIC_TOOLS', '1');
+    vi.stubEnv('AGOR_VERSION', '1.2.3');
+    vi.stubEnv('AGOR_OPENCODE_PATH', await versionBinary(OPENCODE_VERSION));
+    vi.mocked(resolveManagedAgenticToolPackageDirectory).mockRejectedValue(
+      new Error('native package resolved outside the managed directory')
+    );
+    await expect(resolvePackagedOpenCodeBinary()).rejects.toThrow('outside the managed directory');
+  });
+
+  it('accepts the CLI version pinned to the SDK', async () => {
+    const binary = await versionBinary(`opencode version ${OPENCODE_VERSION}`);
+
+    await expect(readOpenCodeBinaryVersion(binary)).resolves.toBe(OPENCODE_VERSION);
+    await expect(assertOpenCodeBinaryCompatibility(binary)).resolves.toBe(OPENCODE_VERSION);
+  });
+
+  it('probes the version without writing into the real home', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'agor-opencode-home-'));
+    temporaryDirectories.push(home);
+    vi.stubEnv('HOME', home);
+    const directory = await mkdtemp(join(tmpdir(), 'agor-opencode-version-'));
+    temporaryDirectories.push(directory);
+    const binary = join(directory, 'opencode');
+    await writeFile(
+      binary,
+      `#!/bin/sh\nmkdir -p "$HOME/.config/opencode"\nprintf '%s\\n' '${OPENCODE_VERSION}'\n`
+    );
+    await chmod(binary, 0o755);
+    await expect(assertOpenCodeBinaryCompatibility(binary)).resolves.toBe(OPENCODE_VERSION);
+    await expect(readdir(home)).resolves.toEqual([]);
+  });
+
+  it('rejects a CLI version that can drift from the pinned SDK', async () => {
+    const binary = await versionBinary('opencode version 9.9.9');
+
+    await expect(assertOpenCodeBinaryCompatibility(binary)).rejects.toThrow(
+      `OpenCode CLI 9.9.9 is incompatible with Agor's pinned SDK ${OPENCODE_VERSION}`
+    );
+  });
+
+  it('rejects unparseable version output', async () => {
+    const binary = await versionBinary('unknown');
+
+    await expect(readOpenCodeBinaryVersion(binary)).rejects.toThrow(
+      'Could not parse OpenCode version'
+    );
+  });
+});
+
+describe('OpenCode native optional package selection', () => {
+  it.each([
+    ['linux', 'x64', false, 'opencode-linux-x64-baseline'],
+    ['linux', 'x64', true, 'opencode-linux-x64-baseline-musl'],
+    ['linux', 'arm64', false, 'opencode-linux-arm64'],
+    ['linux', 'arm64', true, 'opencode-linux-arm64-musl'],
+    ['darwin', 'x64', false, 'opencode-darwin-x64-baseline'],
+    ['darwin', 'arm64', false, 'opencode-darwin-arm64'],
+    ['win32', 'x64', false, 'opencode-windows-x64-baseline'],
+    ['win32', 'arm64', false, 'opencode-windows-arm64'],
+  ] as const)('selects %s/%s (musl=%s)', (platform, arch, musl, expected) => {
+    expect(getOpenCodeNativePackageName(platform, arch, musl)).toBe(expected);
+  });
+
+  it('fails closed for unsupported platforms and architectures', () => {
+    expect(() => getOpenCodeNativePackageName('freebsd', 'x64', false)).toThrow('does not support');
+    expect(() => getOpenCodeNativePackageName('linux', 'ia32', false)).toThrow('does not support');
+  });
+});

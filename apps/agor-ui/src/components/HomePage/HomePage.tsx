@@ -1,0 +1,582 @@
+import type { AgorClient, HomeWorkView, User } from '@agor-live/client';
+import { HOME_WORK_VIEWS, hasMinimumRole, ROLES } from '@agor-live/client';
+import { Alert, Button, Flex, Skeleton, Typography, theme } from 'antd';
+import { memo, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
+import { useLocation, useNavigate } from 'react-router-dom';
+import { useConnectionDisabled, useConnectionState } from '../../contexts/ConnectionContext';
+import { useMCPCatalogModal } from '../../contexts/MCPCatalogModalContext';
+import type { NewSessionConfig, SessionCreationResult } from '../../domain/sessionCreation';
+import { useCommentsForYou } from '../../hooks/useCommentsForYou';
+import { useConfirmArchiveSession } from '../../hooks/useConfirmArchiveSession';
+import { useIdleReady } from '../../hooks/useIdleReady';
+import { useIsMobileViewport } from '../../hooks/useIsMobileViewport';
+import { useLocalStorage } from '../../hooks/useLocalStorage';
+import { useHomeViewAnalytics } from '../../hooks/useProductAnalytics';
+import { useStableCallback } from '../../hooks/useStableCallback';
+import { useUserLocalStorage } from '../../hooks/useUserLocalStorage';
+import {
+  type AgorState,
+  agorStore,
+  shallow,
+  useAgorStore,
+  useStoreWithEqualityFn,
+} from '../../store/agorStore';
+import {
+  compareHomeNeeds,
+  HOME_RECENT_BOARDS,
+  type HomeCommentNeed,
+  type HomeSessionNeed,
+  isUnreadResult,
+  lastRunStartedAt,
+  liveBoardIds,
+  makeHomeBucketsSelector,
+} from '../../store/selectors';
+import {
+  selectHomeBranchesLoaded,
+  selectMySessionsLoaded,
+  selectMySessionsTruncated,
+} from '../../store/userScope';
+import { useThemedMessage } from '../../utils/message';
+import { runWithLimit } from '../../utils/promisePool';
+import {
+  OPEN_BOARD_SWITCHER_EVENT,
+  OPEN_GLOBAL_SEARCH_EVENT,
+  requestShellPicker,
+} from '../../utils/shellEvents';
+import { patchUserPreferences } from '../../utils/userPreferences';
+import type { CreateModalKind } from '../CreateMenu';
+import { HomeAskBox } from './HomeAskBox';
+import { HomeKnowledgeSection } from './HomeKnowledgeSection';
+import { HomeMyWork, MY_WORK_PAGE, type MyWorkTab } from './HomeMyWork';
+import { HomeNeedsYou, NEEDS_MAX, NEEDS_PREVIEW, type NeedsFilter } from './HomeNeedsYou';
+import { HomeRecentBoards } from './HomeRecentBoards';
+import { HomeFrame } from './HomeSection';
+import { HomeTeammatesSection } from './HomeTeammates';
+import {
+  formatCount,
+  HOME_MAIN_COLUMN_BASIS,
+  HOME_PAGE_TITLE_LEVEL,
+  HOME_RAIL_BASIS,
+} from './homeLayout';
+import { OnboardingCard } from './OnboardingCard';
+import {
+  asOpenedFailures,
+  NO_OPENED_FAILURES,
+  OPENED_FAILURES_KEY,
+  openedAt,
+  openedRunsOf,
+} from './openedFailures';
+import type { HomeNeeds } from './useHomeNeeds';
+
+const ONBOARDING_HIDDEN_KEY = 'agor:onboarding-card-hidden';
+// Longer than the 7-day failure window, since a later patch can keep an old failure in view.
+const OPENED_FAILURES_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
+/** Mark all as read patches a few sessions at a time, not the whole backlog at once. */
+const MARK_ALL_CONCURRENCY = 4;
+const NO_BOARD_IDS: string[] = [];
+const isHomeWorkView = (value: unknown): value is HomeWorkView =>
+  HOME_WORK_VIEWS.includes(value as HomeWorkView);
+
+/** Route state other surfaces use to land on part of Home. */
+export interface HomeLocationState {
+  needsFilter?: NeedsFilter;
+}
+
+export interface HomePageProps {
+  client: AgorClient | null;
+  currentUser?: User | null;
+  recentBoardIds?: string[];
+  onBoardClick: (boardId: string) => void;
+  /** `boardId` is where the branch lives, for callers that can't find the branch itself. */
+  onBranchClick: (branchId: string, boardId: string) => void;
+  onSessionClick: (sessionId: string) => void;
+  /** Omitted for callers who can't start sessions: the ask box hides. */
+  onCreateSession?: (
+    config: NewSessionConfig,
+    boardId: string
+  ) => Promise<SessionCreationResult | null>;
+  /** Board and teammate onboarding steps open the shared create modals. */
+  onOpenCreateDialog?: (kind: CreateModalKind) => void;
+  onOpenSettings?: (section: 'repos' | 'users') => void;
+  /** Defaults to the header board switcher. */
+  onAllBoards?: () => void;
+  /** Defaults to header search filtered to sessions. */
+  onSeeAllSessions?: () => void;
+  /** Opens the teammates directory; the rail's "See all" hides without it. */
+  onSeeAllTeammates?: () => void;
+  /**
+   * The shell's "need you" result and clock (`useHomeNeeds`), so Home and the
+   * mobile tab bar badge show one number and Home skips its own needs pass.
+   * Without it Home computes its own.
+   */
+  homeNeeds?: HomeNeeds;
+}
+
+const scrollToSection = (id: string) =>
+  document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+
+const focusAsk = () => {
+  scrollToSection('ask');
+  document.querySelector<HTMLTextAreaElement>('#ask textarea')?.focus();
+};
+
+function greeting(date = new Date()) {
+  const hour = date.getHours();
+  return hour < 12 ? 'morning' : hour < 18 ? 'afternoon' : 'evening';
+}
+
+// Counts wait for the user scope: all of my sessions and every branch they or
+// my comment threads reference (never for the whole workspace).
+const selectHydrated = (s: AgorState) => selectMySessionsLoaded(s) && selectHomeBranchesLoaded(s);
+// My sessions hit the single read's cap: session counts are lower bounds ("N+").
+const selectTruncated = selectMySessionsTruncated;
+
+/** Onboarding steps the caller can perform, subscribed only while the card can still show. */
+const HomeOnboarding: React.FC<{
+  isAdmin: boolean;
+  /** Without it there is no ask box, so the session step hides. */
+  canStartSessions: boolean;
+  onOpenCreateDialog?: HomePageProps['onOpenCreateDialog'];
+  onOpenSettings: NonNullable<HomePageProps['onOpenSettings']>;
+  onDismiss: () => void;
+}> = ({ isAdmin, canStartSessions, onOpenCreateDialog, onOpenSettings, onDismiss }) => {
+  // MCP tools are set up in the MCP Marketplace, not in Settings.
+  const catalog = useMCPCatalogModal();
+  const done = useStoreWithEqualityFn(
+    agorStore,
+    (s) => ({
+      repo: s.repoById.size > 0,
+      board: s.boardById.size > 0,
+      mcp: s.mcpServerById.size > 0,
+      invite: s.userById.size > 1,
+    }),
+    shallow
+  );
+  const steps = [
+    {
+      id: 'repo',
+      label: 'Connect a repository',
+      cta: 'Connect',
+      done: done.repo,
+      onClick: () => onOpenSettings('repos'),
+    },
+    {
+      id: 'board',
+      label: 'Create your first board',
+      cta: 'Create',
+      done: done.board,
+      onClick: onOpenCreateDialog && (() => onOpenCreateDialog('board')),
+    },
+    ...(canStartSessions
+      ? [
+          {
+            id: 'session',
+            label: 'Launch an AI session',
+            cta: 'Start',
+            done: false,
+            onClick: onOpenCreateDialog ? () => onOpenCreateDialog('teammate') : focusAsk,
+          },
+        ]
+      : []),
+    ...(isAdmin ? adminSteps(done, onOpenSettings, () => catalog?.openCatalog()) : []),
+  ];
+  if (steps.every((step) => step.done)) return null;
+  return <OnboardingCard steps={steps} onDismiss={onDismiss} />;
+};
+
+/** Workspace setup only admins can do. */
+const adminSteps = (
+  done: { mcp: boolean; invite: boolean },
+  onOpenSettings: NonNullable<HomePageProps['onOpenSettings']>,
+  onOpenCatalog: () => void
+) => [
+  {
+    id: 'mcp',
+    label: 'Configure MCP tools',
+    cta: 'Set up',
+    done: done.mcp,
+    onClick: onOpenCatalog,
+  },
+  {
+    id: 'invite',
+    label: 'Invite a teammate',
+    cta: 'Invite',
+    done: done.invite,
+    onClick: () => onOpenSettings('users'),
+  },
+];
+
+export const HomePage = memo(function HomePage({
+  client,
+  currentUser,
+  recentBoardIds = NO_BOARD_IDS,
+  onBoardClick,
+  onBranchClick,
+  onSessionClick,
+  onCreateSession,
+  onOpenCreateDialog,
+  onOpenSettings,
+  onAllBoards,
+  onSeeAllSessions,
+  onSeeAllTeammates,
+  homeNeeds,
+}: HomePageProps) {
+  const { token } = theme.useToken();
+  const { showError } = useThemedMessage();
+  const location = useLocation();
+  const navigate = useNavigate();
+  const isMobile = useIsMobileViewport();
+  const { connected, connecting } = useConnectionState();
+  const mutationDisabled = useConnectionDisabled();
+  const railReady = useIdleReady();
+  const confirmArchive = useStableCallback(useConfirmArchiveSession(client));
+  const userId = currentUser?.user_id;
+  useHomeViewAnalytics(userId);
+
+  const [needsFilter, setNeedsFilter] = useState<NeedsFilter>('all');
+  const [needsExpanded, setNeedsExpanded] = useState(false);
+  const [tab, setTab] = useState<MyWorkTab>('recent');
+  // This visit's pick wins over the loaded record; keyed by user so it never crosses accounts.
+  const [viewPick, setViewPick] = useState<{ userId?: string; view: HomeWorkView }>();
+  const savedView = currentUser?.preferences?.homeWorkView;
+  const workView: HomeWorkView =
+    viewPick && viewPick.userId === userId
+      ? viewPick.view
+      : isHomeWorkView(savedView)
+        ? savedView
+        : HOME_WORK_VIEWS[0];
+  const viewWrites = useRef(Promise.resolve());
+  const changeWorkView = useCallback(
+    (view: HomeWorkView) => {
+      setViewPick({ userId, view });
+      if (!client || !userId) return;
+      // Chained so the last pick lands last; a failed write keeps the pick on this device.
+      viewWrites.current = viewWrites.current
+        .then(async () => {
+          await patchUserPreferences(client, userId, { homeWorkView: view });
+        })
+        .catch(() => {});
+    },
+    [client, userId]
+  );
+  const [onlyStartedByMe, setOnlyStartedByMe] = useUserLocalStorage(
+    userId,
+    'home-only-mine',
+    false
+  );
+  const [storedOpenedFailures, setOpenedFailures] = useUserLocalStorage(
+    userId,
+    OPENED_FAILURES_KEY,
+    NO_OPENED_FAILURES
+  );
+  const openedRuns = useMemo(() => openedRunsOf(storedOpenedFailures), [storedOpenedFailures]);
+  const [query, setQuery] = useState('');
+  const deferredQuery = useDeferredValue(query);
+  const [workLimit, setWorkLimit] = useState(MY_WORK_PAGE);
+  // Frozen at mount: Home unmounts on navigation, so the 7-day failure window stays fresh enough.
+  // With the shell's needs, its clock, so a failure is never a need there and recent here.
+  const [mountedAt] = useState(Date.now);
+  const now = homeNeeds?.now ?? mountedAt;
+  const hasShellNeeds = homeNeeds !== undefined;
+  const [onboardingHidden, setOnboardingHidden] = useLocalStorage(ONBOARDING_HIDDEN_KEY, false);
+
+  const hydrated = useAgorStore(selectHydrated);
+  const truncated = useAgorStore(selectTruncated);
+  // Visit history that still names live boards; when none do, recent sessions stand in.
+  const visitedBoardIds = useStoreWithEqualityFn(
+    agorStore,
+    useMemo(() => (s: AgorState) => liveBoardIds(s, recentBoardIds), [recentBoardIds]),
+    shallow
+  );
+  const buckets = useStoreWithEqualityFn(
+    agorStore,
+    useMemo(
+      () =>
+        makeHomeBucketsSelector({
+          userId,
+          now,
+          // With the shell's needs, Home only counts (no need items): My work still needs the split.
+          needsLimit: hasShellNeeds ? 0 : needsExpanded ? NEEDS_MAX : NEEDS_PREVIEW,
+          recentLimit: workLimit,
+          boardsLimit: visitedBoardIds.length ? 0 : HOME_RECENT_BOARDS,
+          query: deferredQuery,
+          onlyStartedByMe,
+          openedFailures: openedRuns,
+        }),
+      [
+        userId,
+        now,
+        hasShellNeeds,
+        needsExpanded,
+        workLimit,
+        visitedBoardIds.length,
+        deferredQuery,
+        onlyStartedByMe,
+        openedRuns,
+      ]
+    ),
+    shallow
+  );
+  const comments = useCommentsForYou(client, currentUser);
+  const sessionNeeds = homeNeeds ?? buckets;
+  const needsLimit = needsExpanded ? NEEDS_MAX : NEEDS_PREVIEW;
+  const needs = useMemo(
+    () =>
+      (needsFilter === 'comments'
+        ? comments
+        : [...sessionNeeds.needs, ...comments].sort(compareHomeNeeds)
+      ).slice(0, needsLimit),
+    [needsFilter, comments, sessionNeeds.needs, needsLimit]
+  );
+  const needsCount = sessionNeeds.needsCount + comments.length;
+  const newUser = hydrated && !buckets.hasSessions && comments.length === 0;
+
+  useEffect(() => {
+    if (!comments.length) setNeedsFilter('all');
+  }, [comments.length]);
+
+  // A landing filter applies once there is something to show, then leaves the history entry.
+  const routeFilter = (location.state as HomeLocationState | null)?.needsFilter;
+  const { pathname, search, hash } = location;
+  useEffect(() => {
+    if (!routeFilter) return;
+    const applicable = routeFilter !== 'comments' || comments.length > 0;
+    if (!applicable && !hydrated) return;
+    if (applicable) setNeedsFilter(routeFilter);
+    requestAnimationFrame(() => scrollToSection('needs'));
+    navigate({ pathname, search, hash }, { replace: true, state: null });
+  }, [routeFilter, comments.length, hydrated, navigate, pathname, search, hash]);
+
+  const openComment = useCallback(
+    ({ thread }: HomeCommentNeed) => {
+      if (thread.session_id) onSessionClick(thread.session_id);
+      else if (thread.branch_id) onBranchClick(thread.branch_id, thread.board_id);
+      else onBoardClick(thread.board_id);
+    },
+    [onBoardClick, onBranchClick, onSessionClick]
+  );
+  // A group header stands for its earlier failures too, so opening it marks every one seen.
+  const openFailure = useCallback(
+    (need: HomeSessionNeed) => {
+      const now = Date.now();
+      const cutoff = now - OPENED_FAILURES_WINDOW_MS;
+      const { sessionById } = agorStore.getState();
+      const opened = [need.session, ...(need.earlier ?? [])].map(({ session_id }) => {
+        const session = sessionById.get(session_id);
+        // The run the person saw, on the server clock, so only a newer run brings the failure back.
+        return [session_id, { run: session ? lastRunStartedAt(session) : now, at: now }] as const;
+      });
+      setOpenedFailures((prev) => ({
+        ...Object.fromEntries(
+          Object.entries(asOpenedFailures(prev)).filter(([, entry]) => openedAt(entry) > cutoff)
+        ),
+        ...Object.fromEntries(opened),
+      }));
+      onSessionClick(need.session.session_id);
+    },
+    [onSessionClick, setOpenedFailures]
+  );
+  const markRead = useCallback(
+    (sessionId: string) => {
+      client
+        ?.service('sessions')
+        .patch(sessionId, { ready_for_prompt: false })
+        .catch(() => showError('Couldn’t mark as read'));
+    },
+    [client, showError]
+  );
+  const [markingAll, setMarkingAll] = useState(false);
+  const markAllRead = useCallback(async () => {
+    if (!client) return;
+    const ids = [...agorStore.getState().sessionById.values()]
+      .filter((s) => s.created_by === userId && !s.archived && isUnreadResult(s))
+      .map((s) => s.session_id);
+    setMarkingAll(true);
+    try {
+      const failed = await runWithLimit(ids, MARK_ALL_CONCURRENCY, (id) =>
+        client.service('sessions').patch(id, { ready_for_prompt: false })
+      );
+      if (failed.length === ids.length && failed.length) showError('Couldn’t mark as read');
+      else if (failed.length) showError(`Couldn’t mark ${failed.length} of ${ids.length} as read`);
+    } finally {
+      setMarkingAll(false);
+    }
+  }, [client, userId, showError]);
+  const showMoreWork = useCallback(() => setWorkLimit((limit) => limit + MY_WORK_PAGE), []);
+  const archive = useCallback((sessionId: string) => confirmArchive(sessionId), [confirmArchive]);
+  const showRunning = useCallback(() => {
+    setTab('running');
+    scrollToSection('mywork');
+  }, []);
+  const jumpToNeeds = useCallback(() => scrollToSection('needs'), []);
+  const isAdmin = hasMinimumRole(currentUser?.role, ROLES.ADMIN);
+  const allBoards = useCallback(
+    () => (onAllBoards ?? (() => requestShellPicker(OPEN_BOARD_SWITCHER_EVENT)))(),
+    [onAllBoards]
+  );
+  const seeAllSessions = useCallback(
+    () => (onSeeAllSessions ?? (() => requestShellPicker(OPEN_GLOBAL_SEARCH_EVENT, 'session')))(),
+    [onSeeAllSessions]
+  );
+
+  const firstName = currentUser?.name?.trim().split(/\s+/)[0] || 'there';
+  // Waits for hydration so returning users never see it flash on a cold load.
+  const onboarding = hydrated && !onboardingHidden && onOpenSettings && !buckets.hasSessions && (
+    <HomeOnboarding
+      isAdmin={isAdmin}
+      canStartSessions={!!onCreateSession}
+      onOpenCreateDialog={onOpenCreateDialog}
+      onOpenSettings={onOpenSettings}
+      onDismiss={() => setOnboardingHidden(true)}
+    />
+  );
+  const textButton = { paddingInline: 0 };
+
+  return (
+    <HomeFrame>
+      {!isMobile && !connected && (
+        <Alert
+          type={connecting ? 'info' : 'warning'}
+          showIcon
+          title={
+            connecting
+              ? 'Reconnecting… showing what we had before the connection dropped.'
+              : 'You’re offline. Showing what we had before the connection dropped.'
+          }
+        />
+      )}
+      <div style={{ minWidth: 0 }}>
+        <Typography.Title level={HOME_PAGE_TITLE_LEVEL} style={{ margin: 0 }}>
+          Good {greeting()}, {firstName}
+        </Typography.Title>
+        {!hydrated ? (
+          <Skeleton.Input active size="small" style={{ width: 220 }} />
+        ) : (
+          !newUser && (
+            <Flex align="center" gap={token.marginXS} wrap>
+              {/* Truncated with nothing found: not provably caught up, so no zero state. */}
+              {(needsCount > 0 || !truncated) && (
+                <Button type="text" size="small" style={textButton} onClick={jumpToNeeds}>
+                  {needsCount ? (
+                    <span>
+                      <Typography.Text strong>{formatCount(needsCount, truncated)}</Typography.Text>{' '}
+                      need you
+                    </span>
+                  ) : (
+                    'All caught up'
+                  )}
+                </Button>
+              )}
+              {buckets.runningCount > 0 && (
+                <>
+                  {(needsCount > 0 || !truncated) && (
+                    <Typography.Text type="secondary" aria-hidden>
+                      ·
+                    </Typography.Text>
+                  )}
+                  <Button type="text" size="small" style={textButton} onClick={showRunning}>
+                    <span>
+                      <Typography.Text strong>
+                        {formatCount(buckets.runningCount, truncated)}
+                      </Typography.Text>{' '}
+                      running
+                    </span>
+                  </Button>
+                </>
+              )}
+            </Flex>
+          )
+        )}
+      </div>
+      <HomeRecentBoards
+        recentBoardIds={visitedBoardIds.length ? visitedBoardIds : buckets.boardIds}
+        userId={userId}
+        onBoardClick={onBoardClick}
+        onAllBoards={allBoards}
+      />
+      {onCreateSession && (
+        <div id="ask">
+          <HomeAskBox
+            client={client}
+            currentUser={currentUser}
+            hasSessions={!hydrated || buckets.hasSessions}
+            disabled={mutationDisabled}
+            onCreateSession={onCreateSession}
+            onOpenSession={onSessionClick}
+          />
+        </div>
+      )}
+      <Flex gap={token.marginXL} wrap align="flex-start">
+        <Flex
+          vertical
+          gap={token.marginXL}
+          style={{ flex: `999 1 ${HOME_MAIN_COLUMN_BASIS}px`, minWidth: 0 }}
+        >
+          {!newUser && (
+            <HomeNeedsYou
+              client={client}
+              needs={needs}
+              needsCount={needsCount}
+              needsByReason={sessionNeeds.needsByReason}
+              commentCount={comments.length}
+              filter={needsFilter}
+              onFilterChange={setNeedsFilter}
+              expanded={needsExpanded}
+              onExpandedChange={setNeedsExpanded}
+              hydrated={hydrated}
+              truncated={truncated}
+              onOpenSession={onSessionClick}
+              onOpenFailure={openFailure}
+              onOpenComment={openComment}
+              onMarkRead={markRead}
+              onMarkAllRead={client && buckets.unreadCount > 0 ? markAllRead : undefined}
+              markingAllRead={markingAll}
+              markAllReadDisabled={mutationDisabled}
+              onArchive={mutationDisabled ? undefined : archive}
+            />
+          )}
+          {onboarding}
+          <HomeMyWork
+            recent={buckets.recent}
+            recentCount={buckets.recentCount}
+            running={buckets.running}
+            runningCount={buckets.runningCount}
+            runningMatchCount={buckets.runningMatchCount}
+            hydrated={hydrated}
+            truncated={truncated}
+            tab={tab}
+            onTabChange={setTab}
+            view={workView}
+            onViewChange={changeWorkView}
+            query={query}
+            onQueryChange={setQuery}
+            onlyStartedByMe={onlyStartedByMe}
+            onOnlyStartedByMeChange={setOnlyStartedByMe}
+            onOpenSession={onSessionClick}
+            onShowMore={showMoreWork}
+            onOpenBoard={onBoardClick}
+            onSeeAll={seeAllSessions}
+          />
+        </Flex>
+        {railReady && (
+          <Flex
+            vertical
+            gap={token.marginXL}
+            style={{ flex: `1 1 ${HOME_RAIL_BASIS}px`, minWidth: 0 }}
+          >
+            <HomeTeammatesSection
+              client={client}
+              currentUser={currentUser}
+              checkAccess={!!onCreateSession}
+              onOpenBoard={onBoardClick}
+              onSeeAll={onSeeAllTeammates}
+            />
+            <HomeKnowledgeSection client={client} connected={connected} />
+          </Flex>
+        )}
+      </Flex>
+    </HomeFrame>
+  );
+});
+
+export default HomePage;

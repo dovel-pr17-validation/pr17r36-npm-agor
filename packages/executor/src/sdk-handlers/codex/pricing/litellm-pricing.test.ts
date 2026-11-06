@@ -1,0 +1,78 @@
+import { describe, expect, it } from 'vitest';
+import { estimateCodexCostUsd, getLiteLlmPricingForModel } from './litellm-pricing.js';
+
+describe('LiteLLM Codex pricing snapshot', () => {
+  it('contains current Codex default model pricing', () => {
+    for (const model of [
+      'gpt-6-astra',
+      'gpt-6.1-sol',
+      'gpt-6-sol',
+      'gpt-6-luna',
+      'gpt-5.6-terra',
+    ]) {
+      const pricing = getLiteLlmPricingForModel(model);
+
+      expect(pricing?.input_cost_per_token).toBeGreaterThan(0);
+      expect(pricing?.output_cost_per_token).toBeGreaterThan(0);
+      expect(pricing?.cache_read_input_token_cost).toBeGreaterThan(0);
+    }
+  });
+
+  it('estimates Astra costs with cached input and provider-prefixed IDs', () => {
+    expect(
+      estimateCodexCostUsd({
+        modelId: 'openai/gpt-6-astra',
+        inputTokens: 10_000,
+        cacheReadTokens: 4_000,
+        outputTokens: 1_000,
+      })
+    ).toBeCloseTo(0.114, 8);
+    expect(
+      estimateCodexCostUsd({
+        modelId: 'gpt-6-astra',
+        inputTokens: 300_000,
+        cacheReadTokens: 100_000,
+        outputTokens: 10_000,
+      })
+    ).toBeCloseTo(2.6, 8);
+  });
+
+  it('estimates cost with cached input tokens as a subset of input tokens', () => {
+    const cost = estimateCodexCostUsd({
+      modelId: 'gpt-5.6-terra',
+      inputTokens: 10_000,
+      cacheReadTokens: 4_000,
+      outputTokens: 1_000,
+    });
+
+    // gpt-5.6-terra snapshot: 6k uncached input * $0.0000025 +
+    // 4k cached input * $0.00000025 + 1k output * $0.000015.
+    expect(cost).toBeCloseTo(0.031, 8);
+  });
+
+  it('does not infer long-context pricing from cumulative Codex input tokens', () => {
+    const cost = estimateCodexCostUsd({
+      modelId: 'gpt-5.6-terra',
+      inputTokens: 300_000,
+      cacheReadTokens: 100_000,
+      outputTokens: 10_000,
+    });
+
+    // Codex SDK input usage is cumulative across the agent loop; 300k here
+    // does not prove any single model request crossed the 272k tier. Use base
+    // prices until Codex exposes per-request pricing-tier information:
+    // 200k uncached input * $0.0000025 +
+    // 100k cached input * $0.00000025 + 10k output * $0.000015.
+    expect(cost).toBeCloseTo(0.675, 8);
+  });
+
+  it('returns undefined for unknown explicit models instead of guessing', () => {
+    expect(
+      estimateCodexCostUsd({
+        modelId: 'future-model-not-in-pricing-map',
+        inputTokens: 1_000,
+        outputTokens: 1_000,
+      })
+    ).toBeUndefined();
+  });
+});

@@ -1,0 +1,299 @@
+import type {
+  AgorClient,
+  Board,
+  BoardCapabilityPolicies,
+  CapabilityPolicyWorkspacePreferences,
+  EffectiveCapabilityPolicyAccess,
+  Group,
+  User,
+} from '@agor-live/client';
+import { Alert, Form, Modal, Skeleton } from 'antd';
+import { useEffect, useMemo, useState } from 'react';
+import { useThemedMessage } from '@/utils/message';
+import { useAgorStore } from '../../store/agorStore';
+import { selectUserById } from '../../store/selectors';
+import { BoardFormFields, extractBoardFormValues } from '../forms/BoardFormFields';
+import { JSONEditor, validateJSON } from '../JSONEditor';
+import { BoardCapabilityPolicyModalEditor } from '../permissions/CapabilityPolicyEditor';
+import { OwnershipTransfer } from '../permissions/CapabilityPolicyEditor/OwnershipTransfer';
+import { DrillInFrame, useDrillFormDraft } from '../SettingsModal/SettingsDrill';
+
+export interface BoardEditModalProps {
+  board: Board | null;
+  client: AgorClient | null;
+  open: boolean;
+  onClose: () => void;
+  onUpdate?: (boardId: string, updates: Partial<Board>) => unknown;
+  currentUser?: User | null;
+  /**
+   * Render the body as an in-place drill-in (no outer Modal) for the Workspace
+   * Settings shell: the shared drill footer drives Save/Cancel and the
+   * unsaved-changes guard. Default false → the standalone Modal used by the
+   * navbar board-settings shortcut is unchanged.
+   */
+  embedded?: boolean;
+}
+
+/** The single board-settings editor used by Settings and the navbar shortcut. */
+export function BoardEditModal({
+  board,
+  client,
+  open,
+  onClose,
+  onUpdate,
+  currentUser,
+  embedded = false,
+}: BoardEditModalProps) {
+  const userById = useAgorStore(selectUserById);
+  const [form] = Form.useForm();
+  const { showError } = useThemedMessage();
+  const [loading, setLoading] = useState(false);
+  const [allUsers, setAllUsers] = useState<User[]>([]);
+  const [allGroups, setAllGroups] = useState<Group[]>([]);
+  const [policy, setPolicy] = useState<BoardCapabilityPolicies | null>(null);
+  const [loadedPolicy, setLoadedPolicy] = useState<BoardCapabilityPolicies | null>(null);
+  const [workspacePreferences, setWorkspacePreferences] =
+    useState<CapabilityPolicyWorkspacePreferences>({ session_sharing_enabled: false });
+  const [effectiveAccess, setEffectiveAccess] = useState<EffectiveCapabilityPolicyAccess | null>(
+    null
+  );
+  const [loadedBoard, setLoadedBoard] = useState<Board | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const permissionUsers = useMemo(() => {
+    const knownUsers = new Map(userById);
+    for (const user of allUsers) knownUsers.set(user.user_id, user);
+    return [...knownUsers.values()];
+  }, [userById, allUsers]);
+  const boardId = board?.board_id;
+
+  useEffect(() => {
+    if (!open || !boardId) return;
+    let cancelled = false;
+    setLoading(true);
+    setLoadError(null);
+    setLoadedBoard(null);
+    setPolicy(null);
+    setLoadedPolicy(null);
+    setEffectiveAccess(null);
+
+    // Re-read the board as the modal opens. The selector uses a lean board list,
+    // while this form must always start from the full, latest representation.
+    // Same-board realtime updates must not reset drafts or unmount a pending
+    // ownership command and its completion result. Reopen to refresh authority.
+    const load = async () => {
+      try {
+        if (!client) throw new Error('Agor client is unavailable');
+        const fresh = await client.service('boards').get(boardId);
+        const [usersResult, groupsResult] = await Promise.allSettled([
+          client.service('users').findAll({}),
+          client.service('groups').findAll({ query: { archived: false } }),
+        ]);
+        if (cancelled) return;
+
+        if (usersResult.status === 'fulfilled') {
+          setAllUsers(usersResult.value as User[]);
+        } else {
+          setAllUsers([]);
+          console.warn('Failed to load users for board permissions:', usersResult.reason);
+        }
+        if (groupsResult.status === 'fulfilled') {
+          setAllGroups(groupsResult.value as Group[]);
+        } else {
+          setAllGroups([]);
+          console.warn('Failed to load groups for board permissions:', groupsResult.reason);
+        }
+
+        const [policyResult, preferencesResult, accessResult] = await Promise.allSettled([
+          client.service('boards/:id/permissions').find({ route: { id: boardId } }),
+          client.service('workspace-preferences').find(),
+          client.service('boards/:id/effective-access').find({ route: { id: boardId } }),
+        ]);
+        if (cancelled) return;
+        if (policyResult.status === 'fulfilled') {
+          setPolicy(policyResult.value);
+          setLoadedPolicy(policyResult.value);
+        } else {
+          throw policyResult.reason;
+        }
+        if (preferencesResult.status === 'fulfilled') {
+          setWorkspacePreferences(preferencesResult.value);
+        }
+        // A failed projection is not a policy denial. Surface the load error
+        // and prevent saving rather than silently locking the owner's fields.
+        // Do not replace server authority with a client-side ownership bypass.
+        if (accessResult.status === 'rejected') throw accessResult.reason;
+        setEffectiveAccess(accessResult.value as unknown as EffectiveCapabilityPolicyAccess);
+        if (cancelled) return;
+        // Populate the form BEFORE exposing loadedBoard so the background
+        // editor mounts against fully-initialized field values (rather than
+        // relying on render batching). loadedBoard is set last, below.
+        form.resetFields();
+        form.setFieldsValue({
+          name: fresh.name,
+          icon: fresh.icon,
+          description: fresh.description,
+          background_color: fresh.background_color,
+          custom_css: fresh.custom_css,
+          custom_context: fresh.custom_context ? JSON.stringify(fresh.custom_context, null, 2) : '',
+        });
+        // Expose the loaded board last: this is what un-gates the form render.
+        setLoadedBoard(fresh);
+      } catch (error) {
+        if (!cancelled) {
+          const detail = error instanceof Error ? error.message : String(error);
+          setLoadError(`Could not load current board settings: ${detail}`);
+        }
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    };
+    void load();
+    return () => {
+      cancelled = true;
+    };
+  }, [boardId, client, form, open]);
+
+  const canEditGeneral = Boolean(effectiveAccess?.capabilities.includes('board.edit'));
+
+  const syncPermissions = async () => {
+    // Metadata-only saves must not require board.policy.manage or rewrite a
+    // policy the user did not edit (including its optimistic revisions).
+    // Compare JSON drafts like the branch editor: change-then-revert creates
+    // new objects but must not trigger a permission write.
+    if (!client || !board || !policy || JSON.stringify(policy) === JSON.stringify(loadedPolicy)) {
+      return;
+    }
+    const saved = await client
+      .service('boards/:id/permissions')
+      .patch(null, policy, { route: { id: board.board_id } });
+    setPolicy(saved);
+    setLoadedPolicy(saved);
+  };
+
+  // Unsaved-changes guard for the drill-in: form values vs the loaded board
+  // (covers programmatic edits such as background presets) or a policy draft.
+  const isFormDirty = useDrillFormDraft(form, loadedBoard);
+  const isDirty = () =>
+    isFormDirty() || (policy !== null && JSON.stringify(policy) !== JSON.stringify(loadedPolicy));
+
+  const close = () => {
+    form.resetFields();
+    onClose();
+  };
+
+  const save = async () => {
+    if (!board || loading || loadError || !canEditGeneral) return;
+    try {
+      setSaving(true);
+      await form.validateFields();
+      const updated = await onUpdate?.(
+        board.board_id,
+        extractBoardFormValues(form, { includeLegacyPermissions: false })
+      );
+      if (updated === false) return;
+      await syncPermissions();
+      close();
+    } catch (error) {
+      if (error instanceof Error) showError(`Failed to update board: ${error.message}`);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const body = loadError ? (
+    <Alert type="error" showIcon title="Board settings unavailable" description={loadError} />
+  ) : !loadedBoard ? (
+    // Render the form only once the full board has loaded, so its fields —
+    // including the background editor's mode — initialize from real values
+    // rather than the empty pre-load state (the cause of the mode/checkbox
+    // resetting on reopen).
+    <Skeleton active paragraph={{ rows: 6 }} style={{ marginTop: 16 }} />
+  ) : (
+    <Form form={form} layout="vertical" preserve style={{ marginTop: 16 }}>
+      <BoardFormFields
+        key={loadedBoard.board_id}
+        form={form}
+        backgroundResetSignal={loadedBoard.board_id}
+        canEditGeneral={canEditGeneral}
+        capabilityPolicyEditor={
+          policy ? (
+            <BoardCapabilityPolicyModalEditor
+              ownershipAction={
+                <OwnershipTransfer
+                  kind="board"
+                  resourceId={loadedBoard.board_id}
+                  ownerUserId={policy.primary_owner_user_id}
+                  client={client}
+                  users={permissionUsers}
+                  currentUser={currentUser}
+                  disabled={saving || loading}
+                  onTransferred={close}
+                />
+              }
+              value={policy}
+              onChange={setPolicy}
+              client={client}
+              users={permissionUsers}
+              groups={allGroups}
+              currentUser={currentUser}
+              workspacePreferences={workspacePreferences}
+            />
+          ) : (
+            <Alert type="error" showIcon description="Permissions are unavailable." />
+          )
+        }
+        extra={
+          <Form.Item
+            label="Custom Context (JSON)"
+            name="custom_context"
+            help="Add custom fields for use in zone trigger templates (e.g., {{ board.context.yourField }})"
+            rules={[{ validator: validateJSON }]}
+          >
+            <JSONEditor
+              placeholder='{"team": "Backend", "sprint": 42}'
+              rows={4}
+              disabled={!canEditGeneral}
+            />
+          </Form.Item>
+        }
+      />
+    </Form>
+  );
+
+  // Drill-in mode for the Workspace Settings shell: no outer Modal. The shared
+  // shell footer drives Save/Cancel and the unsaved-changes guard; the caller
+  // gates this on its drill state and early-returns it in place of the list.
+  if (embedded) {
+    if (!open) return null;
+    return (
+      <DrillInFrame
+        title="Edit Board"
+        dirty={isDirty}
+        onBack={close}
+        saving={loading || saving}
+        saveLabel="Save"
+        saveDisabled={loading || saving || Boolean(loadError) || !canEditGeneral}
+        onSave={() => void save()}
+      >
+        {body}
+      </DrillInFrame>
+    );
+  }
+
+  return (
+    <Modal
+      title="Edit Board"
+      open={open}
+      width={760}
+      confirmLoading={loading || saving}
+      okButtonProps={{ disabled: loading || saving || Boolean(loadError) || !canEditGeneral }}
+      onOk={() => void save()}
+      onCancel={close}
+      okText="Save"
+      destroyOnHidden
+    >
+      {body}
+    </Modal>
+  );
+}

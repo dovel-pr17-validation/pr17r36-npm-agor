@@ -1,0 +1,339 @@
+# Security Headers, CORS & Git Config
+
+How Agor's daemon handles Content-Security-Policy (CSP) and Cross-Origin
+Resource Sharing (CORS), and how operators tune both from `~/.agor/config.yaml`.
+
+> This document is scoped to **web-layer hardening** (CSP / CORS / response
+> headers) plus the daemon-wide git config defaults. For authentication, RBAC, and Unix isolation see
+> [`apps/agor-docs/content/guide/multiplayer-unix-isolation.mdx`](../../apps/agor-docs/content/guide/multiplayer-unix-isolation.mdx)
+> and [`context/guides/rbac-and-unix-isolation.md`](../guides/rbac-and-unix-isolation.md).
+
+---
+
+## Why configurable at all?
+
+PR #1027 landed strict, hardcoded CSP + CORS. Two problems surfaced:
+
+1. **Hardcoded defaults hid a bug for Sandpack artifacts.** CSP lacked
+   `frame-src` and `worker-src`, so both fell back to `default-src 'self'` —
+   which blocks the hosted CodeSandbox bundler iframes Agor uses for
+   artifacts. Operators saw a silent render failure on a fresh deploy with
+   no config knob to fix it.
+2. **Custom integrations couldn't be added.** An operator with a custom
+   analytics script, LLM proxy, embedded dashboard, or IDP had to fork and
+   rebuild the daemon. That's a poor upgrade story.
+
+The `security.*` config block solves both: the defaults now make every
+bundled Agor feature work, and operators can append or replace per-directive
+without leaving YAML.
+
+---
+
+## Config model
+
+### CSP: two-tier (extras / override)
+
+```yaml
+security:
+  csp:
+    # (1) APPEND to built-in defaults — the 95% case.
+    extras:
+      script-src: ['https://plausible.io']
+      connect-src: ['https://api.anthropic.com']
+      frame-src: ['https://my-sandbox.example.com']
+
+    # (2) REPLACE a directive wholesale — escape hatch, rare.
+    # Setting a directive here wipes both defaults AND extras for that key.
+    override:
+      img-src: ["'self'", 'data:']
+
+    # (3) Reporting + debug toggles.
+    report_uri: '/api/csp-report' # daemon mounts a handler here
+    report_only: false # true = emit Content-Security-Policy-Report-Only
+    disabled: false # dev/debug only, emits loud warning
+```
+
+**Why the split?** Every operator we've asked about CSP wanted "keep what
+Agor ships, just let me add `https://plausible.io` to `script-src`." That's
+append. Replacement is for operators with a fully bespoke policy. Offering
+both avoids the common footgun where "I wanted to add X" ended up silently
+dropping the defaults and breaking unrelated features.
+
+**Empty override is meaningful.** `override: { "script-src": [] }` emits
+`script-src` with no sources — i.e. blocks that directive entirely. This is
+distinct from _omitting_ the key, which means "use defaults+extras." If you
+find yourself reaching for this, double-check it's really what you meant.
+
+### CORS: mode-based
+
+```yaml
+security:
+  cors:
+    mode: list # list | wildcard | reflect | null-origin
+    origins: ['https://agor.mydomain.com'] # used when mode=list
+    credentials: true # default true; forced false in wildcard/reflect
+    methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS']
+    allowed_headers: ['Authorization', 'Content-Type', 'X-MCP-Token']
+    max_age_seconds: 600
+    allow_sandpack: true # include *.codesandbox.io (default true)
+```
+
+**Mode semantics:**
+
+| Mode          | Behaviour                                                                                                             | Credentials       |
+| ------------- | --------------------------------------------------------------------------------------------------------------------- | ----------------- |
+| `list`        | Only origins in `origins[]` + built-ins (localhost, Sandpack)                                                         | Allowed (default) |
+| `wildcard`    | Accept any origin (returns `Access-Control-Allow-Origin: *`)                                                          | Forced off        |
+| `reflect`     | Echo the request's `Origin` header back                                                                               | Forced off        |
+| `null-origin` | Accept `Origin: null` (sandboxed iframes, `file://` docs) plus no-origin non-browser clients (curl, server-to-server) | Allowed           |
+
+`credentials: true` + `mode: wildcard` (or `reflect`) is rejected at config
+load with a clear error — the CORS spec explicitly forbids this combination
+because it would allow credentialed requests from any origin.
+
+### Private outbound destinations
+
+Daemon-side outbound HTTP for OAuth, MCP egress, and MCP connection tests goes
+through `safeOutboundFetch` (`packages/core/src/utils/safe-outbound-fetch.ts`),
+which refuses every private, loopback, link-local, and reserved address. When a
+self-hosted deployment needs the daemon to reach one internal HTTPS service
+(for example through a VPC endpoint or an internal load balancer), pin it:
+
+```yaml
+security:
+  private_outbound_destinations:
+    - host: internal-api.example.internal
+      cidrs: [10.200.0.0/24]
+```
+
+- Matching is on the exact hostname, case-insensitive. No wildcards and no IP
+  literals.
+- Only `https:` URLs qualify; plain HTTP to a listed host is still refused.
+- Every resolved address for a listed host must be IPv4 and inside that
+  entry's `cidrs`, or the request fails. A listed host never falls back to the
+  public-address rule, and the connection is pinned to the checked address.
+- Hosts that are not listed keep the default behaviour. Another name resolving
+  into `10.200.0.0/24` is still refused.
+- Redirects are re-checked on every hop, so a redirect from a listed host to an
+  unlisted private host is refused.
+
+Startup fails with `Config error: security.private_outbound_destinations[<i>]…`
+unless: there are at most 64 entries; each `host` is a lowercase DNS name with
+at least two labels (not an IP, `localhost`, `*.localhost`, `*.local`, or
+`metadata.google.internal`); and each entry has 1–8 IPv4 CIDRs, written as
+network addresses, wholly inside `10.0.0.0/8`, `172.16.0.0/12`,
+`192.168.0.0/16`, or `100.64.0.0/10`. Loopback, link-local (`169.254.0.0/16`),
+`0.0.0.0/8`, and public ranges cannot be listed.
+
+The list is installed once at daemon startup; any change, including removing an
+entry, needs a daemon restart. Operator docs:
+`apps/agor-docs/content/guide/config-yaml.mdx` (Private outbound destinations).
+
+### Sandpack, local/private Agor URLs, and Chrome Private Network Access
+
+Artifacts commonly render inside the hosted Sandpack iframe
+(`https://*.codesandbox.io`) while the Agor API URL may point at a loopback,
+internal, VPN, or sandbox host. That includes obvious local URLs like
+`http://localhost:<port>`, but it can also include public-looking names such as
+`https://agor.sandbox.preset.zone` if DNS routes them to a private network
+address. Chromium treats this as a public HTTPS origin trying to reach a
+private/local address space. Depending on Chrome version and flags, the browser
+may enforce Private Network Access / Local Network Access before the artifact's
+`fetch()` reaches Agor at all.
+
+This failure often surfaces only as `TypeError: Failed to fetch` inside the
+artifact. Quick triage:
+
+1. Try the same artifact in Firefox. If Firefox works and Chrome/Edge fail, it
+   is likely Chrome local-network enforcement, not CSP or an Agor token bug.
+2. In Chrome, allow local network access for the Agor/Sandpack page if that site
+   permission is shown.
+3. For local development, Chrome versions that expose the flag can disable the
+   check at `chrome://flags/#local-network-access-check` and then restart
+   Chrome. Older builds may expose the related preflight flag at
+   `chrome://flags/#private-network-access-respect-preflight-results`.
+
+Agor still keeps Sandpack on the non-credentialed side of CORS: browser cookies
+must not be sent to the multi-tenant hosted bundler. Artifacts should use
+explicit Bearer-token grants rather than browser cookies.
+
+---
+
+## Built-in defaults
+
+These are hardcoded into `resolveSecurity()` and make every bundled feature
+work. Operators rarely need to override them:
+
+```
+default-src        'self'
+script-src         'self'
+style-src          'self' 'unsafe-inline' https://fonts.bunny.net # Ant Design inline + Inter font CSS
+img-src            'self' data: blob: https://*.slack-edge.com https://api.smithery.ai https://www.google.com https://*.gstatic.com https://logos.composio.dev https://cdn.jsdelivr.net https://preset.io https://*.codesandbox.io
+font-src           'self' data: https://fonts.bunny.net           # Inter font files
+connect-src        'self' ws: wss: <daemon-url>
+frame-src          'self' https://*.codesandbox.io               # Sandpack iframes
+worker-src         'self' blob:                                  # Sandpack workers
+frame-ancestors    'none'
+object-src         'none'
+base-uri           'self'
+```
+
+The MCP catalog logo sources above are the browser origins used by the
+checked-in curated catalog. Agor does not fetch or proxy those images through
+the daemon. The Google favicon endpoint redirects to `*.gstatic.com`, which is
+why both origins are present.
+
+`script-src` deliberately does NOT include `'unsafe-eval'`. Handlebars
+template rendering — used for zone triggers, env health URLs, and the
+spawn-subsession prompt — runs server-side via the daemon's `/templates`
+service (`apps/agor-daemon/src/services/templates.ts`). The browser bundle
+ships no Handlebars and never calls `new Function` / `eval`.
+
+`fonts.bunny.net` hosts the Inter font CSS imported by `apps/agor-ui/src/index.css`.
+
+The Sandpack origins (`https://*.codesandbox.io` + `blob:` for workers) are
+the load-bearing piece — without them the hosted bundler iframe renders but
+its workers fail to spawn and artifacts never mount. Setting
+`security.cors.allow_sandpack: false` removes them from _both_ the CSP and
+the CORS allow-list (the two need to stay in sync or you get weird
+half-broken states).
+
+---
+
+## Common recipes
+
+### I want to allow an external analytics script
+
+```yaml
+security:
+  csp:
+    extras:
+      script-src: ['https://plausible.io']
+      connect-src: ['https://plausible.io']
+```
+
+### I want to embed an external iframe
+
+```yaml
+security:
+  csp:
+    extras:
+      frame-src: ['https://my-embed.example.com']
+```
+
+### I want to relax CORS for a specific origin
+
+```yaml
+security:
+  cors:
+    origins: ['https://dashboard.internal.example.com']
+```
+
+Regex patterns are supported inside `/slashes/`:
+
+```yaml
+security:
+  cors:
+    origins:
+      - 'https://dashboard.example.com'
+      - "/\\.internal\\.example\\.com$/"
+```
+
+### I want to watch what's being blocked before enforcing
+
+```yaml
+security:
+  csp:
+    report_only: true
+    report_uri: '/api/csp-report'
+```
+
+The daemon mounts a rate-limited handler at `report_uri` that logs incoming
+reports at `warn` level via pino. Watch your logs, tighten your `extras`,
+flip `report_only: false` when the floor is quiet.
+
+---
+
+## Backwards compatibility
+
+The legacy `daemon.cors_origins` and `daemon.cors_allow_sandpack` keys from
+#1027 still work. When present they're merged into the resolved CORS config
+with a deprecation warning at daemon startup. The `CORS_ORIGIN` environment
+variable continues to win over all config sources for deployment
+compatibility.
+
+Migration path: move values to `security.cors.origins` +
+`security.cors.allow_sandpack` on your next config touch — the deprecation
+will be promoted to a hard error in a future release.
+
+---
+
+## Debugging a blocked resource
+
+When Sandpack-like "silent render failure" strikes again:
+
+1. Open DevTools → Network tab → click the failing resource.
+2. In the response headers, find `Content-Security-Policy` (or
+   `-Report-Only`). The daemon also surfaces this in Settings → About →
+   Security Headers so you don't have to dig.
+3. Find the directive that governs that resource type (`script-src` for
+   JS, `frame-src` for iframes, `connect-src` for fetch/XHR, `worker-src`
+   for web workers, etc.).
+4. Add the required source to `security.csp.extras.<directive>` in
+   `~/.agor/config.yaml`, restart the daemon.
+
+If you can't afford a restart cycle, flip on `report_only: true` first, wait
+for the next violation report in logs, then make the change — you'll know
+exactly which origin + directive the browser wanted.
+
+---
+
+## Architecture
+
+Resolution lives in `packages/core/src/config/security-resolver.ts`:
+
+```
+AgorConfig.security          →  resolveSecurity()  →  ResolvedSecurity
+  + daemonUrl                                           { csp: ResolvedCsp,
+  + legacyCorsOrigins                                     cors: ResolvedCors }
+  + legacyAllowSandpack
+  + CORS_ORIGIN env var
+```
+
+The resolver is pure — no file I/O, no side effects except warnings — and
+is imported by:
+
+- `apps/agor-daemon/src/setup/security-headers.ts` — consumes `ResolvedCsp`
+- `apps/agor-daemon/src/setup/cors.ts` — consumes `ResolvedCors`
+- `apps/agor-daemon/src/register-routes.ts` — surfaces it on `/health`
+- `apps/agor-ui/src/components/SettingsModal/AboutTab.tsx` — renders it
+
+Validation errors surface at daemon startup, not request-time. If your
+`config.yaml` has an unknown CSP directive or a `credentials: true +
+mode: wildcard` combination, the daemon refuses to boot with an actionable
+error message.
+
+---
+
+## Git config hardening (`security.git_config_parameters`)
+
+The daemon sets `GIT_CONFIG_PARAMETERS` at startup; every git invocation it or a
+local executor runs inherits it, and a `delegated` launcher must forward it
+explicitly. Defaults (`packages/core/src/config/security-resolver.ts`) refuse
+credential-bearing URLs (`transfer.credentialsInUrl=die`, git 2.41+), block the
+`file://` / `ext::` protocol families, and enable HFS/NTFS path protection.
+`fetch.fsckObjects` is deliberately not a default: it rejects legacy repos with
+technically broken commits.
+
+Same two-tier shape as CSP: `extras` appends (a same-key entry overrides the
+default value), `override` replaces the defaults wholesale (`[]` disables all),
+and setting both throws at load. Never put credential-bearing values such as
+`http.proxy=http://user:pass@…` here; logs are redacted but the env var is not.
+
+## See also
+
+- `apps/agor-daemon/src/setup/security-headers.ts` — CSP middleware
+- `apps/agor-daemon/src/setup/cors.ts` — CORS policy builder
+- `packages/core/src/config/security-resolver.ts` — config resolver
+- [`apps/agor-docs/content/guide/multiplayer-unix-isolation.mdx`](../../apps/agor-docs/content/guide/multiplayer-unix-isolation.mdx) — daemon auth, RBAC, OS-level isolation tiers
+- [`context/guides/rbac-and-unix-isolation.md`](../guides/rbac-and-unix-isolation.md) — implementation guide

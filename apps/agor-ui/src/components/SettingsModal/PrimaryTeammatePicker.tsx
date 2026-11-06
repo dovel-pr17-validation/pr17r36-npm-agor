@@ -1,0 +1,170 @@
+import type { AgorClient, Branch, UserID } from '@agor-live/client';
+import { isTeammate } from '@agor-live/client';
+import { RobotOutlined } from '@ant-design/icons';
+import { Select, Space, Spin, Typography } from 'antd';
+import type React from 'react';
+import { useEffect, useMemo, useState } from 'react';
+import { useIdentityGuardedAsync } from '../../hooks/useIdentityGuardedAsync';
+import { useAgorStore } from '../../store/agorStore';
+import { selectBoardById, selectRepoById } from '../../store/selectors';
+import { formatActionError } from '../../utils/connectionErrors';
+import { useThemedMessage } from '../../utils/message';
+import { type TeammateOption, teammateLabel, teammateOption } from '../../utils/teammateLabels';
+import { TeammateOptionLabel } from '../PrimaryAssistantCompose';
+
+interface PrimaryTeammatePickerProps {
+  client: AgorClient | null;
+  /** Caller identity; changing it invalidates all caller-scoped cached data. */
+  currentUserId?: UserID;
+  /** Distinguishes logout/login as the same caller. */
+  authenticationGeneration?: number;
+  /** Drop the heading/description chrome for embedding in a tight surface (e.g. a popover). */
+  compact?: boolean;
+  disabled?: boolean;
+  /** Fired after a successful pick so an embedder can continue an in-flight action. */
+  onPicked?: (branch: Branch) => void;
+}
+
+/**
+ * Self-contained picker for the calling user's primary assistant — the default
+ * teammate for personal/ambient work. Reads and writes via the caller-scoped
+ * `users.getPrimaryTeammate` / `users.setPrimaryTeammate` RPCs; no assumptions
+ * about the surrounding modal so it can be relocated by moving its mount point.
+ */
+export const PrimaryTeammatePicker: React.FC<PrimaryTeammatePickerProps> = ({
+  client,
+  currentUserId,
+  authenticationGeneration = 0,
+  compact = false,
+  disabled = false,
+  onPicked,
+}) => {
+  const { showSuccess, showError } = useThemedMessage();
+  const boardById = useAgorStore(selectBoardById);
+  const repoById = useAgorStore(selectRepoById);
+
+  const [current, setCurrent] = useState<Branch | null>(null);
+  const [candidates, setCandidates] = useState<Branch[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [loadFailed, setLoadFailed] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const mutationGuard = useIdentityGuardedAsync(
+    [client, currentUserId, authenticationGeneration],
+    () => setSaving(false)
+  );
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: caller identity invalidates caller-scoped RPC results even when the client instance is reused
+  useEffect(() => {
+    setSaving(false);
+    if (!client) {
+      setCurrent(null);
+      setCandidates([]);
+      setLoading(false);
+      setLoadFailed(true);
+      return;
+    }
+    let cancelled = false;
+    setCurrent(null);
+    setCandidates([]);
+    setLoading(true);
+    setLoadFailed(false);
+    Promise.all([
+      client.service('users').getPrimaryTeammate(),
+      client.service('users').getPrimaryTeammateCandidates(),
+    ])
+      .then(([branch, eligibleCandidates]) => {
+        if (!cancelled) {
+          setCurrent(branch && isTeammate(branch) && !branch.archived ? branch : null);
+          setCandidates(eligibleCandidates);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setLoadFailed(true);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [client, currentUserId]);
+
+  const options = useMemo<TeammateOption[]>(() => {
+    const teammates = candidates.slice();
+    // The resolved primary may live on a board this list doesn't otherwise
+    // surface; keep it selectable so its label renders instead of a raw id.
+    if (current && !teammates.some((branch) => branch.branch_id === current.branch_id)) {
+      teammates.push(current);
+    }
+    return teammates
+      .sort((a, b) => teammateLabel(a).localeCompare(teammateLabel(b)))
+      .map((branch) => teammateOption(branch, boardById, repoById));
+  }, [candidates, boardById, repoById, current]);
+
+  const currentOption = current ? teammateOption(current, boardById, repoById) : null;
+  // Skip the closing period when the sentence already ends in punctuation (e.g. "Ambient!").
+  const currentEndsSentence = /[.!?…]$/.test(currentOption?.context ?? currentOption?.label ?? '');
+
+  const handleChange = async (branchId: string) => {
+    if (!client || !currentUserId) return;
+    const operationUserId = currentUserId;
+    setSaving(true);
+    try {
+      const branch = await mutationGuard.run(() =>
+        client.service('users').setPrimaryTeammate({ branchId, expectedUserId: operationUserId })
+      );
+      setCurrent(branch);
+      if (branch) {
+        showSuccess(`Primary assistant set to ${teammateLabel(branch)}.`);
+        onPicked?.(branch);
+      }
+    } catch (error) {
+      showError(formatActionError('change your primary assistant', error, { idempotent: true }));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Space orientation="vertical" size="middle" style={{ width: '100%' }}>
+      {!compact && (
+        <Typography.Text type="secondary">
+          Your default teammate for personal, ambient work. Change it anytime.
+        </Typography.Text>
+      )}
+
+      {loading ? (
+        <Spin />
+      ) : loadFailed ? (
+        <Typography.Text type="danger">
+          Couldn't load your primary assistant. Check the connection and try again.
+        </Typography.Text>
+      ) : currentOption ? (
+        <Typography.Text>
+          Currently <Typography.Text strong>{currentOption.label}</Typography.Text>
+          {currentOption.context && ` on ${currentOption.context}`}
+          {!currentEndsSentence && '.'}
+        </Typography.Text>
+      ) : compact ? null : (
+        <Typography.Text type="secondary">
+          No primary assistant set — pick one below to use as your default for personal work.
+        </Typography.Text>
+      )}
+
+      <Select
+        showSearch
+        loading={saving}
+        disabled={disabled || saving || !client || !currentUserId || loadFailed}
+        placeholder="Select a primary assistant"
+        value={current?.branch_id}
+        onChange={handleChange}
+        options={options}
+        optionFilterProp="searchText"
+        notFoundContent={options.length === 0 ? 'No teammates available' : undefined}
+        suffixIcon={<RobotOutlined />}
+        style={{ width: '100%', maxWidth: 420 }}
+        optionRender={(option) => <TeammateOptionLabel option={option.data} />}
+      />
+    </Space>
+  );
+};

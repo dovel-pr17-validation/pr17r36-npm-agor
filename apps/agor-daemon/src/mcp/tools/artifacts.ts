@@ -1,0 +1,880 @@
+/**
+ * Artifact MCP Tools
+ *
+ * Agent-facing tools for publishing and managing Sandpack artifacts on boards.
+ * Artifacts are DB-backed live web applications that render on the board canvas.
+ *
+ * The format is intentionally small: a file map plus declarative metadata
+ * (`required_env_vars`, `agor_grants`, `sandpack_config`). The daemon
+ * synthesizes a per-viewer `.env` and resolves daemon-supplied capabilities
+ * at render time. There is no Handlebars layer, no per-fetch JS rendering,
+ * and no `sandpack.json`/`agor.config.js` sidecar.
+ */
+
+import { BranchRepository } from '@agor/core/db';
+import type {
+  AgorGrants,
+  AgorRuntimeConfig,
+  BoardID,
+  BranchID,
+  SandpackConfig,
+  UserRole,
+  UUID,
+} from '@agor/core/types';
+import { ARTIFACT_LIST_FIELDS_WITHOUT_FILES } from '@agor/core/types';
+import { isNotFoundError } from '@agor/core/utils/errors';
+import type { McpServer } from '@modelcontextprotocol/server';
+import { z } from 'zod';
+import type { ArtifactParams, ArtifactsService } from '../../services/artifacts.js';
+import { hasBranchPermission, isSuperAdmin } from '../../utils/branch-authorization.js';
+import { emitServiceEvent } from '../../utils/emit-service-event.js';
+import { resolveArtifactId, resolveBoardId, resolveBranchId } from '../resolve-ids.js';
+import {
+  mcpLimit,
+  mcpOffset,
+  mcpOptionalId,
+  mcpOptionalNumber,
+  mcpOptionalPositiveInt,
+  mcpOptionalString,
+  mcpPageResult,
+  mcpRequiredId,
+  mcpRequiredString,
+} from '../schema.js';
+import type { McpContext } from '../server.js';
+import { coerceString, textResult } from '../server.js';
+import { runWithMcpTenantDatabaseScope } from '../tenant-scope.js';
+
+const SANDPACK_TEMPLATES = [
+  'static',
+  'react',
+  'react-ts',
+  'vanilla',
+  'vanilla-ts',
+  'vue',
+  'vue3',
+  'svelte',
+  'solid',
+  'angular',
+] as const;
+
+const SandpackConfigSchema = z
+  .object({
+    template: z.enum(SANDPACK_TEMPLATES).optional(),
+    customSetup: z
+      .object({
+        dependencies: z.record(z.string(), z.string()).optional(),
+        devDependencies: z.record(z.string(), z.string()).optional(),
+        entry: mcpOptionalString('sandpackConfig.customSetup.entry', 'Custom Sandpack entry file'),
+        environment: mcpOptionalString(
+          'sandpackConfig.customSetup.environment',
+          'Custom Sandpack environment'
+        ),
+      })
+      .optional(),
+    theme: z
+      .union([
+        mcpRequiredString('sandpackConfig.theme', 'Sandpack theme name'),
+        z.record(z.string(), z.unknown()),
+      ])
+      .optional(),
+    options: z.record(z.string(), z.unknown()).optional(),
+  })
+  .passthrough()
+  .optional();
+
+const AgorGrantsSchema = z
+  .object({
+    agor_api_url: z.boolean().optional(),
+    agor_user_email: z.boolean().optional(),
+    agor_artifact_id: z.boolean().optional(),
+    agor_board_id: z.boolean().optional(),
+  })
+  .optional();
+
+const AgorRuntimeSchema = z
+  .object({
+    enabled: z
+      .boolean()
+      .optional()
+      .describe(
+        "Inject the daemon-side `agor-runtime.js` into the served bundle (as an iframe-level `<script>` via Sandpack's `externalResources`). Default: true. Set false to opt the artifact out of agent DOM introspection (e.g. if the artifact's own code conflicts with our message listener)."
+      ),
+  })
+  .optional();
+
+export function registerArtifactTools(server: McpServer, ctx: McpContext): void {
+  // Tool 1: agor_artifacts_publish
+  server.registerTool(
+    'agor_artifacts_publish',
+    {
+      description: `Publish a folder as a live Sandpack artifact on a board. Reads files from the given folder, serializes them to the database, and places (or updates) the artifact on the board.
+
+If artifactId is omitted, creates a new artifact.
+If artifactId is provided, updates the existing artifact (must be owned by you).
+
+The folder should contain ordinary source files (no \`sandpack.json\`, no \`agor.config.js\`). \`branchId + subpath\` identifies the branch-relative folder. The executor verifies the caller has access, reads it, and registers the artifact through the daemon API. After publishing, the artifact lives in the database.
+
+Recommended: create the folder inside your branch so files can be version-controlled.
+For a new HTML/CSS-first artifact, use template=\`static\` (or
+\`sandpackConfig.template="static"\`) and keep the HTML entry at
+\`/index.html\`; place any browser JavaScript in linked or inline scripts rather
+than an executable vanilla \`/index.js\`. Existing vanilla artifacts with a
+present empty/comment-only conventional entry are repaired to the static
+runtime automatically.
+
+DECLARATIVE CONFIG:
+- \`requiredEnvVars\`: array of env var NAMES the artifact needs (e.g. ["OPENAI_KEY", "STRIPE_KEY"]). The daemon synthesizes a per-viewer \`.env\` at render time using values from the viewer's stored env vars (Settings → Environment Variables). Names are stored without prefix; the daemon prefixes per template at render time. Currently only the \`react\` / \`react-ts\` mapping is verified end-to-end: those are CRA-backed (sandpack-react v2), so use \`process.env.REACT_APP_X\`. Other templates are best-effort and may need to be audited the first time an artifact publishes against them — the table in apps/agor-docs/content/guide/artifacts.mdx tracks status. \`static\`, \`vanilla\` / \`vanilla-ts\` have no dotenv path (daemon warns and injects nothing). HTML-first vanilla artifacts with an empty entry are served through the \`static\` template automatically.
+- \`agorGrants\`: declarative daemon capabilities. Each grant maps to a fixed env var:
+    \`agor_api_url: true\`   → injects the daemon URL as \`AGOR_API_URL\`.
+    \`agor_user_email: true\` → injects viewer's email as \`AGOR_USER_EMAIL\`.
+    \`agor_artifact_id: true\` → \`AGOR_ARTIFACT_ID\` (informational, no consent).
+    \`agor_board_id: true\`   → \`AGOR_BOARD_ID\` (informational, no consent).
+- \`sandpackConfig\`: author-controlled SandpackProvider config (template, customSetup, theme, options). Sanitized on write — UI-affecting / private-account props are stripped.
+
+CONSENT MODEL (TOFU): when the viewer is NOT the artifact author, the daemon does NOT inject env vars or grants without an explicit trust grant. Untrusted artifacts render with empty env values and a "Trust to render with secrets" badge.
+
+SYNCHRONOUS-ISH VALIDATION: pass \`waitForStatus: true\` to wait briefly for YOUR browser render to report Sandpack boot status, errors, and console output. This is not a headless/server build: Sandpack runs in the browser, and logs are per-viewer to avoid leaking secret-derived output. If no browser tab for you is viewing the artifact, the validation returns \`observed:false\` with a note instead of pretending success.
+
+IMPORTANT:
+- Secret VALUES are never sent to the LLM as-is — they're only injected into the served \`.env\` at view time. CAVEAT: if your artifact renders a secret-derived value into the DOM (e.g. \`<div>API: {key}</div>\`), an agent calling \`agor_artifacts_query_dom\` against your own running render WILL see the rendered text. Treat any \`agor_artifacts_query_*\` reply as potentially carrying secret-derived output if the artifact renders one.
+- Missing user env vars render as "" — your app should detect that and surface a "configure SOMETHING in Settings" message rather than calling APIs with empty creds.
+- For node.js / static templates without a dotenv path, env vars are NOT injected; the daemon emits a warning if you declared any.`,
+      inputSchema: z.object({
+        branchId: mcpRequiredId(
+          'branchId',
+          'Branch',
+          'Branch ID (UUID or short ID) containing the artifact folder.'
+        ),
+        subpath: mcpRequiredString('subpath', 'Branch-relative subpath to the artifact folder.'),
+        boardId: mcpOptionalId(
+          'boardId',
+          'Board',
+          'Board to place the artifact on. REQUIRED when creating. IGNORED when updating (artifactId given) — to move an artifact between boards use agor_artifacts_update.'
+        ),
+        name: mcpOptionalString(
+          'name',
+          'Artifact display name. REQUIRED when creating; on update (artifactId given) defaults to the existing name if omitted. PASSING A DIFFERENT NAME ON UPDATE WILL RENAME THE ARTIFACT.'
+        ),
+        artifactId: mcpOptionalId(
+          'artifactId',
+          'Artifact',
+          'If provided, update existing artifact (must be owned by you)'
+        ),
+        template: z
+          .enum(SANDPACK_TEMPLATES)
+          .optional()
+          .describe(
+            'Sandpack template (default: react). Also settable via sandpackConfig.template.'
+          ),
+        public: z
+          .boolean()
+          .optional()
+          .describe('Whether the artifact is visible to all board viewers (default: true)'),
+        sandpackConfig: SandpackConfigSchema.describe(
+          'Author-controlled Sandpack provider config (sanitized on write).'
+        ),
+        requiredEnvVars: z
+          .array(mcpRequiredString('requiredEnvVars[]', 'Env var name without template prefix'))
+          .optional()
+          .describe(
+            'Env var NAMES (no prefix) the artifact needs. Daemon synthesizes a per-viewer .env at render time.'
+          ),
+        agorGrants: AgorGrantsSchema.describe(
+          'Daemon capabilities to inject. See tool description for the full list.'
+        ),
+        agorRuntime: AgorRuntimeSchema.describe(
+          'Controls injection of the daemon-side `agor-runtime.js` (which powers agent DOM introspection via agor_artifacts_query_dom). Default: enabled.'
+        ),
+        x: mcpOptionalNumber('x', 'X position on board (default: 0, only used on create)'),
+        y: mcpOptionalNumber('y', 'Y position on board (default: 0, only used on create)'),
+        width: mcpOptionalNumber('width', 'Width in pixels (default: 600, only used on create)'),
+        height: z
+          .number()
+          .optional()
+          .describe('Height in pixels (default: 400, only used on create)'),
+        waitForStatus: z
+          .boolean()
+          .optional()
+          .describe(
+            "If true, wait for this user's browser render to report Sandpack status/errors/console logs before returning. Requires an open board/fullscreen tab for this user; otherwise returns observed:false after timeout."
+          ),
+        waitTimeoutMs: mcpOptionalPositiveInt(
+          'waitTimeoutMs',
+          'Maximum milliseconds to wait for browser-reported Sandpack status when waitForStatus=true (default 10000, max 60000).'
+        ),
+      }),
+    },
+    async (args) => {
+      const service = ctx.app.service('artifacts') as unknown as ArtifactsService;
+      const boardIdRaw = coerceString(args.boardId);
+      const resolvedBoardId = boardIdRaw ? await resolveBoardId(ctx, boardIdRaw) : undefined;
+      const branchIdRaw = coerceString(args.branchId);
+      const resolvedBranchId = branchIdRaw ? await resolveBranchId(ctx, branchIdRaw) : undefined;
+      const subpath = coerceString(args.subpath);
+      const resolvedArtifactId = coerceString(args.artifactId)
+        ? await resolveArtifactId(ctx, coerceString(args.artifactId)!)
+        : undefined;
+      if (!resolvedBranchId || !subpath) throw new Error('branchId and subpath are required');
+      const artifact = await service.publishArtifact(
+        {
+          branch_id: resolvedBranchId,
+          source_session_id: ctx.sessionId,
+          subpath,
+          board_id: resolvedBoardId,
+          name: coerceString(args.name),
+          artifact_id: resolvedArtifactId,
+          template: args.template,
+          public: args.public,
+          sandpack_config: args.sandpackConfig as SandpackConfig | undefined,
+          required_env_vars: args.requiredEnvVars,
+          agor_grants: args.agorGrants as AgorGrants | undefined,
+          agor_runtime: args.agorRuntime as AgorRuntimeConfig | undefined,
+          x: args.x,
+          y: args.y,
+          width: args.width,
+          height: args.height,
+        },
+        ctx.baseServiceParams as ArtifactParams
+      );
+
+      const publishValidation = args.waitForStatus
+        ? await service.waitForRuntimeStatus(artifact.artifact_id, ctx.userId, {
+            timeoutMs: args.waitTimeoutMs,
+          })
+        : undefined;
+      const publishDiagnostic = publishValidation
+        ? service.buildStatusDiagnostic(publishValidation)
+        : undefined;
+
+      const { files: _files, ...artifactSummary } = artifact;
+      const baseInstructions = args.artifactId
+        ? 'Artifact updated. Changes are live on the board.'
+        : 'Artifact created and placed on the board. To update it later, call agor_artifacts_publish again with the artifact_id.';
+      const validationInstructions = publishValidation
+        ? publishValidation.ok
+          ? ' Browser runtime validation observed a successful Sandpack boot.'
+          : publishValidation.timed_out
+            ? ' Browser runtime validation was inconclusive: compilation completion and settling were not confirmed before the timeout. Inspect publish_validation.note and the preview as this user, then call agor_artifacts_status. This is not evidence that the app is broken.'
+            : publishValidation.observed
+              ? ' Browser runtime validation observed a failure; inspect publish_validation.build_errors, sandpack_error, and console_logs, then fix and republish.'
+              : ' Publish validation failed before browser boot; inspect publish_validation.build_errors, then fix and republish.'
+        : '';
+      return textResult({
+        artifact: artifactSummary,
+        urls: {
+          board: artifactSummary.url ?? null,
+          fullscreen: artifactSummary.fullscreen_url ?? null,
+        },
+        next_actions: {
+          open_fullscreen: artifactSummary.fullscreen_url ?? null,
+          check_status: `agor_artifacts_status({ artifactId: "${artifact.artifact_id}" })`,
+          republish: `agor_artifacts_publish({ artifactId: "${artifact.artifact_id}", ... })`,
+        },
+        ...(publishValidation
+          ? { publish_validation: { ...publishValidation, diagnostic: publishDiagnostic } }
+          : {}),
+        instructions: `${baseInstructions}${validationInstructions}`,
+      });
+    }
+  );
+
+  // Tool 2: agor_artifacts_check_build
+  server.registerTool(
+    'agor_artifacts_check_build',
+    {
+      description:
+        'Browserless artifact folder validation in a branch-relative folder. Checks source presence/non-empty files, package.json syntax, configured entry existence, missing local imports, and common env/template footguns. Does NOT run Sandpack; use publish(waitForStatus=true) or agor_artifacts_status for browser runtime validation.',
+      inputSchema: z.object({
+        branchId: mcpRequiredId(
+          'branchId',
+          'Branch',
+          'Branch ID (UUID or short ID) containing the artifact folder.'
+        ),
+        subpath: mcpRequiredString(
+          'subpath',
+          'Branch-relative subpath pointing at the artifact folder.'
+        ),
+      }),
+    },
+    async (args) => {
+      const service = ctx.app.service('artifacts') as unknown as ArtifactsService;
+      const branchIdRaw = coerceString(args.branchId);
+      const resolvedBranchId = branchIdRaw ? await resolveBranchId(ctx, branchIdRaw) : undefined;
+      const subpath = coerceString(args.subpath);
+      if (!resolvedBranchId || !subpath) throw new Error('branchId and subpath are required');
+      const result = await service.checkBuildFromFolder(
+        {
+          branch_id: resolvedBranchId,
+          subpath,
+        },
+        ctx.baseServiceParams as ArtifactParams
+      );
+      // Mirror getStatus shape — `build_status` (not `status`) and `build_errors`
+      // (always an array, never undefined) so agents can parse one schema across
+      // both tools.
+      return textResult({
+        build_status: result.status,
+        build_errors: result.errors,
+        build_warnings: result.warnings,
+        diagnostics: result.diagnostics,
+      });
+    }
+  );
+
+  // Tool 2b: agor_artifacts_validate_folder
+  server.registerTool(
+    'agor_artifacts_validate_folder',
+    {
+      description:
+        'Browserless artifact folder validation. Clearer alias for agor_artifacts_check_build: verifies source files, package.json syntax, configured entry existence, missing local imports, and common env/template footguns. It still does NOT run Sandpack; use agor_artifacts_publish(waitForStatus=true) or agor_artifacts_status for browser runtime validation.',
+      inputSchema: z.object({
+        branchId: mcpRequiredId(
+          'branchId',
+          'Branch',
+          'Branch ID (UUID or short ID) containing the artifact folder.'
+        ),
+        subpath: mcpRequiredString(
+          'subpath',
+          'Branch-relative subpath pointing at the artifact folder.'
+        ),
+      }),
+    },
+    async (args) => {
+      const service = ctx.app.service('artifacts') as unknown as ArtifactsService;
+      const branchIdRaw = coerceString(args.branchId);
+      const resolvedBranchId = branchIdRaw ? await resolveBranchId(ctx, branchIdRaw) : undefined;
+      const subpath = coerceString(args.subpath);
+      if (!resolvedBranchId || !subpath) throw new Error('branchId and subpath are required');
+      const result = await service.checkBuildFromFolder(
+        {
+          branch_id: resolvedBranchId,
+          subpath,
+        },
+        ctx.baseServiceParams as ArtifactParams
+      );
+      return textResult({
+        build_status: result.status,
+        build_errors: result.errors,
+        build_warnings: result.warnings,
+        diagnostics: result.diagnostics,
+      });
+    }
+  );
+
+  // Tool 3: agor_artifacts_status
+  server.registerTool(
+    'agor_artifacts_status',
+    {
+      description: `Get artifact build status, Sandpack bundler errors, and recent console logs from the browser runtime. Use this to debug rendering issues.
+
+build_status reflects both file validation AND Sandpack runtime state. If the Sandpack bundler reports an error (e.g. "Could not find module './data'"), build_status will be 'error' even if files were accepted.
+
+Fields:
+- build_status: 'success' | 'error' | 'unknown' — reflects the worst of file validation and Sandpack runtime
+- build_errors: array of error messages (includes Sandpack errors prefixed with [Sandpack])
+- diagnostic: compact deterministic diagnosis + suggested_fix when an error/no-observation pattern is recognized
+- sandpack_error: the raw Sandpack bundler/runtime error object (null if no error)
+- sandpack_status: Sandpack provider lifecycle ('idle', 'running', 'timeout', etc.), NOT compilation readiness
+- compilation_status: 'pending' | 'compiling' | 'success' | 'error'; explicit browser compilation progress (absent for older tabs). Compilation success is a boot smoke check, not proof of DOM correctness.
+- runtime_observed_at: when your browser last reported current-content status/logs
+- console_logs: console.log/warn/error output from the running app
+
+NOTE: sandpack_error and console_logs require a browser to be viewing the artifact. They are scoped to the calling user's render — you only see your own console output, never another viewer's.`,
+      annotations: { readOnlyHint: true },
+      inputSchema: z.object({
+        artifactId: mcpRequiredId('artifactId', 'Artifact', 'Artifact ID'),
+      }),
+    },
+    async (args) => {
+      const service = ctx.app.service('artifacts') as unknown as ArtifactsService;
+      const status = await service.getStatus(coerceString(args.artifactId)!, ctx.userId);
+      return textResult({
+        ...status,
+        diagnostic: service.buildStatusDiagnostic(status),
+      });
+    }
+  );
+
+  // Tool 4: agor_artifacts_delete
+  server.registerTool(
+    'agor_artifacts_delete',
+    {
+      description:
+        "Delete an artifact. Owner or admin only — calling as a different user returns 'Forbidden'. Removes database record and board placement. Does not touch the filesystem.",
+      annotations: { destructiveHint: true },
+      inputSchema: z.object({
+        artifactId: mcpRequiredId('artifactId', 'Artifact', 'Artifact ID to delete'),
+      }),
+    },
+    async (args) => {
+      const service = ctx.app.service('artifacts') as unknown as ArtifactsService;
+      const artifactId = coerceString(args.artifactId)!;
+
+      // deleteArtifact loads the row, runs the owner/admin check, performs
+      // the delete, and returns the artifact so we can emit `removed`
+      // without a redundant pre-delete fetch. role on AuthenticatedUser is
+      // loosely typed as `string`; auth strategies enforce a valid value
+      // upstream so the cast to UserRole is honest.
+      const artifact = await runWithMcpTenantDatabaseScope(ctx, () =>
+        service.deleteArtifact(artifactId, ctx.userId, ctx.authenticatedUser.role as UserRole)
+      );
+      emitServiceEvent(ctx.app, {
+        path: 'artifacts',
+        event: 'removed',
+        data: artifact,
+        id: artifact.artifact_id,
+      });
+
+      return textResult({ success: true, artifactId });
+    }
+  );
+
+  // Tool 5: agor_artifacts_get
+  server.registerTool(
+    'agor_artifacts_get',
+    {
+      description:
+        'Get a single artifact by ID, including its full file map (path → content) and declarative metadata (sandpack_config, required_env_vars, agor_grants). Use this to read artifact source code from another branch without filesystem access. Respects visibility: public artifacts are readable by anyone; private artifacts are only readable by their creator.',
+      annotations: { readOnlyHint: true },
+      inputSchema: z.object({
+        artifactId: mcpRequiredId(
+          'artifactId',
+          'Artifact',
+          'Artifact ID (full UUID or short prefix)'
+        ),
+      }),
+    },
+    async (args) => {
+      const service = ctx.app.service('artifacts') as unknown as ArtifactsService;
+      const artifactId = coerceString(args.artifactId)!;
+
+      let artifact: Awaited<ReturnType<typeof service.get>>;
+      try {
+        artifact = await service.get(artifactId, ctx.baseServiceParams);
+      } catch (err) {
+        if (isNotFoundError(err)) {
+          return textResult({ error: `Artifact ${artifactId} not found` });
+        }
+        throw err;
+      }
+
+      if (!service.isVisibleTo(artifact, ctx.userId)) {
+        return textResult({ error: `Artifact ${artifactId} not found` });
+      }
+
+      const { files, ...metadata } = artifact;
+      return textResult({
+        artifact: metadata,
+        files: files ?? {},
+      });
+    }
+  );
+
+  // Tool 6: agor_artifacts_update
+  server.registerTool(
+    'agor_artifacts_update',
+    {
+      description: `Update artifact metadata without re-reading files from disk. Use this to move an artifact to a different board, rename it, toggle visibility, archive it, reposition its board placement, or update its declarative config (requiredEnvVars / agorGrants / sandpackConfig).
+
+For file/content changes, use agor_artifacts_publish (which re-reads a folder and updates the stored files).
+
+Placement (x, y, width, height) is preserved across board moves unless you explicitly override it.
+
+Caller must own the artifact (or be an admin).`,
+      inputSchema: z.object({
+        artifactId: mcpRequiredId(
+          'artifactId',
+          'Artifact',
+          'Artifact ID to update (full UUID or short prefix)'
+        ),
+        boardId: mcpOptionalId('boardId', 'Board', 'Move the artifact to a different board'),
+        name: mcpOptionalString('name', 'Rename the artifact'),
+        description: mcpOptionalString('description', 'Update the description'),
+        public: z
+          .boolean()
+          .optional()
+          .describe('Change visibility (true = visible to all board viewers, false = owner only)'),
+        archived: z.boolean().optional().describe('Archive or unarchive the artifact'),
+        x: mcpOptionalNumber('x', 'New X position on board'),
+        y: mcpOptionalNumber('y', 'New Y position on board'),
+        width: mcpOptionalNumber('width', 'New width in pixels'),
+        height: mcpOptionalNumber('height', 'New height in pixels'),
+        sandpackConfig: SandpackConfigSchema.describe(
+          "Replace the artifact's sandpack_config (sanitized on write)."
+        ),
+        requiredEnvVars: z
+          .array(mcpRequiredString('requiredEnvVars[]', 'Env var name without template prefix'))
+          .optional()
+          .describe("Replace the artifact's required_env_vars list."),
+        agorGrants: AgorGrantsSchema.describe("Replace the artifact's agor_grants object."),
+        agorRuntime: AgorRuntimeSchema.describe(
+          "Replace the artifact's agor_runtime config (controls agor-runtime.js injection)."
+        ),
+        waitForStatus: z
+          .boolean()
+          .optional()
+          .describe(
+            "If true, wait for this user's browser render to report Sandpack status/errors/console logs after the metadata update. Most useful when changing sandpackConfig, requiredEnvVars, agorGrants, or agorRuntime."
+          ),
+        waitTimeoutMs: mcpOptionalPositiveInt(
+          'waitTimeoutMs',
+          'Maximum milliseconds to wait for browser-reported Sandpack status when waitForStatus=true (default 10000, max 60000).'
+        ),
+      }),
+    },
+    async (args) => {
+      const service = ctx.app.service('artifacts') as unknown as ArtifactsService;
+      const artifactId = await resolveArtifactId(ctx, coerceString(args.artifactId)!);
+
+      const boardIdInput = coerceString(args.boardId);
+      const resolvedBoardId = boardIdInput ? await resolveBoardId(ctx, boardIdInput) : undefined;
+
+      const updated = await runWithMcpTenantDatabaseScope(ctx, () =>
+        service.updateMetadata(
+          artifactId,
+          {
+            name: coerceString(args.name),
+            description: coerceString(args.description),
+            public: args.public,
+            archived: args.archived,
+            board_id: resolvedBoardId as BoardID | undefined,
+            x: args.x,
+            y: args.y,
+            width: args.width,
+            height: args.height,
+            sandpack_config: args.sandpackConfig as SandpackConfig | undefined,
+            required_env_vars: args.requiredEnvVars,
+            agor_grants: args.agorGrants as AgorGrants | undefined,
+            agor_runtime: args.agorRuntime as AgorRuntimeConfig | undefined,
+          },
+          ctx.userId,
+          ctx.authenticatedUser.role as UserRole
+        )
+      );
+
+      const updateValidation = args.waitForStatus
+        ? await service.waitForRuntimeStatus(updated.artifact_id, ctx.userId, {
+            timeoutMs: args.waitTimeoutMs,
+          })
+        : undefined;
+      const updateDiagnostic = updateValidation
+        ? service.buildStatusDiagnostic(updateValidation)
+        : undefined;
+
+      const { files: _files, ...artifactSummary } = updated;
+      return textResult({
+        artifact: artifactSummary,
+        urls: {
+          board: artifactSummary.url ?? null,
+          fullscreen: artifactSummary.fullscreen_url ?? null,
+        },
+        next_actions: {
+          open_fullscreen: artifactSummary.fullscreen_url ?? null,
+          check_status: `agor_artifacts_status({ artifactId: "${updated.artifact_id}" })`,
+        },
+        ...(updateValidation
+          ? { publish_validation: { ...updateValidation, diagnostic: updateDiagnostic } }
+          : {}),
+        instructions: updateValidation
+          ? updateValidation.ok
+            ? 'Artifact metadata updated. Browser runtime validation observed a successful Sandpack boot.'
+            : 'Artifact metadata updated, but validation did not observe a successful render. Inspect publish_validation for details.'
+          : 'Artifact metadata updated.',
+      });
+    }
+  );
+
+  // Tool 7: agor_artifacts_land
+  server.registerTool(
+    'agor_artifacts_land',
+    {
+      description: `Materialize an artifact's stored files to disk inside a branch. Inverse of agor_artifacts_publish.
+
+Use this when you want to tweak an artifact's code: land it into a branch, edit the files locally, then call agor_artifacts_publish with the same artifactId to push the changes back.
+
+Writes a small \`agor.artifact.json\` sidecar alongside the source files. The sidecar carries metadata that doesn't fit in the file map (template, sandpack_config, required_env_vars, agor_grants) so a round-trip publish() can preserve it. **Do not delete \`agor.artifact.json\`** — without it, a republish will reset \`required_env_vars\` and \`agor_grants\` to empty. Build tools (Vite/CRA/etc.) ignore the sidecar.
+
+Safety:
+- Destination must be inside the target branch (cannot escape via ".." or absolute paths).
+- Default subpath is \`.agor/artifacts/<slug>-<short-id>\` derived from the artifact's name (kebab-cased, ASCII-only). Pass a custom subpath if you want a different location.
+- Refuses to write to an existing destination unless overwrite=true is passed.
+- overwrite=true removes the destination directory first (symlinks are unlinked, not followed).
+
+Visibility: public artifacts are readable by anyone; private artifacts are only landable by their owner.`,
+      inputSchema: z.object({
+        artifactId: mcpRequiredId(
+          'artifactId',
+          'Artifact',
+          'Artifact ID to materialize (full UUID or short prefix)'
+        ),
+        branchId: mcpRequiredId(
+          'branchId',
+          'Branch',
+          'Destination branch ID (full UUID or short prefix)'
+        ),
+        subpath: mcpOptionalString(
+          'subpath',
+          'Branch-relative path for the destination folder. Default: .agor/artifacts/<slug>-<short-id> derived from the artifact name. Must not be absolute or escape the branch.'
+        ),
+        overwrite: z
+          .boolean()
+          .optional()
+          .describe('Remove the destination folder first if it exists. Default: false.'),
+      }),
+    },
+    async (args) => {
+      const service = ctx.app.service('artifacts') as unknown as ArtifactsService;
+      const artifactId = await resolveArtifactId(ctx, coerceString(args.artifactId)!);
+      const branchId = await resolveBranchId(ctx, coerceString(args.branchId)!);
+
+      let artifact: Awaited<ReturnType<typeof service.get>>;
+      try {
+        artifact = await service.get(artifactId, ctx.baseServiceParams);
+      } catch (err) {
+        if (isNotFoundError(err)) {
+          return textResult({ error: `Artifact ${artifactId} not found` });
+        }
+        throw err;
+      }
+      if (!service.isVisibleTo(artifact, ctx.userId)) {
+        return textResult({ error: `Artifact ${artifactId} not found` });
+      }
+
+      const branch = (await ctx.app.service('branches').get(branchId, ctx.baseServiceParams)) as {
+        branch_id: string;
+        path: string;
+      };
+
+      const branchIdBranded = branch.branch_id as BranchID;
+      const userIdBranded = ctx.userId as UUID;
+      const permission = await runWithMcpTenantDatabaseScope(ctx, async (db) => {
+        const branchRepo = new BranchRepository(db);
+        const fullBranch = await branchRepo.findById(branchIdBranded);
+        if (!fullBranch) return null;
+        const access = await branchRepo.resolveUserAccess(fullBranch, userIdBranded);
+        return { access, fullBranch };
+      });
+      if (!permission) {
+        return textResult({ error: `Branch ${branchId} not found` });
+      }
+      const { access, fullBranch } = permission;
+      const canWrite = hasBranchPermission(
+        fullBranch,
+        userIdBranded,
+        access.is_owner,
+        'session',
+        ctx.authenticatedUser.role,
+        ctx.app.get('config').execution?.allow_superadmin === true,
+        access.can
+      );
+      const hasFilesystemWrite =
+        access.is_owner ||
+        isSuperAdmin(
+          ctx.authenticatedUser.role,
+          ctx.app.get('config').execution?.allow_superadmin === true
+        ) ||
+        access.fs_access === 'write';
+      if (!canWrite || !hasFilesystemWrite) {
+        return textResult({
+          error: `Forbidden: Collaborator and filesystem write access are required to land artifacts into branch ${branchId}`,
+        });
+      }
+
+      const result = await service.land(
+        artifactId,
+        branchIdBranded,
+        {
+          subpath: coerceString(args.subpath),
+          overwrite: args.overwrite,
+        },
+        ctx.baseServiceParams as ArtifactParams
+      );
+
+      return textResult({
+        artifactId,
+        branchId: branch.branch_id,
+        subpath: result.subpath,
+        fileCount: result.fileCount,
+        bytesWritten: result.bytesWritten,
+        instructions: `Artifact materialized to branch ${branch.branch_id} at subpath ${result.subpath}. The folder includes \`agor.artifact.json\` — keep it: it carries template/sandpack_config/required_env_vars/agor_grants for round-trip publishing. Edit source files there, then call agor_artifacts_publish with branchId=${branch.branch_id}, subpath=${result.subpath}, and artifactId=${artifactId} to push changes back.`,
+      });
+    }
+  );
+
+  // Tool 8: agor_artifacts_list
+  server.registerTool(
+    'agor_artifacts_list',
+    {
+      description:
+        'List a page of artifacts, optionally filtered by board. File maps are omitted. Respects visibility and branch RBAC. Advance with offset=nextOffset while hasMore is true.',
+      annotations: { readOnlyHint: true },
+      inputSchema: z.object({
+        boardId: mcpOptionalId('boardId', 'Board', 'Filter by board ID'),
+        limit: mcpLimit(25, 100),
+        offset: mcpOffset(0),
+      }),
+    },
+    async (args) => {
+      const boardIdRaw = coerceString(args.boardId);
+      const boardId = boardIdRaw ? await resolveBoardId(ctx, boardIdRaw) : undefined;
+      const limit = typeof args.limit === 'number' ? args.limit : 25;
+      const offset = typeof args.offset === 'number' ? args.offset : 0;
+      // Use the normal service path so tenant/RBAC/visibility hooks run before
+      // the adapter computes total and applies pagination.
+      const result = await ctx.app.service('artifacts').find({
+        query: {
+          ...(boardId ? { board_id: boardId } : {}),
+          $limit: limit,
+          $skip: offset,
+          $sort: { created_at: -1, artifact_id: 1 },
+          $select: [...ARTIFACT_LIST_FIELDS_WITHOUT_FILES],
+        },
+        ...ctx.baseServiceParams,
+      });
+      const page = mcpPageResult(result, limit, offset);
+      const stripped = (page.data as Record<string, unknown>[]).map(
+        ({ files: _f, ...rest }) => rest
+      );
+      return textResult({ ...page, data: stripped });
+    }
+  );
+
+  // Tool 9: agor_artifacts_export_codesandbox
+  server.registerTool(
+    'agor_artifacts_export_codesandbox',
+    {
+      description: `Export an artifact to CodeSandbox via their "define API". Returns a sandbox URL and ID. Useful for sharing or demoing — the artifact runs in CodeSandbox's standard environment, not Agor.
+
+CAVEAT: daemon-supplied capabilities won't work on CodeSandbox. The exported sandbox can read \`required_env_vars\` from CodeSandbox's "Secret Keys" UI — the names match because both sides use the same prefix-per-template convention (Vite → \`VITE_\`, CRA → \`REACT_APP_\`, etc.).`,
+      inputSchema: z.object({
+        artifactId: mcpRequiredId(
+          'artifactId',
+          'Artifact',
+          'Artifact ID to export (full UUID or short prefix)'
+        ),
+      }),
+    },
+    async (args) => {
+      const service = ctx.app.service('artifacts') as unknown as ArtifactsService;
+      const artifactId = await resolveArtifactId(ctx, coerceString(args.artifactId)!);
+      try {
+        const result = await service.exportToCodeSandbox(artifactId, ctx.userId);
+        return textResult(result);
+      } catch (err) {
+        return textResult({
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+  );
+
+  // Tool 10: agor_artifacts_query_dom
+  server.registerTool(
+    'agor_artifacts_query_dom',
+    {
+      description: `Query the rendered DOM of a running artifact via CSS selector.
+
+Round-trip: this MCP call → daemon → WebSocket → your own browser tab(s) viewing the artifact → Sandpack iframe → \`agor-runtime.js\` (auto-injected at render time) → response back up the chain. Replies carry serialized matches: tag, attributes, textContent, outerHTML.
+
+REQUIREMENTS:
+- The artifact must have \`agor_runtime.enabled !== false\` (default is enabled). If the author disabled introspection, the call returns a clean error.
+- A browser tab logged in as YOU must be currently viewing the artifact. The daemon scopes responses to the requesting user — another viewer's browser cannot answer your query (and so cannot leak their secret-bearing render).
+- If no qualifying tab is open, the call times out (default 5s) with an error suggesting you open the artifact and retry.
+
+Caps: 50 nodes max, 50KB outerHTML per node, 5KB textContent per node. Tightened for context budget.
+
+Use cases:
+- "Did my artifact actually render the new heading?" — \`{ selector: 'h1' }\`
+- "Inspect a list of cards" — \`{ selector: '.card', multiple: true }\`
+- "Get the full document" — use \`{ selector: 'html' }\`, or call \`agor_artifacts_query_document_html\` for an unstructured dump of the entire \`document.documentElement.outerHTML\`.`,
+      annotations: { readOnlyHint: true },
+      inputSchema: z.object({
+        artifactId: mcpRequiredId(
+          'artifactId',
+          'Artifact',
+          'Artifact ID (full UUID or short prefix)'
+        ),
+        selector: mcpRequiredString(
+          'selector',
+          'CSS selector to match (e.g. "h1", ".card", "[data-test=\'submit\']")'
+        ),
+        multiple: z
+          .boolean()
+          .optional()
+          .describe('querySelectorAll vs querySelector. Default: false (single match).'),
+        maxNodes: mcpOptionalPositiveInt(
+          'maxNodes',
+          'Max nodes to return (capped at 50 by the runtime). Default: 50.'
+        ),
+        timeoutMs: mcpOptionalPositiveInt(
+          'timeoutMs',
+          'How long to wait for the browser to answer (500-30000). Default: 5000.'
+        ),
+      }),
+    },
+    async (args) => {
+      const service = ctx.app.service('artifacts') as unknown as ArtifactsService;
+      const artifactId = await resolveArtifactId(ctx, coerceString(args.artifactId)!);
+      try {
+        const result = await service.queryArtifactRuntime({
+          artifactId,
+          userId: ctx.userId,
+          kind: 'query_dom',
+          args: {
+            selector: coerceString(args.selector),
+            multiple: args.multiple,
+            maxNodes: args.maxNodes,
+          },
+          timeoutMs: args.timeoutMs,
+        });
+        return textResult(result);
+      } catch (err) {
+        return textResult({
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+  );
+
+  // Tool 11: agor_artifacts_query_document_html
+  server.registerTool(
+    'agor_artifacts_query_document_html',
+    {
+      description: `Return the rendered artifact's full \`document.documentElement.outerHTML\` (unstructured dump).
+
+Same round-trip as agor_artifacts_query_dom: requires \`agor_runtime.enabled\` and a browser tab logged in as YOU currently viewing the artifact.
+
+Capped at 200KB. Truncated output ends with \`... [truncated]\`. For targeted queries prefer agor_artifacts_query_dom with a CSS selector — this tool is the "give me everything" escape hatch when you don't know what to look for yet.`,
+      annotations: { readOnlyHint: true },
+      inputSchema: z.object({
+        artifactId: mcpRequiredId(
+          'artifactId',
+          'Artifact',
+          'Artifact ID (full UUID or short prefix)'
+        ),
+        timeoutMs: mcpOptionalPositiveInt(
+          'timeoutMs',
+          'How long to wait for the browser to answer (500-30000). Default: 5000.'
+        ),
+      }),
+    },
+    async (args) => {
+      const service = ctx.app.service('artifacts') as unknown as ArtifactsService;
+      const artifactId = await resolveArtifactId(ctx, coerceString(args.artifactId)!);
+      try {
+        const result = await service.queryArtifactRuntime({
+          artifactId,
+          userId: ctx.userId,
+          kind: 'document_html',
+          args: {},
+          timeoutMs: args.timeoutMs,
+        });
+        return textResult(result);
+      } catch (err) {
+        return textResult({
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+  );
+}

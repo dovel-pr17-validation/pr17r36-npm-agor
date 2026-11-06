@@ -1,0 +1,566 @@
+/**
+ * Gemini Tool Implementation
+ *
+ * Current capabilities:
+ * - ✅ Live execution via @google/gemini-cli-core SDK
+ * - ✅ Token-level streaming with AsyncGenerator
+ * - ✅ Accept edits and Bypass permissions
+ * - ✅ Session continuity via SDK recording and resumeChat()
+ * - ❌ Import sessions (deferred - need checkpoint format)
+ * - ❌ Session creation (handled via live execution)
+ */
+
+import { execSync } from 'node:child_process';
+import { generateId } from '@agor/core/db';
+import { writeLogLine } from '@agor/core/utils/logger';
+import type {
+  BranchRepository,
+  MCPOAuthAuthHeadersRepository,
+  MCPServerRepository,
+  MessagesRepository,
+  RepoRepository,
+  SessionMCPServerRepository,
+  SessionRepository,
+  UsersRepository,
+} from '../../db/feathers-repositories.js';
+import type { NormalizedSdkResponse, RawSdkResponse } from '../../types/sdk-response.js';
+import type { TokenUsage } from '../../types/token-usage.js';
+import {
+  type Message,
+  type MessageID,
+  MessageRole,
+  type MessageSource,
+  type PermissionMode,
+  type SessionID,
+  type TaskID,
+} from '../../types.js';
+import { enrichContentBlocks } from '../base/diff-enrichment.js';
+import type {
+  ITool,
+  MessagesService,
+  StreamingCallbacks,
+  TasksService,
+  ToolCapabilities,
+} from '../base/index.js';
+import { buildAssistantMessageMetadata, patchTaskModelIfKnown } from '../base/model-recording.js';
+import { createUserMessage } from '../claude/message-builder.js';
+import { GeminiPromptService } from './prompt-service.js';
+import { GeminiIntegrationError, geminiFailureLine } from './runtime.js';
+import { extractGeminiTokenUsage } from './usage.js';
+
+interface GeminiExecutionResult {
+  wasStopped?: boolean;
+  hadError?: boolean;
+  errorDetails?: string[];
+  userMessageId: MessageID;
+  assistantMessageIds: MessageID[];
+  tokenUsage?: TokenUsage;
+  contextWindow?: number;
+  contextWindowLimit?: number;
+  model?: string;
+  rawSdkResponse?: unknown; // Raw SDK event from Gemini
+}
+
+export class GeminiTool implements ITool {
+  readonly toolType = 'gemini' as const;
+  readonly name = 'Google Gemini';
+
+  private promptService?: GeminiPromptService;
+
+  constructor(
+    private messagesRepo?: MessagesRepository,
+    sessionsRepo?: SessionRepository,
+    apiKey?: string,
+    private messagesService?: MessagesService,
+    private tasksService?: TasksService,
+    branchesRepo?: BranchRepository,
+    reposRepo?: RepoRepository,
+    mcpServerRepo?: MCPServerRepository,
+    sessionMCPRepo?: SessionMCPServerRepository,
+    mcpEnabled?: boolean,
+    useNativeAuth?: boolean, // Flag to use OAuth when no API key
+    usersRepo?: UsersRepository,
+    mcpOAuthAuthHeadersRepo?: MCPOAuthAuthHeadersRepository
+  ) {
+    if (messagesRepo && sessionsRepo) {
+      this.promptService = new GeminiPromptService(
+        messagesRepo,
+        sessionsRepo,
+        apiKey,
+        branchesRepo,
+        reposRepo,
+        mcpServerRepo,
+        sessionMCPRepo,
+        mcpEnabled,
+        useNativeAuth,
+        usersRepo,
+        this.tasksService,
+        mcpOAuthAuthHeadersRepo
+      );
+    }
+  }
+
+  getCapabilities(): ToolCapabilities {
+    return {
+      supportsSessionCreate: false, // ❌ Not exposed (handled via executeTask)
+      supportsLiveExecution: true, // ✅ Via @google/gemini-cli-core SDK
+      supportsSessionFork: false,
+      supportsChildSpawn: false,
+      supportsGitState: false, // Agor manages git state
+      supportsStreaming: true, // ✅ Via sendMessageStream()
+    };
+  }
+
+  async checkInstalled(): Promise<boolean> {
+    try {
+      // Check if gemini CLI is installed
+      execSync('which gemini', { encoding: 'utf-8' });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Execute a prompt against a session WITH real-time streaming
+   *
+   * Creates user message, streams response chunks from Gemini, then creates complete assistant messages.
+   * Calls streamingCallbacks during message generation for real-time UI updates.
+   *
+   * @param sessionId - Session to execute prompt in
+   * @param prompt - User prompt text
+   * @param taskId - Optional task ID for linking messages
+   * @param permissionMode - Permission mode (Manual is rejected at execution)
+   * @param streamingCallbacks - Optional callbacks for real-time streaming (enables typewriter effect)
+   * @returns User message ID and array of assistant message IDs
+   */
+  async executePromptWithStreaming(
+    sessionId: SessionID,
+    prompt: string,
+    taskId?: TaskID,
+    permissionMode?: PermissionMode,
+    streamingCallbacks?: StreamingCallbacks,
+    abortController?: AbortController,
+    messageSource?: MessageSource
+  ): Promise<GeminiExecutionResult> {
+    if (!this.promptService || !this.messagesRepo) {
+      throw new Error('GeminiTool not initialized with repositories for live execution');
+    }
+
+    if (!this.messagesService) {
+      throw new Error('GeminiTool not initialized with messagesService for live execution');
+    }
+
+    // Hydrate only this Task while deriving the append position from one row.
+    const [existingMessages, sessionNextIndex] = await Promise.all([
+      taskId ? this.messagesRepo.findInitialUserMessagesByTaskId(taskId) : Promise.resolve([]),
+      this.messagesRepo.getNextIndexBySessionId(sessionId),
+    ]);
+    let nextIndex = sessionNextIndex;
+
+    // Create user message (or reuse the daemon's pre-write).
+    const userMessage = await createUserMessage(
+      sessionId,
+      prompt,
+      taskId,
+      nextIndex,
+      this.messagesService!,
+      { messageSource, existingMessages }
+    );
+    nextIndex = Math.max(nextIndex, userMessage.index + 1);
+
+    // Execute prompt via Gemini SDK with streaming
+    const assistantMessageIds: MessageID[] = [];
+    let wasStopped = false;
+    let resolvedModel: string | undefined;
+    let currentMessageId: MessageID | null = null;
+    let tokenUsage: TokenUsage | undefined;
+    let streamStartTime = Date.now();
+    let firstTokenTime: number | null = null;
+    let rawSdkResponse: unknown;
+    let failure: GeminiIntegrationError | undefined;
+
+    try {
+      for await (const event of this.promptService.promptSessionStreaming(
+        sessionId,
+        prompt,
+        taskId,
+        permissionMode,
+        streamingCallbacks?.onPulse,
+        abortController
+      )) {
+        if (event.type === 'stopped') {
+          wasStopped = true;
+          continue;
+        }
+        if (event.type === 'partial') {
+          resolvedModel = event.resolvedModel ?? resolvedModel;
+        } else if (event.type === 'complete') {
+          resolvedModel = event.resolvedModel ?? resolvedModel;
+        }
+
+        // Capture token usage from complete event
+        if (event.type === 'complete' && event.usage) {
+          tokenUsage = event.usage;
+        }
+
+        // Capture raw SDK response for token accounting
+        if (event.type === 'complete' && event.rawSdkResponse) {
+          rawSdkResponse = event.rawSdkResponse;
+        }
+
+        // Handle partial streaming events (token-level chunks)
+        if (event.type === 'partial' && event.textChunk) {
+          // Start new message if needed
+          if (!currentMessageId) {
+            currentMessageId = generateId() as MessageID;
+            firstTokenTime = Date.now();
+            const ttfb = firstTokenTime - streamStartTime;
+            console.debug(`⏱️  [Gemini] TTFB: ${ttfb}ms`);
+
+            if (streamingCallbacks) {
+              streamingCallbacks.onStreamStart(currentMessageId, {
+                role: MessageRole.ASSISTANT,
+                timestamp: new Date().toISOString(),
+              });
+            }
+          }
+
+          // Emit chunk immediately
+          if (streamingCallbacks) {
+            streamingCallbacks.onStreamChunk(currentMessageId, event.textChunk);
+          }
+        }
+        // Handle complete message (save to database)
+        else if (event.type === 'complete' && event.content.length > 0) {
+          // End streaming if active
+          if (currentMessageId && streamingCallbacks) {
+            const streamEndTime = Date.now();
+            streamingCallbacks.onStreamEnd(currentMessageId);
+            const totalTime = streamEndTime - streamStartTime;
+            const streamingTime = firstTokenTime ? streamEndTime - firstTokenTime : 0;
+            console.debug(
+              `⏱️  [Streaming] Complete - TTFB: ${firstTokenTime ? firstTokenTime - streamStartTime : 0}ms, streaming: ${streamingTime}ms, total: ${totalTime}ms`
+            );
+          }
+
+          // Use existing message ID or generate new one
+          const assistantMessageId = currentMessageId || (generateId() as MessageID);
+
+          // Best-effort diff enrichment for Edit/Write tool results
+          enrichContentBlocks(event.content);
+
+          // Create complete message in DB
+          await this.createAssistantMessage(
+            sessionId,
+            assistantMessageId,
+            event.content,
+            event.toolUses,
+            taskId,
+            nextIndex++,
+            resolvedModel,
+            extractGeminiTokenUsage(event.rawSdkResponse?.value.usageMetadata)
+          );
+          assistantMessageIds.push(assistantMessageId);
+
+          // Reset for next message
+          currentMessageId = null;
+          streamStartTime = Date.now();
+          firstTokenTime = null;
+        }
+      }
+    } catch (error) {
+      if (!(error instanceof GeminiIntegrationError)) throw error;
+      failure = error;
+    }
+
+    return {
+      ...(failure ? { hadError: true, errorDetails: [failure.message] } : {}),
+      userMessageId: userMessage.message_id,
+      assistantMessageIds,
+      wasStopped,
+      tokenUsage,
+      // Gemini SDK doesn't provide contextWindow/contextWindowLimit
+      contextWindow: undefined,
+      contextWindowLimit: undefined,
+      model: resolvedModel,
+      rawSdkResponse,
+    };
+  }
+
+  /**
+   * Create complete assistant message in database
+   * @private
+   */
+  private async createAssistantMessage(
+    sessionId: SessionID,
+    messageId: MessageID,
+    content: Array<{
+      type: string;
+      text?: string;
+      id?: string;
+      name?: string;
+      input?: Record<string, unknown>;
+    }>,
+    toolUses: Array<{ id: string; name: string; input: Record<string, unknown> }> | undefined,
+    taskId: TaskID | undefined,
+    nextIndex: number,
+    resolvedModel?: string,
+    tokenUsage?: TokenUsage
+  ): Promise<Message> {
+    // Extract text content for preview
+    const textBlocks = content.filter((b) => b.type === 'text').map((b) => b.text || '');
+    const fullTextContent = textBlocks.join('');
+    const contentPreview = fullTextContent.substring(0, 200);
+
+    const message: Message = {
+      message_id: messageId,
+      session_id: sessionId,
+      type: 'assistant',
+      role: MessageRole.ASSISTANT,
+      index: nextIndex,
+      timestamp: new Date().toISOString(),
+      content_preview: contentPreview,
+      content: content as Message['content'],
+      tool_uses: toolUses,
+      task_id: taskId,
+      metadata: buildAssistantMessageMetadata({ model: resolvedModel, tokenUsage }),
+    };
+
+    try {
+      await this.messagesService?.create(message);
+      await patchTaskModelIfKnown(this.tasksService, taskId, resolvedModel);
+    } catch (error) {
+      // The prompt generator is suspended during persistence, with SDK console
+      // output suppressed. Emit only a fixed category on the unaffected stream.
+      writeLogLine('error', geminiFailureLine('persistence', error));
+      throw error;
+    }
+
+    return message;
+  }
+
+  /**
+   * Execute a prompt against a session (non-streaming version)
+   *
+   * Creates user message, collects response from Gemini, creates assistant messages.
+   * Returns user message ID and array of assistant message IDs.
+   *
+   * @param sessionId - Session to execute prompt in
+   * @param prompt - User prompt text
+   * @param taskId - Optional task ID for linking messages
+   * @param permissionMode - Permission mode (Manual is rejected at execution)
+   */
+  async executePrompt(
+    sessionId: SessionID,
+    prompt: string,
+    taskId?: TaskID,
+    permissionMode?: PermissionMode,
+    messageSource?: MessageSource
+  ): Promise<GeminiExecutionResult> {
+    if (!this.promptService || !this.messagesRepo) {
+      throw new Error('GeminiTool not initialized with repositories for live execution');
+    }
+
+    if (!this.messagesService) {
+      throw new Error('GeminiTool not initialized with messagesService for live execution');
+    }
+
+    // Hydrate only this Task while deriving the append position from one row.
+    const [existingMessages, sessionNextIndex] = await Promise.all([
+      taskId ? this.messagesRepo.findInitialUserMessagesByTaskId(taskId) : Promise.resolve([]),
+      this.messagesRepo.getNextIndexBySessionId(sessionId),
+    ]);
+    let nextIndex = sessionNextIndex;
+
+    // Create user message (or reuse the daemon's pre-write).
+    const userMessage = await createUserMessage(
+      sessionId,
+      prompt,
+      taskId,
+      nextIndex,
+      this.messagesService!,
+      { messageSource, existingMessages }
+    );
+    nextIndex = Math.max(nextIndex, userMessage.index + 1);
+
+    // Execute prompt via Gemini SDK
+    const assistantMessageIds: MessageID[] = [];
+    let wasStopped = false;
+    let resolvedModel: string | undefined;
+    let tokenUsage: TokenUsage | undefined;
+    let _contextWindow: number | undefined;
+    let _contextWindowLimit: number | undefined;
+    let rawSdkResponse: unknown;
+    let failure: GeminiIntegrationError | undefined;
+
+    try {
+      for await (const event of this.promptService.promptSessionStreaming(
+        sessionId,
+        prompt,
+        taskId,
+        permissionMode
+      )) {
+        if (event.type === 'stopped') {
+          wasStopped = true;
+          continue;
+        }
+        if (event.type === 'partial') {
+          resolvedModel = event.resolvedModel ?? resolvedModel;
+        } else if (event.type === 'complete') {
+          resolvedModel = event.resolvedModel ?? resolvedModel;
+        }
+
+        // Capture token usage from complete event
+        if (event.type === 'complete' && event.usage) {
+          tokenUsage = event.usage;
+        }
+
+        if (event.type === 'complete' && event.rawSdkResponse)
+          rawSdkResponse = event.rawSdkResponse;
+
+        // Skip partial and tool events in non-streaming mode
+        if (
+          event.type === 'partial' ||
+          event.type === 'tool_start' ||
+          event.type === 'tool_complete'
+        ) {
+          continue;
+        }
+
+        // Handle complete messages only
+        if (event.type === 'complete' && event.content && event.content.length > 0) {
+          // Best-effort diff enrichment for Edit/Write tool results
+          enrichContentBlocks(event.content);
+
+          const messageId = generateId() as MessageID;
+          await this.createAssistantMessage(
+            sessionId,
+            messageId,
+            event.content,
+            event.toolUses,
+            taskId,
+            nextIndex++,
+            resolvedModel,
+            extractGeminiTokenUsage(event.rawSdkResponse?.value.usageMetadata)
+          );
+          assistantMessageIds.push(messageId);
+        }
+      }
+    } catch (error) {
+      if (!(error instanceof GeminiIntegrationError)) throw error;
+      failure = error;
+    }
+
+    return {
+      ...(failure ? { hadError: true, errorDetails: [failure.message] } : {}),
+      userMessageId: userMessage.message_id,
+      assistantMessageIds,
+      wasStopped,
+      tokenUsage,
+      // Gemini SDK doesn't provide contextWindow/contextWindowLimit
+      contextWindow: undefined,
+      contextWindowLimit: undefined,
+      model: resolvedModel,
+      rawSdkResponse,
+    };
+  }
+
+  /**
+   * Stop currently executing task in session
+   *
+   * Uses AbortController to gracefully cancel the streaming request.
+   *
+   * @param sessionId - Session identifier
+   * @param taskId - Optional task ID (not used for Gemini, session-level stop)
+   * @returns Success status and reason if failed
+   */
+  async stopTask(
+    sessionId: string,
+    taskId?: string
+  ): Promise<{
+    success: boolean;
+    partialResult?: Partial<{ taskId: string; status: 'completed' | 'failed' | 'cancelled' }>;
+    reason?: string;
+  }> {
+    if (!this.promptService) {
+      return {
+        success: false,
+        reason: 'GeminiTool not initialized with prompt service',
+      };
+    }
+
+    const result = this.promptService.stopTask(sessionId as SessionID);
+
+    if (result.success) {
+      return {
+        success: true,
+        partialResult: {
+          taskId: taskId || 'unknown',
+          status: 'cancelled',
+        },
+      };
+    }
+
+    return result;
+  }
+
+  // ============================================================
+  // Token Accounting (NEW)
+  // ============================================================
+
+  /**
+   * Normalize Gemini SDK response to common format
+   *
+   * @deprecated This method is deprecated - use normalizeRawSdkResponse() from utils/sdk-normalizer instead
+   * This stub remains for API compatibility but should not be used.
+   */
+  normalizedSdkResponse(_rawResponse: RawSdkResponse): NormalizedSdkResponse {
+    throw new Error(
+      'normalizedSdkResponse() is deprecated - use normalizeRawSdkResponse() from utils/sdk-normalizer instead'
+    );
+  }
+
+  /**
+   * Compute cumulative context window usage for a Gemini session
+   *
+   * For Gemini, the SDK already provides cumulative token counts in each task's response.
+   * The promptTokenCount field includes the full conversation history up to that point.
+   * We just need to extract and return the contextWindow from the current task's SDK response.
+   *
+   * @param sessionId - Session ID to compute context for
+   * @param currentTaskId - Optional current task ID (not used for Gemini, kept for interface consistency)
+   * @param currentRawSdkResponse - Optional raw SDK response from current task (if available in memory)
+   * @returns Promise resolving to computed context window usage in tokens
+   */
+  async computeContextWindow(
+    sessionId: string,
+    _currentTaskId?: string,
+    currentRawSdkResponse?: unknown
+  ): Promise<number> {
+    // Gemini SDK provides cumulative tokens in usageMetadata
+    // Simply extract promptTokenCount + candidatesTokenCount from the raw response
+    if (currentRawSdkResponse) {
+      const response =
+        currentRawSdkResponse as import('../../types/sdk-response').GeminiSdkResponse;
+      const inputTokens = response.value?.usageMetadata?.promptTokenCount || 0;
+      const outputTokens = response.value?.usageMetadata?.candidatesTokenCount || 0;
+      const cumulativeTokens = inputTokens + outputTokens;
+      console.log(
+        `✅ Computed context window for Gemini session ${sessionId}: ${cumulativeTokens} tokens (from current task)`
+      );
+      return cumulativeTokens;
+    }
+
+    // IMPORTANT: Do NOT query database when currentRawSdkResponse is not provided
+    // This method is called during task UPDATE operations, and querying the database
+    // during a pending UPDATE causes deadlocks in PostgreSQL due to read-while-write
+    // in the same transaction. The caller should ALWAYS provide currentRawSdkResponse
+    // during task completion.
+    console.warn(
+      `⚠️  computeContextWindow called without currentRawSdkResponse for session ${sessionId}. ` +
+        'This should not happen during task completion. Returning 0 to avoid database deadlock.'
+    );
+    return 0;
+  }
+}

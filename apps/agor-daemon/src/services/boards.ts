@@ -1,0 +1,736 @@
+/**
+ * Boards Service
+ *
+ * Provides REST + WebSocket API for board management.
+ * Uses DrizzleService adapter with BoardRepository.
+ */
+
+import { PAGINATION } from '@agor/core/config';
+import {
+  BoardCommentsRepository,
+  BoardObjectRepository,
+  BoardRepository,
+  BranchRepository,
+  boards,
+  CapabilityPolicyRepository,
+  eq,
+  getCurrentTenantId,
+  lockBranchReferenceMutation,
+  lockRowForUpdate,
+  mapBoardExportBlobToCreateData,
+  runWithTenantDatabaseTransaction,
+  type TenantScopeAwareDatabase,
+} from '@agor/core/db';
+import { BadRequest, Conflict, Forbidden } from '@agor/core/feathers';
+import { isValidUUID } from '@agor/core/ids';
+import {
+  buildTeammateWelcomeNoteObject,
+  TEAMMATE_WELCOME_NOTE_OBJECT_ID,
+} from '@agor/core/templates/teammate-welcome-note';
+import {
+  type AuthenticatedParams,
+  type Board,
+  type BoardComment,
+  type BoardEntityObject,
+  type BoardExportBlob,
+  type BoardID,
+  type BoardImportResult,
+  type BoardObject,
+  type BranchID,
+  boardCommentZoneParentObjectKey,
+  hasMinimumRole,
+  type QueryParams,
+  ROLES,
+  type TeammateWelcomeNoteRequest,
+  type UUID,
+} from '@agor/core/types';
+import { NotFoundError } from '@agor/core/utils/errors';
+import { DrizzleService, type Query } from '../adapters/drizzle';
+import type { ManualServiceEvent } from '../utils/emit-service-event.js';
+import {
+  type BoardObjectPatchedEventPayload,
+  toBoardObjectPatchedEventPayload,
+} from './board-objects.js';
+import {
+  lockTenantAuthorizationFence,
+  resolveCurrentTenantAuthorityActor,
+} from './tenant-authorization-fence.js';
+
+/**
+ * Board service params
+ */
+export interface BoardParams
+  extends QueryParams<{
+    slug?: string;
+    name?: string;
+  }> {
+  user?: AuthenticatedParams['user'];
+  tenant?: AuthenticatedParams['tenant'];
+  /** Internal hook signal; set only when ensureTeammateWelcomeNote writes. */
+  teammateWelcomeNoteMutated?: boolean;
+  /** Internal RBAC SQL pushdown marker set by register-hooks for external regular users. */
+  _agorSqlBoardAccessUserId?: UUID;
+}
+
+function shouldSqlPageBoardQuery(query?: Record<string, unknown>): boolean {
+  if (!query) return true;
+  const allowed = new Set(['archived', 'board_id', 'lean', '$limit', '$skip', '$sort']);
+  if (Object.keys(query).some((key) => !allowed.has(key) || key === '$select')) return false;
+  if (query.archived !== undefined && typeof query.archived !== 'boolean') return false;
+  if (query.lean !== undefined && typeof query.lean !== 'boolean') return false;
+  if (query.board_id !== undefined) {
+    const value = query.board_id;
+    if (typeof value !== 'string') {
+      if (
+        !value ||
+        typeof value !== 'object' ||
+        !Array.isArray((value as { $in?: unknown }).$in) ||
+        !(value as { $in: unknown[] }).$in.every((id) => typeof id === 'string')
+      ) {
+        return false;
+      }
+    }
+  }
+  const sort = query.$sort as Record<string, unknown> | undefined;
+  if (sort) {
+    const columns = new Set(['board_id', 'name', 'slug', 'created_at', 'updated_at']);
+    if (
+      Object.keys(sort).some(
+        (field) => !columns.has(field) || (sort[field] !== 1 && sort[field] !== -1)
+      )
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+export interface BoardsServiceDependencies {
+  moveBranch?: (branchId: BranchID, boardId: BoardID, params?: BoardParams) => Promise<void>;
+  emitBoardObjectPatched?: (
+    boardObject: BoardObjectPatchedEventPayload,
+    params?: BoardParams
+  ) => void;
+  emitBoardEvent?: (event: Omit<ManualServiceEvent, 'path'>) => void;
+  emitBoardCommentPatched?: (comment: BoardComment, params?: BoardParams) => void;
+}
+
+/**
+ * Extended boards service with custom methods
+ */
+export class BoardsService extends DrizzleService<Board, Partial<Board>, BoardParams> {
+  private moveBranch?: BoardsServiceDependencies['moveBranch'];
+  private db: TenantScopeAwareDatabase;
+  private boardRepo: BoardRepository;
+  private emitBoardObjectPatched?: (
+    boardObject: BoardObjectPatchedEventPayload,
+    params?: BoardParams
+  ) => void;
+  private emitBoardEvent?: (event: Omit<ManualServiceEvent, 'path'>) => void;
+  private emitBoardCommentPatched?: (comment: BoardComment, params?: BoardParams) => void;
+
+  constructor(db: TenantScopeAwareDatabase, dependencies: BoardsServiceDependencies = {}) {
+    const boardRepo = new BoardRepository(db);
+    super(boardRepo, {
+      id: 'board_id',
+      resourceType: 'Board',
+      paginate: {
+        default: PAGINATION.DEFAULT_LIMIT,
+        max: PAGINATION.MAX_LIMIT,
+      },
+    });
+
+    this.db = db;
+    this.moveBranch = dependencies.moveBranch;
+    this.boardRepo = boardRepo;
+    this.emitBoardObjectPatched = dependencies.emitBoardObjectPatched;
+    this.emitBoardEvent = dependencies.emitBoardEvent;
+    this.emitBoardCommentPatched = dependencies.emitBoardCommentPatched;
+  }
+
+  /**
+   * Push the list read's high-selectivity predicates into SQL.
+   *
+   * The generic adapter would read the entire boards table and filter in
+   * memory. `boards` is fetched on initial app load, so we narrow the read to
+   * explicit board ids and any RBAC SQL visibility marker before rows leave the
+   * database. `find` still re-applies every query filter in memory, so this
+   * only ever returns a superset of the matching rows and the downstream
+   * sort/pagination is unaffected.
+   *
+   * `lean` is a list-only projection flag — it omits each board's heavy
+   * `data.objects` / `data.custom_css` (a client `$select` can't trim them:
+   * they live inside the `data` JSON column). Routing it through this one
+   * repository read is exactly what keeps the lean list from ever widening
+   * board visibility — it inherits the same RBAC + id pushdown as every other
+   * list read. It is NOT a board column, so we strip it from `query` before
+   * `find` hands the query to `filterData`, which would otherwise treat it as an
+   * equality filter on a non-existent `lean` column and empty the result;
+   * `$sort` / `$select` / pagination never touch the omitted fields, and
+   * `boards.get(id)` is unaffected and always returns the full board.
+   *
+   * The boards query validator (`boardQuerySchema`) accepts `board_id`,
+   * `archived`, and `lean`. A
+   * `{ $in }` is only pushed when every element is a string, keeping the
+   * superset invariant unconditional.
+   */
+  protected async fetchData(query: Query, params?: BoardParams): Promise<Board[]> {
+    const filter: {
+      archived?: boolean;
+      boardIds?: BoardID[];
+      visibleToUserId?: UUID;
+      lean?: boolean;
+    } = {};
+
+    if (params?._agorSqlBoardAccessUserId) {
+      filter.visibleToUserId = params._agorSqlBoardAccessUserId;
+    }
+
+    const leanQuery = query as Query & { lean?: boolean };
+    if (leanQuery.lean) {
+      filter.lean = true;
+    }
+    delete leanQuery.lean;
+
+    if (typeof query.archived === 'boolean') filter.archived = query.archived;
+
+    const boardId = query.board_id;
+    if (typeof boardId === 'string') {
+      filter.boardIds = [boardId as BoardID];
+    } else if (
+      boardId &&
+      typeof boardId === 'object' &&
+      Array.isArray(boardId.$in) &&
+      boardId.$in.every((el: unknown) => typeof el === 'string')
+    ) {
+      filter.boardIds = boardId.$in as BoardID[];
+    }
+
+    return this.boardRepo.findAll(filter);
+  }
+
+  override async find(params?: BoardParams) {
+    const query = params?.query as Record<string, unknown> | undefined;
+    if (shouldSqlPageBoardQuery(query)) {
+      const boardFilter = query?.board_id;
+      const boardIds =
+        typeof boardFilter === 'string'
+          ? [boardFilter as BoardID]
+          : boardFilter &&
+              typeof boardFilter === 'object' &&
+              Array.isArray((boardFilter as { $in?: unknown }).$in)
+            ? (boardFilter as { $in: BoardID[] }).$in
+            : undefined;
+      const { limit, skip } = this.pageWindow(query ?? {});
+      const page = await this.boardRepo.findPage({
+        archived: typeof query?.archived === 'boolean' ? query.archived : undefined,
+        boardIds,
+        visibleToUserId: params?._agorSqlBoardAccessUserId,
+        lean: query?.lean === true,
+        limit,
+        offset: skip,
+        sort: query?.$sort as Record<string, 1 | -1> | undefined,
+      });
+      return {
+        total: page.total,
+        limit,
+        skip,
+        data: page.data,
+      };
+    }
+    return super.find(params);
+  }
+
+  /**
+   * Custom method: Find board by slug
+   */
+  async findBySlug(slug: string, _params?: BoardParams): Promise<Board | null> {
+    return this.boardRepo.findBySlug(slug);
+  }
+
+  async create(
+    data: Partial<Board> | Partial<Board>[],
+    params?: BoardParams
+  ): Promise<Board | Board[]> {
+    for (const candidate of Array.isArray(data) ? data : [data]) {
+      if (
+        candidate.board_id !== undefined &&
+        (typeof candidate.board_id !== 'string' || !isValidUUID(candidate.board_id))
+      ) {
+        throw new BadRequest('board_id must be a canonical UUIDv7');
+      }
+    }
+    const result = (await super.create(data, params)) as Board | Board[];
+    return result;
+  }
+
+  /**
+   * Custom method: Find board by slug or ID (for URL routing)
+   */
+  async findBySlugOrId(param: string, _params?: BoardParams): Promise<Board | null> {
+    return this.boardRepo.findBySlugOrId(param);
+  }
+
+  /**
+   * DEPRECATED: Add session to board
+   * Use board-objects service instead
+   */
+  async addSession(_id: string, _sessionId: string, _params?: BoardParams): Promise<Board> {
+    throw new Error('addSession is deprecated - use board-objects service');
+  }
+
+  /**
+   * DEPRECATED: Remove session from board
+   * Use board-objects service instead
+   */
+  async removeSession(_id: string, _sessionId: string, _params?: BoardParams): Promise<Board> {
+    throw new Error('removeSession is deprecated - use board-objects service');
+  }
+
+  /**
+   * Custom method: Atomically add or update a board object
+   */
+  async upsertBoardObject(
+    boardId: string,
+    objectId: string,
+    objectData: BoardObject,
+    _params?: BoardParams
+  ): Promise<Board> {
+    return this.boardRepo.upsertBoardObject(boardId, objectId, objectData);
+  }
+
+  /**
+   * Custom method: Atomically remove a board object
+   */
+  async removeBoardObject(
+    boardId: string,
+    objectId: string,
+    _params?: BoardParams
+  ): Promise<Board> {
+    const tenantId = _params?.tenant?.tenant_id ?? getCurrentTenantId();
+    return runWithTenantDatabaseTransaction(this.db, tenantId, async (operationDb) => {
+      const boardRepo = new BoardRepository(operationDb);
+      const boardObjectRepo = new BoardObjectRepository(operationDb);
+      const boardCommentsRepo = new BoardCommentsRepository(operationDb);
+      const board = await boardRepo.findBySlugOrId(boardId);
+      const object = board?.objects?.[objectId];
+
+      // A generic removeObject path can remove zones too (e.g. MCP
+      // agor_boards_update.removeObjects). Clear entity zone references first so
+      // future board renders do not construct React Flow children with a missing
+      // parent. Convert zone-relative positions to absolute while the zone origin
+      // is still available.
+      if (board && object?.type === 'zone') {
+        const cleared = await boardObjectRepo.clearZoneReferences(board.board_id, objectId, {
+          x: object.x,
+          y: object.y,
+        });
+
+        for (const boardObject of cleared) {
+          const payload = toBoardObjectPatchedEventPayload(boardObject);
+          if (_params) this.emitBoardObjectPatched?.(payload, _params);
+          else this.emitBoardObjectPatched?.(payload);
+        }
+
+        // Spatial comments can also be pinned to a zone. Keep them visible by
+        // converting their relative offsets to absolute board coordinates before
+        // the parent zone disappears. Replies have no position and are unaffected.
+        const comments = await boardCommentsRepo.findByBoard(board.board_id);
+        for (const comment of comments) {
+          const relative = comment.position?.relative;
+          if (
+            relative?.parent_type !== 'zone' ||
+            boardCommentZoneParentObjectKey(relative.parent_id) !== objectId
+          ) {
+            continue;
+          }
+
+          const updated = await boardCommentsRepo.update(comment.comment_id, {
+            position: {
+              absolute: {
+                x: object.x + relative.offset_x,
+                y: object.y + relative.offset_y,
+              },
+            },
+          });
+          if (_params) this.emitBoardCommentPatched?.(updated, _params);
+          else this.emitBoardCommentPatched?.(updated);
+        }
+      }
+
+      // The registered emitters delegate to emitServiceEvent, whose
+      // transaction-aware queue publishes these patches only after commit.
+      return boardRepo.removeBoardObject(boardId, objectId);
+    });
+  }
+
+  /**
+   * Custom method: Create the bundled teammate welcome note when missing.
+   *
+   * Rendering is intentionally server-side from a static Handlebars template so
+   * the browser bundle does not import Handlebars (blocked by CSP unsafe-eval),
+   * and callers never provide template source for this path.
+   */
+  async ensureTeammateWelcomeNote(
+    data: TeammateWelcomeNoteRequest,
+    params?: BoardParams
+  ): Promise<Board> {
+    const boardIdentifier = data.boardId ?? data.id;
+    if (!boardIdentifier) throw new Error('Board ID required');
+
+    const board = await this.boardRepo.findBySlugOrId(String(boardIdentifier));
+    if (!board) {
+      throw new NotFoundError('Board', String(boardIdentifier));
+    }
+
+    const teammateName = typeof data.teammateName === 'string' ? data.teammateName : '';
+    const teammateEmoji = typeof data.teammateEmoji === 'string' ? data.teammateEmoji : null;
+    const objectData = buildTeammateWelcomeNoteObject({
+      teammateName,
+      teammateEmoji,
+    });
+
+    const existing = board.objects?.[TEAMMATE_WELCOME_NOTE_OBJECT_ID];
+    if (existing) return board;
+
+    if (params) {
+      params.teammateWelcomeNoteMutated = true;
+    }
+    return this.boardRepo.upsertBoardObject(
+      board.board_id,
+      TEAMMATE_WELCOME_NOTE_OBJECT_ID,
+      objectData
+    );
+  }
+
+  /**
+   * Custom method: Set the board's primary teammate branch.
+   */
+  async setPrimaryTeammate(
+    data: { boardId?: string; id?: string; branchId?: string } | string,
+    branchIdOrParams?: string | BoardParams,
+    _maybeParams?: BoardParams
+  ): Promise<Board> {
+    const boardId = typeof data === 'string' ? data : (data.boardId ?? data.id);
+    const branchId = typeof data === 'string' ? branchIdOrParams : data.branchId;
+    if (!boardId) throw new Error('Board ID required');
+    if (!branchId || typeof branchId !== 'string') throw new Error('Branch ID required');
+    const params =
+      typeof data === 'string' ? _maybeParams : (branchIdOrParams as BoardParams | undefined);
+    return runWithTenantDatabaseTransaction(this.db, params?.tenant?.tenant_id, async (db) => {
+      await lockTenantAuthorizationFence(db, params);
+      // Match branch relocation: reference writers may also update User rows.
+      // Never hold the human actor row while waiting for their reference lock.
+      await lockBranchReferenceMutation(db);
+      const current = await resolveCurrentTenantAuthorityActor(db, params, {
+        allowActorlessTrusted: true,
+      });
+      const boards = new BoardRepository(db);
+      const board = await boards.findById(boardId);
+      const branch = await new BranchRepository(db).findById(branchId);
+      if (!board || !branch) throw new BadRequest('Board or teammate not found');
+      if (current && !current.service && !hasMinimumRole(current.role, ROLES.ADMIN)) {
+        const access = await new CapabilityPolicyRepository(db).resolveBoardAccess(
+          board.board_id,
+          current.user_id
+        );
+        if (!access.capabilities.includes('board.edit'))
+          throw new Forbidden('Board Editor or Manager access is required to assign a teammate');
+      }
+      if (branch.board_id !== board.board_id && this.moveBranch) {
+        // An empty-board Assign must not overwrite a primary installed since
+        // the picker loaded. The shared branch move maintains both pointers.
+        if (board.primary_teammate_id && board.primary_teammate_id !== branch.branch_id) {
+          throw new Conflict('This board already has a primary teammate. Reload before assigning.');
+        }
+        await this.moveBranch(branch.branch_id, board.board_id, params);
+      }
+      return boards.setPrimaryTeammate(board.board_id, branch.branch_id);
+    });
+  }
+
+  /**
+   * Custom method: Clear the board's primary teammate branch.
+   */
+  async clearPrimaryTeammate(boardId: string, _params?: BoardParams): Promise<Board> {
+    return this.boardRepo.clearPrimaryTeammate(boardId);
+  }
+
+  /**
+   * Custom method: Batch upsert board objects
+   */
+  async batchUpsertBoardObjects(
+    boardId: string,
+    objects: Record<string, BoardObject>,
+    _params?: BoardParams
+  ): Promise<Board> {
+    return this.boardRepo.batchUpsertBoardObjects(boardId, objects);
+  }
+
+  /**
+   * Custom method: Atomically shallow-merge field patches into existing board
+   * objects (used by z-order reorder to persist only the changed zIndex).
+   */
+  async mergeBoardObjectFields(
+    boardId: string,
+    patches: Record<string, Partial<BoardObject>>,
+    _params?: BoardParams
+  ): Promise<Board> {
+    return this.boardRepo.mergeBoardObjectFields(boardId, patches);
+  }
+
+  /**
+   * Custom method: switch a zone to free in one transaction, saving where each
+   * of its cards was shown and the zone's shown size. Only the zone's layout,
+   * order and size change, read from the current zone, so concurrent edits to
+   * it survive; cards no longer in the zone are left alone.
+   */
+  async placeZoneEntities(
+    boardId: string,
+    zoneId: string,
+    size: { width: number; height: number },
+    positions: Record<string, { x: number; y: number }>,
+    params?: BoardParams
+  ): Promise<{ board: Board; moved: BoardEntityObject[] }> {
+    const tenantId = params?.tenant?.tenant_id ?? getCurrentTenantId();
+    const result = await runWithTenantDatabaseTransaction(
+      this.db,
+      tenantId,
+      async (operationDb) => {
+        const boardRepo = new BoardRepository(operationDb);
+        const found = await boardRepo.findBySlugOrId(boardId);
+        if (!found) throw new NotFoundError('Board', boardId);
+        // Lock, then re-read, so the zone saved below isn't an older copy of a concurrent edit or delete.
+        await lockRowForUpdate(
+          operationDb,
+          operationDb,
+          boards,
+          eq(boards.board_id, found.board_id)
+        );
+        const current = await boardRepo.findById(found.board_id);
+        if (!current) throw new NotFoundError('Board', boardId);
+        const zone = current.objects?.[zoneId];
+        if (zone?.type !== 'zone') throw new NotFoundError('Zone', zoneId);
+        const moved = await new BoardObjectRepository(operationDb).updatePositions(
+          current.board_id,
+          zoneId,
+          positions
+        );
+        const board = await boardRepo.upsertBoardObject(current.board_id, zoneId, {
+          ...zone,
+          layout: 'free',
+          order: [],
+          width: size.width,
+          height: size.height,
+        });
+        return { board, moved };
+      }
+    );
+    // Announce the moves only once they are committed.
+    for (const boardObject of result.moved) {
+      const payload = toBoardObjectPatchedEventPayload(boardObject);
+      if (params) this.emitBoardObjectPatched?.(payload, params);
+      else this.emitBoardObjectPatched?.(payload);
+    }
+    return result;
+  }
+
+  /**
+   * Custom method: Delete a zone and handle associated sessions
+   */
+  async deleteZone(
+    boardId: string,
+    objectId: string,
+    _deleteAssociatedSessions: boolean,
+    params?: BoardParams
+  ): Promise<{ board: Board; affectedSessions: string[] }> {
+    const board = await this.removeBoardObject(boardId, objectId, params);
+    return {
+      board,
+      affectedSessions: [],
+    };
+  }
+
+  /**
+   * Export board to blob (JSON)
+   */
+  async toBlob(
+    data: { boardId?: string; id?: string; slug?: string } | string,
+    _params?: BoardParams
+  ): Promise<BoardExportBlob> {
+    const boardId = await this.resolveBoardId(data);
+    return this.boardRepo.toBlob(boardId);
+  }
+
+  /**
+   * Import board from blob (JSON)
+   */
+  async fromBlob(blob: BoardExportBlob, params?: BoardParams): Promise<BoardImportResult> {
+    // Hook chain enforces auth before we get here. The repository owns import
+    // (validation, skipping unusable objects, artifact resolution, create);
+    // after-hooks emit the `created` event.
+    return this.boardRepo.fromBlob(blob, params!.user!.user_id);
+  }
+
+  /**
+   * Export board to YAML string
+   */
+  async toYaml(
+    data: { boardId?: string; id?: string; slug?: string } | string,
+    _params?: BoardParams
+  ): Promise<string> {
+    const boardId = await this.resolveBoardId(data);
+    return this.boardRepo.toYaml(boardId);
+  }
+
+  /**
+   * Import board from YAML string
+   */
+  async fromYaml(
+    data: { yaml?: string; content?: string } | string,
+    params?: BoardParams
+  ): Promise<BoardImportResult> {
+    const yamlContent = typeof data === 'string' ? data : (data.yaml ?? data.content);
+    if (!yamlContent) throw new Error('YAML content required');
+    const blob = this.boardRepo.parseYamlToBlob(yamlContent);
+    return this.fromBlob(blob, params);
+  }
+
+  /**
+   * Clone board (create copy with new ID)
+   */
+  async clone(
+    data: { boardId?: string; id?: string; name?: string; slug?: string } | string,
+    newNameOrParams?: string | BoardParams,
+    maybeParams?: BoardParams
+  ): Promise<Board> {
+    let boardIdentifier: string | undefined;
+    let name: string | undefined;
+    let params: BoardParams | undefined;
+
+    if (typeof data === 'string') {
+      boardIdentifier = data;
+      if (typeof newNameOrParams !== 'string') {
+        throw new Error('Board name required');
+      }
+      name = newNameOrParams;
+      params = maybeParams;
+    } else {
+      boardIdentifier = data.boardId ?? data.id ?? data.slug;
+      name = data.name;
+      params = (newNameOrParams as BoardParams | undefined) ?? maybeParams;
+    }
+
+    if (!boardIdentifier) throw new Error('Board ID or slug required');
+    if (!name) throw new Error('Board name required');
+
+    // Hook chain enforces auth before we get here.
+    const userId = params!.user!.user_id;
+    const resolvedBoardId = await this.resolveBoardId(boardIdentifier);
+    const blob = await this.boardRepo.toBlob(resolvedBoardId);
+    const boardData = mapBoardExportBlobToCreateData(blob, userId, name);
+    // Create board through repository (not super.create to avoid double-emit issues)
+    const clonedBoard = await this.boardRepo.create(boardData);
+
+    // Note: Events must be emitted by the caller using app.service('boards').emit()
+    // this.emit() doesn't work reliably in custom methods due to execution context
+    // See: apps/agor-daemon/src/index.ts for examples of manual emission
+
+    return clonedBoard;
+  }
+
+  /**
+   * Custom method: Archive a board (soft delete)
+   */
+  async archive(id: string, params?: BoardParams): Promise<Board> {
+    const board = await this.get(id, params);
+
+    if (board.archived) {
+      throw new Error(`Board "${board.name}" is already archived`);
+    }
+
+    console.log(`📦 Archiving board: ${board.name}`);
+
+    // Hook chain enforces auth before we get here.
+    const currentUserId = params!.user!.user_id;
+    const archivedBoard = (await this.patch(
+      id,
+      {
+        archived: true,
+        archived_at: new Date().toISOString(),
+        archived_by: currentUserId,
+      } as Partial<Board>,
+      params
+    )) as Board;
+    // Custom methods call the raw implementation, bypassing Feathers'
+    // standard patch event hook. Emit the transition for connected clients.
+    this.emitBoardEvent?.({
+      event: 'patched',
+      data: archivedBoard,
+      params,
+      id: archivedBoard.board_id,
+    });
+
+    console.log(`✅ Archived board ${board.name}`);
+    return archivedBoard as Board;
+  }
+
+  /**
+   * Custom method: Unarchive a board
+   */
+  async unarchive(id: string, params?: BoardParams): Promise<Board> {
+    const board = await this.get(id, params);
+
+    if (!board.archived) {
+      throw new Error(`Board "${board.name}" is not archived`);
+    }
+
+    console.log(`📦 Unarchiving board: ${board.name}`);
+
+    const unarchivedBoard = (await this.patch(
+      id,
+      {
+        archived: false,
+        archived_at: undefined,
+        archived_by: undefined,
+      } as Partial<Board>,
+      params
+    )) as Board;
+    this.emitBoardEvent?.({
+      event: 'patched',
+      data: unarchivedBoard,
+      params,
+      id: unarchivedBoard.board_id,
+    });
+
+    console.log(`✅ Unarchived board ${board.name}`);
+    return unarchivedBoard as Board;
+  }
+
+  private async resolveBoardId(
+    data: { boardId?: string; id?: string; slug?: string } | string
+  ): Promise<string> {
+    const identifier = typeof data === 'string' ? data : (data.boardId ?? data.id ?? data.slug);
+
+    if (!identifier) {
+      throw new Error('Board ID or slug required');
+    }
+
+    const board = await this.boardRepo.findBySlugOrId(identifier);
+    if (!board) {
+      throw new NotFoundError('Board', identifier);
+    }
+
+    return board.board_id;
+  }
+}
+
+/**
+ * Service factory function
+ */
+export function createBoardsService(
+  db: TenantScopeAwareDatabase,
+  dependencies: BoardsServiceDependencies = {}
+): BoardsService {
+  return new BoardsService(db, dependencies);
+}

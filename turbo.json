@@ -1,0 +1,69 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  "globalDependencies": [
+    "**/.env.*local",
+    "pnpm-lock.yaml",
+    "test/isolate-host-env.ts",
+    "apps/*/vitest.config.ts",
+    "packages/*/vitest.config.ts"
+  ],
+  "globalPassThroughEnv": [
+    "AGOR_ADMIN_PASSWORD",
+    "AGOR_ALLOW_DEVELOPMENT_DEFAULT_ADMIN",
+    "AGOR_DATA_HOME",
+    "AGOR_DB_DIALECT",
+    "AGOR_HA_INTEGRATION",
+    "AGOR_HA_INTEGRATION_FAILURES",
+    "AGOR_HA_INTEGRATION_START",
+    "AGOR_HA_NODE_ENV",
+    "AGOR_HA_PUBLIC_ORIGIN",
+    "AGOR_HA_ACME_ORIGIN",
+    "AGOR_HA_GLOBEX_ORIGIN",
+    "AGOR_HOME",
+    "AGOR_OUTER_SANDBOX",
+    "AGOR_POSTGRES_TEST_CONCURRENCY",
+    "AGOR_POSTGRES_TEST_RUN_ID",
+    "AGOR_TEST_POSTGRES_ADMIN_URL",
+    "AGOR_TEST_POSTGRES_URL",
+    "BIOME_BIN",
+    "COMPOSE_PROJECT_NAME",
+    "DATABASE_URL",
+    "HA_DAEMON_A_PORT",
+    "HA_DAEMON_B_PORT",
+    "HA_PORT",
+    "HA_TENANT_PORT",
+    "HA_URL"
+  ],
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"],
+      "outputs": ["dist/**", ".next/**", "build/**"]
+    },
+    "@agor/daemon#build": {
+      "dependsOn": ["^build"],
+      "outputs": ["dist/**", ".next/**", "build/**"],
+      "env": ["AGOR_BUILD_SHA", "AGOR_BUILT_AT"]
+    },
+    "dev": {
+      "cache": false,
+      "persistent": true
+    },
+    "lint": {
+      "dependsOn": ["^build"]
+    },
+    "typecheck": {
+      "cache": true,
+      "dependsOn": ["^build"],
+      "inputs": ["src/**/*.ts", "src/**/*.tsx", "tsconfig*.json", "package.json"]
+    },
+    "test": {
+      "dependsOn": ["^build"]
+    },
+    "@agor/executor#test": {
+      "dependsOn": ["build"]
+    },
+    "clean": {
+      "cache": false
+    }
+  }
+}

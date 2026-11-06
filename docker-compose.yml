@@ -1,0 +1,284 @@
+# Agor Development Environment
+#
+# This Docker Compose setup supports:
+# - Multiple branches running simultaneously (via -p flag)
+# - Both SQLite (default) and PostgreSQL databases
+# - Isolated environments per branch (separate volumes, ports, node_modules)
+#
+# ==============================================================================
+# Quick Start
+# ==============================================================================
+#
+# Single branch (SQLite):
+#   docker compose up
+#
+# Multiple branches (recommended - see .agor.yml):
+#   docker compose -p agor-postgres-support up -d
+#   docker compose -p agor-main up -d
+#
+# PostgreSQL (optional - for database/schema parity):
+#   docker compose -f docker-compose.yml -f docker-compose.override.postgres.yml \
+#     --profile postgres up
+#
+# Or set in .env file:
+#   COMPOSE_PROFILES=postgres
+#   docker compose up
+#
+# ==============================================================================
+# Multi-Branch Isolation
+# ==============================================================================
+#
+# The -p (project name) flag creates completely isolated environments:
+# - SHARED Docker image (all projects use agor-dev:latest - saves disk space!)
+# - Separate volumes (database, config) - isolated per project
+# - Separate networks and containers
+# - Separate ports (using unique_id offset in .agor.yml)
+#
+# Dependencies are baked into the Docker image:
+# - node_modules preserved via anonymous volumes (shadows bind mount)
+# - No pnpm install at runtime - instant container startup!
+# - Rebuild image when pnpm-lock.yaml changes: docker compose up --build
+#
+# ==============================================================================
+# Database Modes
+# ==============================================================================
+#
+# 1. SQLite Mode (default):
+#    - No PostgreSQL container runs
+#    - Database stored in ~/.agor/agor.db (inside container volume)
+#    - Lightweight, perfect for single-user development
+#
+# 2. PostgreSQL Mode (with the PostgreSQL overlay + --profile postgres):
+#    - PostgreSQL container runs automatically
+#    - Database in postgres-data volume
+#    - Exercises PostgreSQL-specific behavior and row-level-security policies
+#    - The overlay sets AGOR_DB_DIALECT and DATABASE_URL
+#
+# ==============================================================================
+# Configuration
+# ==============================================================================
+#
+# Copy .env.example to .env and customize:
+#   cp .env.example .env
+#
+# Key environment variables:
+#   AGOR_DB_DIALECT              - 'sqlite' (default) or 'postgresql'
+#   DATABASE_URL                 - Full PostgreSQL connection URL (when using PostgreSQL)
+#   POSTGRES_DB                  - Database name (default: agor)
+#   POSTGRES_SUPERUSER           - Bootstrap-only Postgres superuser (default: agor_bootstrap)
+#   POSTGRES_SUPERUSER_PASSWORD  - Bootstrap superuser password (default: agor_bootstrap_secret)
+#
+#
+# ==============================================================================
+
+services:
+  agor-dev:
+    # Use fixed image name - all projects share the same base image
+    # Only volumes are isolated per project (via -p flag)
+    # This saves disk space and build time!
+    image: agor-dev:latest
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: development
+      args:
+        UID: ${UID:-1000}
+        GID: ${GID:-1000}
+    # Ensure we run as the 'agor' user (defined in Dockerfile)
+    # This is critical for sudo access and permission handling in entrypoint
+    user: agor
+    # No container_name - allows multiple instances via docker compose -p flag
+    ports:
+      # Expose daemon port (so browser can connect) - configurable via DAEMON_PORT
+      - '${DAEMON_PORT:-3030}:${DAEMON_PORT:-3030}'
+      # Expose UI port (configurable via UI_PORT env var)
+      - '${UI_PORT:-5173}:${UI_PORT:-5173}'
+    # Add host.docker.internal mapping for Linux compatibility
+    # On Mac/Windows, Docker Desktop provides this automatically
+    # On Linux, we need to explicitly map it to the Docker host gateway
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
+    environment:
+      # The development image tag is shared across branch projects, so a manual
+      # `docker compose up` can briefly reuse an older image/entrypoint. Keep
+      # pnpm startup safeguards at the Compose boundary too: current source must
+      # never hang on an interactive node_modules purge, even with a stale image.
+      - CI=true
+      - pnpm_config_verify_deps_before_run=false
+
+      # Daemon configuration
+      - NODE_ENV=development
+      # Exact triple gate for the deliberately fixed development-only admin.
+      # Production Compose files do not carry these defaults. Remote/public
+      # development substrates can override both values with a generated
+      # bootstrap password and a disabled fixed-default gate.
+      - AGOR_ADMIN_PASSWORD=${AGOR_ADMIN_PASSWORD:-admin}
+      - AGOR_ALLOW_DEVELOPMENT_DEFAULT_ADMIN=${AGOR_ALLOW_DEVELOPMENT_DEFAULT_ADMIN:-true}
+      - DAEMON_PORT=${DAEMON_PORT:-3030}
+      - DAEMON_HOST=${DAEMON_HOST:-0.0.0.0}
+      - CORS_ORIGIN=${CORS_ORIGIN:-*}
+
+      # UI configuration
+      - UI_PORT=${UI_PORT:-5173}
+      # Daemon port the browser-side SPA derives its API origin from when no
+      # explicit VITE_DAEMON_URL is given (root-vite-dev resolution).
+      - VITE_DAEMON_PORT=${DAEMON_PORT:-3030}
+      # Browser-facing daemon URL. In a split-port branch env the UI is served
+      # by vite-dev on UI_PORT while the daemon API listens on DAEMON_PORT, so
+      # the SPA must POST /authentication to the daemon — not its own origin.
+      # When set (see .agor.yml dev variants) getDaemonUrl() returns this
+      # verbatim, short-circuiting the same-origin assumption. Left empty for
+      # production, which serves UI + API from one origin under /ui.
+      - VITE_DAEMON_URL=${VITE_DAEMON_URL:-}
+      # Public, browser-facing base URL used in Slack/GitHub/email links.
+      - AGOR_BASE_URL=${AGOR_BASE_URL:-}
+
+      # Database configuration. Activating the Compose `postgres` profile only
+      # starts that service; select a PostgreSQL overlay or set both variables
+      # explicitly to make the daemon use it.
+      - AGOR_DB_DIALECT=${AGOR_DB_DIALECT:-sqlite}
+      - DATABASE_URL=${DATABASE_URL:-}
+
+      # Explicit operator acknowledgement for protocol-breaking migrations.
+      # New Agor-managed isolated dev variants set the dedicated variable in
+      # .agor.yml. SEED is the compatibility signal for already-rendered
+      # managed commands: it is development-only and those Compose projects
+      # own isolated database volumes. Unseeded/ad-hoc/shared invocations stay
+      # fail-closed unless the operator sets the dedicated variable.
+      - AGOR_MIGRATION_OFFLINE_CUTOVER=${AGOR_MIGRATION_OFFLINE_CUTOVER:-${SEED:-false}}
+
+      # Seed development fixtures (optional, set SEED=true to populate test data)
+      # Creates: Agor repo (https://github.com/preset-io/agor.git) + test-branch
+      - SEED=${SEED:-false}
+
+      # Load demo fixtures (optional, set LOAD_FIXTURES=true for hardcoded fake
+      # data: users, branches, sessions+transcripts, boards/zones, cards,
+      # artifacts). Pure DB inserts (no git/network). Composes with SEED; the
+      # recommended combo for instant E2E testing is SEED=true LOAD_FIXTURES=true
+      - LOAD_FIXTURES=${LOAD_FIXTURES:-false}
+
+      # Pass through API keys from host (if set)
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+
+      # Board and branch RBAC is always enabled; this variable is retired.
+      # Forwarded only during the compatibility window so an existing
+      # deployment still setting it gets the migration error instead of a
+      # silently ignored value: `true` is an accepted no-op, `false`/malformed
+      # fail startup. Remove it from your env once migrated.
+      - AGOR_RBAC_ENABLED=${AGOR_RBAC_ENABLED:-}
+      # Execution mode (resolved in memory; config.yaml is never rewritten).
+      #   AGOR_UNIX_USER_MODE=sandbox    → execution.unix_user_mode: sandbox
+      #                                    (simple | sandbox | delegated)
+      - AGOR_UNIX_USER_MODE=${AGOR_UNIX_USER_MODE:-}
+      # OS-level executor filesystem sandbox (bubblewrap). AGOR_SANDBOX_ENABLED=true
+      # → execution.sandbox.enabled: true (resolved in memory). Used by the
+      # `sandbox` .agor.yml env variant. See context/guides/rbac-and-unix-isolation.md.
+      - AGOR_SANDBOX_ENABLED=${AGOR_SANDBOX_ENABLED:-}
+      # AGOR_SANDBOX_HOME_MODE=per_user overlays a private, persistent per-owner
+      # persistent private home inside the sandbox. Default (unset/shared) uses
+      # the daemon user's home.
+      - AGOR_SANDBOX_HOME_MODE=${AGOR_SANDBOX_HOME_MODE:-}
+      # Optional branch-owned SDK state. Empty preserves the deployment-safe
+      # `inherit` default; the rich/full PostgreSQL overlay opts into
+      # `per_branch` so its RBAC fixtures exercise the complete sharing model.
+      - AGOR_SANDBOX_SDK_HOME_MODE=${AGOR_SANDBOX_SDK_HOME_MODE:-}
+      # Optional PostgreSQL/RBAC development fixtures. This must be forwarded
+      # explicitly: --env-file supplies Compose interpolation values but does
+      # not inject arbitrary variables into the container by itself.
+      - CREATE_RBAC_TEST_USERS=${CREATE_RBAC_TEST_USERS:-}
+
+      # Instance identification (optional - displayed in UI navbar)
+      - INSTANCE_LABEL=${INSTANCE_LABEL:-}
+
+      # Version-sync banner: SHA captured on the host (where git can resolve
+      # the branch's gitdir) and forwarded into the container. Without this,
+      # loadBuildInfo() falls all the way through to 'dev' because the
+      # in-container git can't follow the /app/.git pointer to the host-side
+      # branch metadata. See .agor.yml start commands for the capture.
+      - AGOR_BUILD_SHA=${AGOR_BUILD_SHA:-}
+      - AGOR_BUILT_AT=${AGOR_BUILT_AT:-}
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+        required: false # Optional dependency - only needed when postgres profile is active
+    volumes:
+      # Mount entire repo for hot-reload (source code only)
+      - .:/app
+      # Anonymous volume shadows bind mount, preserving Docker-built node_modules
+      # This uses the node_modules from the IMAGE (with correct platform binaries)
+      # No pnpm install needed at runtime - deps are baked into the image!
+      # pnpm workspace symlinks (packages/*/node_modules) point into this directory
+      - /app/node_modules
+      # Shadow package-level node_modules too (they contain symlinks into root)
+      - /app/packages/core/node_modules
+      - /app/packages/agentic-tool-opencode/node_modules
+      - /app/packages/agentic-tools/node_modules
+      - /app/packages/executor/node_modules
+      - /app/packages/client/node_modules
+      - /app/packages/git/node_modules
+      - /app/apps/agor-daemon/node_modules
+      - /app/apps/agor-cli/node_modules
+      - /app/apps/agor-ui/node_modules
+      # Persist entire home directory (database, config, agent auth tokens, etc.)
+      - agor-home:/home/agor
+      # Mount SSH keys for git authentication (dev only)
+      - ~/.ssh:/home/agor/.ssh:ro
+    stdin_open: true
+    tty: true
+
+  # PostgreSQL database (ONLY active with --profile postgres)
+  # Usage: docker-compose --profile postgres up
+  postgres:
+    profiles: ['postgres'] # Optional service - only runs when profile is specified
+    # pgvector image tracks upstream Postgres and preinstalls the vector extension.
+    # The dev image creates a non-superuser app role (agor_app) so local Postgres
+    # exercises RLS instead of bypassing it through POSTGRES_USER superuser.
+    build:
+      context: .
+      dockerfile: docker/postgres-dev.Dockerfile
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-agor}
+      # Bootstrap-only superuser managed by the official image. Do not use this
+      # role for Agor runtime connections; DATABASE_URL points at agor_app.
+      POSTGRES_USER: ${POSTGRES_SUPERUSER:-agor_bootstrap}
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:-agor_bootstrap_secret}
+      # Performance tuning for development
+      POSTGRES_INITDB_ARGS: '-E UTF8 --locale=C'
+    # NOTE: No external port exposure - postgres is only accessed via Docker internal network
+    # The agor-dev container connects to postgres:5432 (internal Docker DNS)
+    # This avoids port conflicts when running multiple docker-compose instances
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      # Init SQL is baked into docker/postgres-dev.Dockerfile rather than
+      # bind-mounted because a checkout may carry restrictive host permissions
+      # or ACLs that make the source file unreadable to the postgres container.
+    healthcheck:
+      # Only gate on PostgreSQL accepting connections. Agor owns schema creation
+      # through Drizzle migrations during daemon startup; checking for the
+      # drizzle schema here can deadlock fresh environments before the daemon has
+      # a chance to create it.
+      # Escape `$` so Compose leaves these for the container shell. Without an
+      # explicit user, pg_isready inherits the healthcheck process user
+      # (`root`) and PostgreSQL logs a failed `role "root" does not exist`
+      # connection on every probe.
+      test: ['CMD-SHELL', 'pg_isready -h localhost -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
+      interval: 2s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+    restart: unless-stopped
+
+volumes:
+  # Named volume - unique per docker-compose project (via -p flag)
+  # Each branch gets its own isolated volume for:
+  # - Database (~/.agor/agor.db)
+  # - Config (~/.agor/config.yaml)
+  # - Agent auth tokens
+  # - Caches, etc.
+  agor-home:
+
+  # PostgreSQL data (only created when postgres profile is active)
+  postgres-data:

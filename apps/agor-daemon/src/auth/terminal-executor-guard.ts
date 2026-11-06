@@ -1,0 +1,34 @@
+/**
+ * Terminal-executor identity guard.
+ *
+ * A terminal-scoped executor token (see terminals.ts / RuntimeJWTStrategy)
+ * authenticates ONLY the Socket.IO terminal channel — those events are handled
+ * in socketio.ts, outside Feathers, and are gated on `terminal_user_id`.
+ *
+ * As a REST/Feathers identity it must be REJECTED, not merely under-privileged.
+ * The canonical RBAC helpers fail closed for this non-user role, and this guard
+ * independently rejects it at the shared auth chokepoint so a future change to
+ * role comparison cannot accidentally turn a terminal token into an API user.
+ */
+
+import { Forbidden } from '@agor/core/feathers';
+import type { HookContext } from '@agor/core/types';
+
+/** Whether an authenticated identity is a terminal-scoped executor token. */
+export function isTerminalExecutorIdentity(user: unknown): boolean {
+  return (user as { _isTerminalExecutor?: boolean } | undefined)?._isTerminalExecutor === true;
+}
+
+/**
+ * Reject any REST/Feathers service call made by a terminal-executor identity.
+ * Composed into `requireAuth` so it runs for every authenticated endpoint. The
+ * authentication service itself is NOT gated by `requireAuth` because the
+ * Socket.IO handshake invokes the JWT strategy before accepting a connection.
+ */
+export async function rejectTerminalExecutorIdentity(context: HookContext): Promise<HookContext> {
+  const user = (context.params as { user?: unknown } | undefined)?.user;
+  if (isTerminalExecutorIdentity(user)) {
+    throw new Forbidden('Terminal-executor tokens are not valid for API access.');
+  }
+  return context;
+}

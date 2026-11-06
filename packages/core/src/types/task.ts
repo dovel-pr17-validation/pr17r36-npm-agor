@@ -1,0 +1,668 @@
+// src/types/task.ts
+import type { PersistedAgenticToolName } from './agentic-tool';
+import type { GatewayInboundEventID } from './gateway';
+import type { BranchID, MessageID, SessionID, TaskID, UserID } from './id';
+import type { PersistedMessageSource } from './message';
+import type { ReportPath, ReportTemplate } from './report';
+
+export const TaskStatus = {
+  QUEUED: 'queued', // Task created but not yet running (waiting for executor to drain queue)
+  CREATED: 'created',
+  DISPATCHING: 'dispatching', // Daemon persisted launch intent; executor has not connected yet
+  RUNNING: 'running',
+  STOPPING: 'stopping', // Stop requested, waiting for SDK to halt
+  AWAITING_PERMISSION: 'awaiting_permission',
+  AWAITING_INPUT: 'awaiting_input', // Legacy / pre-#1177: AskUserQuestion was disallowed at the SDK; new tasks never enter this state, kept for historical rows
+  TIMED_OUT: 'timed_out', // Permission/input request timed out, executor exited — user must re-prompt
+  COMPLETED: 'completed',
+  FAILED: 'failed',
+  STOPPED: 'stopped', // User-requested stop (distinct from failed)
+} as const;
+
+export type TaskStatus = (typeof TaskStatus)[keyof typeof TaskStatus];
+
+/** Task states that have not yet crossed the daemon's durable dispatch fence. */
+export type TaskPendingDispatchStatus = typeof TaskStatus.CREATED | typeof TaskStatus.QUEUED;
+
+/** Launch metadata only; does not confer ownership of a dispatch claim. */
+export type TaskLaunchFields = Pick<
+  Task,
+  'message_range' | 'git_state' | 'started_at' | 'executor_mode' | 'sdk_watchdog_mode'
+> & { status: typeof TaskStatus.DISPATCHING };
+
+export type ExecutorMode = 'local' | 'templated';
+
+export const ExecutorPulseKind = {
+  SDK_STARTED: 'sdk_started',
+  PROGRESS: 'progress',
+  WAITING: 'waiting',
+  UNKNOWN_ACTIVITY: 'unknown_activity',
+} as const;
+
+export type ExecutorPulseKind = (typeof ExecutorPulseKind)[keyof typeof ExecutorPulseKind];
+
+export interface ExecutorPulse {
+  sequence: number;
+  kind: ExecutorPulseKind;
+  detail?: string;
+  /** Daemon-authored time; advances only with a greater sequence. */
+  observed_at: string;
+}
+
+export interface RuntimeTelemetryInput {
+  task_id: string;
+  pulse?: Omit<ExecutorPulse, 'observed_at'>;
+}
+
+export const SDK_WATCHDOG_FAILURE_REASONS = [
+  'no_first_progress',
+  'progress_stalled',
+  'unknown_activity',
+] as const;
+
+export type SdkWatchdogFailureReason = (typeof SDK_WATCHDOG_FAILURE_REASONS)[number];
+
+export type SdkFailureReason =
+  | 'startup_timeout'
+  | SdkWatchdogFailureReason
+  | 'heartbeat_lost'
+  | 'executor_interrupted'
+  | 'termination_unverified'
+  | 'launch_refused';
+
+/**
+ * Reserved exit code (sysexits `EX_TEMPFAIL`) of a templated launcher that
+ * refused admission before creating anything. Read as a refusal only when the
+ * daemon env opts in with `AGOR_EXECUTOR_LAUNCH_REFUSED_EXIT=75`.
+ */
+export const EXECUTOR_LAUNCH_REFUSED_EXIT_CODE = 75;
+
+export interface SdkFailure {
+  reason: SdkFailureReason;
+  detected_at: string;
+  tool: PersistedAgenticToolName;
+  last_pulse?: ExecutorPulse;
+  elapsed_ms?: number;
+  watchdog_action?: 'would_fire' | 'enforced';
+  unknown_event_count?: number;
+  sdk_version?: string;
+  termination: 'not_requested' | 'requested' | 'verified' | 'unverified';
+}
+
+export type SdkHealthFailureInput = Pick<
+  SdkFailure,
+  'elapsed_ms' | 'watchdog_action' | 'unknown_event_count' | 'sdk_version'
+> & { task_id: string; reason: SdkWatchdogFailureReason };
+
+// Wire values for ExecutorCleanupContext v1; keep additions coordinated with helpers.
+export const TERMINATION_CAUSES = [
+  'user_stop',
+  'startup_timeout',
+  'heartbeat_lost',
+  'sdk_health_failure',
+  'executor_interrupted',
+  'authorization_revoked',
+  'launch_refused',
+] as const;
+export type TerminationCause = (typeof TERMINATION_CAUSES)[number];
+
+/** A live executor's signal observation, not evidence of process absence or OOM. */
+export interface ExecutorInterruptionInput {
+  task_id: string;
+  signal: 'SIGTERM' | 'SIGINT';
+}
+
+/** Fixed server/executor copy for runtime authorization withdrawal. */
+export const AUTHORIZATION_REVOKED_TERMINATION_MESSAGE =
+  'Authorization to continue this task was revoked.';
+
+/**
+ * Why a durable termination request is not settled yet.
+ *
+ * `non_owner_replica` and `coordination_in_progress` wait for another HA
+ * coordinator. `awaiting_remote_executor` waits for a templated/remote
+ * executor that has not connected yet; it can still observe the durable stop
+ * request when it starts, so the daemon must not declare containment
+ * unverified before the remote startup deadline.
+ */
+export const TERMINATION_COORDINATION_PENDING_CODES = [
+  'non_owner_replica',
+  'coordination_in_progress',
+  'awaiting_remote_executor',
+] as const;
+
+export type TerminationCoordinationPendingCode =
+  (typeof TERMINATION_COORDINATION_PENDING_CODES)[number];
+
+/**
+ * Expiring, database-fenced ownership of one containment attempt.
+ *
+ * The daemon identity is diagnostic. `claim_token` is the correctness fence:
+ * a coordinator may settle containment only while this exact token remains on
+ * the Task. A replacement daemon can claim a new token after expiry.
+ */
+export interface TerminationCoordinationClaim {
+  claim_token: string;
+  claimed_at: string;
+  lease_expires_at: string;
+  instance_id: string;
+  boot_id: string;
+}
+
+/** How a termination request reached Agor; absent on requests recorded before this existed. */
+export type TerminationRequestVia = 'ui' | 'api' | 'mcp' | 'agor';
+
+/** Trusted supervisor stdin. Task IDs are immutable dispatch identities, never reused for replay. */
+export interface ExecutorCleanupContext {
+  version: 1;
+  tenant_id: string;
+  task_id: string;
+  session_id: string;
+  branch_id: string;
+  requested_at: string;
+  attempt_id: string;
+  cause: TerminationCause;
+}
+
+export interface TerminationRequest {
+  /** Changed on explicit Retry cleanup; fences duplicate/stale browser requests. */
+  recovery_revision?: string;
+  /** Bounded daemon-authored diagnostic, never raw command output. */
+  cleanup_diagnostic?: string;
+  /** Written before invoking the external command. Never automatically invoked twice. */
+  cleanup_attempt?: { attempt_id: string; started_at: string };
+  cause: TerminationCause;
+  requested_at: string;
+  /** Authenticated user whose request won the claim, when a person or their agent asked. */
+  requested_by_user_id?: string;
+  requested_via?: TerminationRequestVia;
+  /** Failure/stop reason captured with the winning claim. */
+  error_message?: string;
+  /**
+   * Daemon-authored time at which the scoped executor reported that its SDK
+   * work and stop hooks had fully quiesced. For remote executors this is the
+   * authoritative cooperative-containment result; local executors still get
+   * process-group absence verification before the session becomes promptable.
+   */
+  executor_quiesced_at?: string;
+  /** Current expiring containment coordinator, if one has been elected. */
+  coordination?: TerminationCoordinationClaim;
+}
+
+export interface ExecutorTerminationCompleteInput {
+  task_id: string;
+  /** Fences a late report from a previous termination request. */
+  requested_at: string;
+}
+
+/**
+ * Structured metadata attached to a task. All fields are optional, but the
+ * ones that are present are load-bearing — typing them here prevents drift
+ * between the daemon (which writes them) and the UI/services that read them.
+ *
+ * - `is_agor_callback`: marks a task whose prompt was synthesized by the
+ *   callback machinery (child session finished → parent gets a system
+ *   message). Drives both auth attribution and UI styling.
+ * - `source`: where the prompt entered the system. Copied onto the
+ *   user-message row so message-level provenance survives the queue → run
+ *   transition.
+ * - `queued_by_user_id`: who scheduled the task (distinct from
+ *   `task.created_by` for callback tasks, where `created_by` is the
+ *   callback owner and `queued_by_user_id` is set to the same value but
+ *   the field carries semantic intent rather than ownership).
+ * - `child_session_id` / `child_task_id`: lineage breadcrumbs for callback
+ *   tasks — the child session/task whose completion produced this prompt.
+ */
+export interface TaskMetadata {
+  is_agor_callback?: boolean;
+  source?: PersistedMessageSource;
+  queued_by_user_id?: string;
+  child_session_id?: SessionID;
+  child_task_id?: TaskID;
+  /**
+   * Completion callbacks already dispatched for this task, keyed by event +
+   * target. The daemon uses this as an idempotency marker so child-session
+   * completion notifications are not queued twice if multiple completion
+   * paths race.
+   */
+  callback_dispatches?: Array<{
+    /** `session_completion` is retained for callbacks recorded before task-level callbacks existed. */
+    event: 'task_completion' | 'session_completion';
+    target_session_id: SessionID;
+    queued_task_id?: TaskID;
+    dispatched_at: string;
+  }>;
+  /**
+   * Marks a task whose prompt was authored by the daemon (not typed by a
+   * human). This is a security-relevant provenance marker: MCP, widget,
+   * zone, spawn, and other synthesized prompt paths set it so provider SDKs
+   * do not grant the prompt human authority. The UI may also use it to label
+   * the queued prompt appropriately.
+   */
+  system_authored?: boolean;
+  /**
+   * For tasks queued by widget resolution, the widget message that fired
+   * this prompt. Links the task back to the originating widget for audit.
+   */
+  widget_id?: MessageID;
+  /** User who resolved the widget; Task execution remains session-owner attributed. */
+  widget_resolved_by_user_id?: UserID;
+  /** Provider-event occurrence that durably admitted this gateway prompt. */
+  gateway_inbound_event_id?: GatewayInboundEventID;
+  /** Teams catch-up cursor this admission earns; a retry that finds the Task repairs it from here. */
+  gateway_teams_cursor?: string;
+  /** Provider reply target captured for this gateway Task (for example an editable ack ID). */
+  gateway_reply_metadata?: Record<string, unknown>;
+  /** Immutable gateway coordinates; stripped from API/realtime Task DTOs. */
+  gateway_task_source?: {
+    gateway_channel_id: string;
+    channel_type: import('./gateway').ChannelType;
+    thread_id: string;
+    /**
+     * The `thread_session_map` row this prompt was admitted through — the
+     * Task's reply address.
+     *
+     * Outbound routing used to ask which thread a *Session* belongs to, which
+     * is only answerable while a session has exactly one mapping. This is the
+     * per-Task answer, resolved once at admission and never re-derived.
+     *
+     * It is stamped rather than recomputed from `thread_id` because the
+     * mapping is keyed on the outbound seed's platform thread when there is
+     * one, plus reply aliases — so a seed-originated thread does not find its
+     * own mapping by the inbound thread id. Absent on Tasks admitted before
+     * this was persisted; readers resolve those older Tasks by their recorded
+     * channel/thread coordinates (including reply aliases). An invalid stamp
+     * must not fall back to a different thread of the Session.
+     */
+    thread_session_map_id?: import('./gateway').ThreadSessionMapID;
+    provider_user_id: string;
+    provider_message_id?: string;
+    slack_team_id?: string;
+    slack_channel_id?: string;
+    /**
+     * Slack conversation kind (`im` | `mpim` | `channel` | `group`) as the
+     * inbound event reported it. Recorded because a surface that projects
+     * something back into the thread later — the MCP connect card — has to
+     * know whether it is speaking into a DM or somewhere other people are
+     * reading, and by then the inbound metadata is long gone. Absent on Tasks
+     * created before this was persisted; readers must fall back rather than
+     * assume a DM.
+     */
+    slack_conversation_type?: string;
+  };
+  /**
+   * Durable identity of the Task's first transcript row. Internal
+   * idempotent producers persist this alongside the Task so any daemon that
+   * later drains the queue can reconcile the same row instead of inventing a
+   * process-local message identity.
+   */
+  initial_message_id?: MessageID;
+
+  /** Latest secret-free MCP recovery projection. Hints may be missed; this row is authoritative. */
+  mcp_recovery?: import('./mcp').MCPRuntimeRecovery;
+
+  /** Monotonic tombstone retained after a successful MCP recovery is cleared. */
+  mcp_recovery_generation?: number;
+
+  /** Exact refresh request settled at the tombstone generation. */
+  mcp_recovery_settled_request_id?: string;
+
+  /** Daemon time at which the last refresh tombstone became authoritative. */
+  mcp_recovery_settled_at?: string;
+
+  /** Bounded keyed hashes of the per-server authority installed by the last refresh. */
+  mcp_recovery_settled_authority_fingerprints?: string[];
+
+  /** Immutable digest attesting the complete ready-server projection last installed. */
+  mcp_recovery_settled_projection_fingerprint?: string;
+
+  /** Exact durable claim fencing one live MCP reprojection across daemons. */
+  mcp_reprojection_claim?: {
+    request_id: string;
+    recovery_generation: number;
+    fingerprint: string;
+    claimed_at: string;
+    /** Immutable digest of the complete ready-server authority projection. */
+    projection_fingerprint?: string;
+    /** Bounded keyed hashes of the exact projection returned for this claim. */
+    authority_fingerprints?: string[];
+  };
+
+  /** Internal Slack delivery projection for the structured MCP recovery above. */
+  mcp_slack_recovery_notice?: import('./mcp').MCPSlackRecoveryNotice;
+
+  /**
+   * Immutable origin of an agent-originated prompt, stamped server-side at
+   * admission from the daemon's own authenticated request context.
+   *
+   * Callers cannot supply or influence any field: the key is stripped from
+   * caller metadata unconditionally in `buildPromptTaskMetadata` (including
+   * for trusted daemon-internal producers, which is strictly stronger than the
+   * treatment of `source`), and the value is applied from a trusted param that
+   * only the MCP layer sets. The same reviewed shape as `completion_callback`.
+   *
+   * Presence means an MCP caller delivered this prompt. Absence means it did
+   * not arrive over MCP: it came from a provider-carrying (browser/REST)
+   * transport or a daemon-internal producer. A session MCP token reaches
+   * neither, so an agent using it cannot suppress its own stamp. A personal API
+   * key also authenticates REST, so absence alone is not proof that a human
+   * typed the prompt.
+   *
+   * IDs only, deliberately, and `rendered_block` likewise names the origin
+   * only by Session ID. Every reader of the recipient Session can read this
+   * row and `full_prompt`, so neither may carry an origin branch or teammate
+   * name; a reader resolves those through `agor_sessions_get` under their own
+   * branch access.
+   */
+  prompt_provenance?: {
+    version: 1;
+    /**
+     * How the origin Session identity was established. Never flattened: the
+     * MCP session-token path carries a signed session binding, while the
+     * personal-API-key path only re-authorizes an `X-Agor-Session-Id` the
+     * caller chose. Emitting one value for both would launder the weaker
+     * claim into the stronger one.
+     */
+    authenticated_by: 'session_token' | 'personal_api_key';
+    /** Absent when the caller named no Agor session (admitted, rendered unattributed). */
+    origin_session_id?: SessionID;
+    origin_branch_id?: BranchID;
+    /**
+     * No `origin_task_id`. The session MCP token binds a Session, not a Task,
+     * and nothing else on the authenticated request names one - so the only
+     * way to fill it would be to query the origin Session's current Task and
+     * attest a guess. An envelope that exists to stop inferred identity from
+     * looking attested must not do that.
+     */
+    /** Agor account the calling agent ran under. Not evidence of human approval. */
+    origin_user_id: UserID;
+    origin_agentic_tool?: PersistedAgenticToolName;
+    tool: string;
+    mode?: string;
+    stamped_at: string;
+    /** Exact block text rendered into `full_prompt`, for audit and re-application. */
+    rendered_block: string;
+    /** Where the block sits relative to the caller body. */
+    placement: 'prefix' | 'suffix';
+    /** Sentinel occurrences neutralized out of the caller body, when any. */
+    escaped_sentinels?: number;
+  };
+
+  /**
+   * Immutable one-shot completion callback requested for this exact task.
+   * The MCP prompt tool derives both identities from trusted request context;
+   * callers cannot nominate an arbitrary destination.
+   */
+  completion_callback?: {
+    target_session_id: SessionID;
+    requested_from_session_id: SessionID;
+    requested_by_user_id: string;
+  };
+}
+
+/**
+ * A task reached a terminal state *on its own* (finished or hit an error),
+ * as opposed to being user-stopped/timed-out/cancelled. Used e.g. to gate
+ * completion notifications that should only fire on natural finishes.
+ */
+export function isNaturalCompletion(status: TaskStatus): boolean {
+  return status === TaskStatus.COMPLETED || status === TaskStatus.FAILED;
+}
+
+export const TERMINAL_TASK_STATUSES: ReadonlySet<TaskStatus> = new Set<TaskStatus>([
+  TaskStatus.COMPLETED,
+  TaskStatus.FAILED,
+  TaskStatus.STOPPED,
+  TaskStatus.TIMED_OUT,
+]);
+
+/** Every persisted Task status that still represents unfinished work. */
+export const NONTERMINAL_TASK_STATUSES: ReadonlySet<TaskStatus> = new Set<TaskStatus>(
+  Object.values(TaskStatus).filter((status) => !TERMINAL_TASK_STATUSES.has(status))
+);
+
+export function isTerminalTaskStatus(status: TaskStatus | undefined): boolean {
+  return status !== undefined && TERMINAL_TASK_STATUSES.has(status);
+}
+
+/**
+ * A Task whose daemon-side launch claim has not yet become durable.
+ *
+ * Every other status is downstream of the CREATED/QUEUED -> DISPATCHING
+ * fence (or terminal) and must never be sent through launch admission again
+ * merely to reconcile projections around that durable Task.
+ */
+export function isTaskPendingDispatch(task: Pick<Task, 'status'>): task is Pick<Task, 'status'> & {
+  status: TaskPendingDispatchStatus;
+} {
+  return task.status === TaskStatus.CREATED || task.status === TaskStatus.QUEUED;
+}
+
+/**
+ * Task states owned by an active executor turn. These block starting another
+ * task in the same session and should be stopped/failed before queue drain can
+ * continue. CREATED and QUEUED are intentionally excluded: CREATED is a
+ * pre-executor row and QUEUED is waiting for a future turn.
+ */
+/**
+ * A templated/remote executor that has not claimed its dispatch cannot have
+ * received the stop request yet. Its startup path reads the durable request
+ * and reports quiescence, so the request is pending rather than unverified.
+ * A pure predicate over the Task DTO; shared by the termination coordinator
+ * and the runtime reconciler.
+ */
+export function isAwaitingRemoteExecutor(task: Task): boolean {
+  return (
+    task.status === TaskStatus.STOPPING &&
+    task.executor_mode === 'templated' &&
+    !task.executor_connected_at &&
+    !!task.termination_request &&
+    !task.termination_request.executor_quiesced_at &&
+    task.sdk_failure?.termination !== 'unverified'
+  );
+}
+
+export const EXECUTING_TASK_STATUSES: ReadonlySet<TaskStatus> = new Set<TaskStatus>([
+  TaskStatus.DISPATCHING,
+  TaskStatus.RUNNING,
+  TaskStatus.STOPPING,
+  TaskStatus.AWAITING_PERMISSION,
+  TaskStatus.AWAITING_INPUT,
+]);
+
+export type TaskExecutionState = Pick<Task, 'status'>;
+
+export function isTaskExecuting(task: TaskExecutionState): boolean {
+  return EXECUTING_TASK_STATUSES.has(task.status);
+}
+
+/**
+ * Authoritative context-window snapshot captured at task completion.
+ *
+ * Source depends on the agentic tool:
+ * - Claude Code: derived from the Claude Agent SDK `getContextUsage()` response.
+ * - Codex: extracted from the Codex CLI's `event_msg/token_count.last_token_usage`
+ *   payload — see `extractCodexContextSnapshotFromEvent` in the executor.
+ *
+ * `percentage` is the value the source tool itself reports/displays for
+ * "Context XX% used" (i.e. for Codex it is baseline-adjusted to match the
+ * CLI TUI's indicator). Consumers should prefer this over recomputing
+ * `totalTokens / maxTokens` so per-tool conventions are respected.
+ */
+export interface ContextUsageSnapshot {
+  totalTokens: number;
+  maxTokens: number;
+  /** Finite 0–100 percentage reported by the source tool. */
+  percentage: number;
+}
+
+export interface Task {
+  /** Unique task identifier (UUIDv7) */
+  task_id: TaskID;
+
+  /** Session this task belongs to */
+  session_id: SessionID;
+
+  /** User ID of the user who created this task */
+  created_by: string;
+
+  /** Original user prompt (can be multi-line) */
+  full_prompt: string;
+
+  status: TaskStatus;
+
+  /**
+   * Queue position when status is QUEUED. Lower values drain first.
+   * Undefined for non-queued tasks.
+   */
+  queue_position?: number;
+
+  /**
+   * Structured metadata for the task. Fields here are load-bearing for
+   * auth, lineage, and UI styling — see the per-field comments. When a
+   * QUEUED task transitions to RUNNING and a user-message row is written,
+   * `is_agor_callback` and `source` are copied onto the new message.metadata
+   * so the UI styling for callbacks survives the queue → run hop.
+   */
+  metadata?: TaskMetadata;
+
+  // Message range
+  message_range: {
+    start_index: number;
+    end_index: number;
+    start_timestamp: string;
+    end_timestamp?: string;
+  };
+
+  // Tool usage
+  /** Server-derived terminal snapshot of distinct recorded tool IDs. Missing/null
+   * means unknown (including legacy turns); never substitute zero.
+   * Transcript mutations invalidate it. Not an executor/client-writable field. */
+  recorded_tool_count?: number | null;
+
+  // Git state
+  git_state: {
+    ref_at_start: string; // Branch name at task start (required)
+    sha_at_start: string; // SHA at task start (required)
+    ref_at_end?: string; // Branch name at task end (optional)
+    sha_at_end?: string; // SHA at task end (optional)
+    commit_message?: string; // Commit message if task resulted in a commit (optional)
+  };
+
+  // Task execution metadata
+  duration_ms?: number; // Total execution time from SDK
+  agent_session_id?: string; // SDK's internal session ID for debugging
+
+  /**
+   * Human-readable error message populated when the task transitions to the
+   * `failed` state. Captures the reason so UI and logs can surface a clear
+   * cause instead of silently leaving the session idle with a ghost task.
+   */
+  error_message?: string;
+
+  // Model (resolved model ID used for this task, e.g., "claude-sonnet-4-5-20250929")
+  model?: string;
+
+  // Closed SDK response projection - source of truth for token accounting.
+  // Provider prose and unknown SDK extension objects are removed before storage.
+  // Access token usage, context window, costs, etc. via normalizers
+  // Optional to support legacy tasks that don't have this field
+  raw_sdk_response?: unknown; // Raw SDK response stored as JSON
+
+  // Normalized SDK response - computed and runtime-projected by the executor,
+  // then projected again by the daemon before persistence/realtime.
+  // Stored here so UI doesn't need SDK-specific normalization logic
+  // Will be empty for legacy tasks (pre-normalization)
+  normalized_sdk_response?: {
+    tokenUsage: {
+      inputTokens: number;
+      outputTokens: number;
+      totalTokens: number;
+      cacheReadTokens?: number; // Provider-reported prompt cache reads
+      cacheCreationTokens?: number; // Provider-reported prompt cache writes
+    };
+    contextWindowLimit?: number; // Model's max context window (e.g., 200k for Claude)
+    costUsd?: number; // Estimated cost in USD (if pricing available)
+    primaryModel?: string; // Resolved model used for the task
+    durationMs?: number; // Total execution duration from SDK, when available
+    /** Authoritative SDK/protocol context-window snapshot when available */
+    contextUsageSnapshot?: ContextUsageSnapshot;
+  };
+
+  // Current context-window occupancy in tokens at the end of this task.
+  //
+  // Source precedence (set by base-executor):
+  // 1. `normalized_sdk_response.contextUsageSnapshot.totalTokens` when the
+  //    tool surfaced an authoritative snapshot (Claude SDK getContextUsage,
+  //    Codex CLI event_msg/token_count last_token_usage). This is the common
+  //    case and is what UI consumers should rely on.
+  // 2. Otherwise the tool's `computeContextWindow()` fallback (per-tool
+  //    heuristic — see tool.interface.ts).
+  //
+  // For display percentages, prefer `contextUsageSnapshot.percentage` over
+  // recomputing here — Codex applies a baseline subtraction that does NOT
+  // equal raw `computed_context_window / contextWindowLimit`.
+  computed_context_window?: number;
+
+  // Report (auto-generated after task completion)
+  report?: {
+    /**
+     * File path relative to context/reports/
+     * Format: "<session-id>/<task-id>.md"
+     */
+    path: ReportPath;
+    template: ReportTemplate;
+    generated_at: string;
+  };
+
+  // Permission request (when task is awaiting user approval)
+  permission_request?: {
+    request_id: string;
+    tool_name: string;
+    tool_input: Record<string, unknown>;
+    tool_use_id?: string;
+    requested_at: string;
+    // Optional: Track who approved (for audit trail)
+    approved_by?: string; // userId
+    approved_at?: string;
+  };
+
+  created_at: string;
+  started_at?: string; // When task execution was dispatched (UTC ISO string)
+  /** Server timestamp recorded when the authenticated executor claims the task. */
+  executor_connected_at?: string; // UTC ISO string
+  /** Latest heartbeat emitted by the executor while this task is active. */
+  last_executor_heartbeat_at?: string; // UTC ISO string
+  /** Immutable launch-mode snapshot used to classify launcher exit safely. */
+  executor_mode?: ExecutorMode;
+  /** Latest bounded SDK activity fact; this is not an event history. */
+  latest_executor_pulse?: ExecutorPulse;
+  /** Bounded SDK/process health diagnosis. */
+  sdk_failure?: SdkFailure;
+  /** Durable intent while verified local containment is pending. */
+  termination_request?: TerminationRequest;
+  /** Immutable watchdog policy snapshot for this dispatch. */
+  sdk_watchdog_mode?: 'disabled' | 'observe' | 'enforce';
+  completed_at?: string; // When task reached terminal status (UTC ISO string)
+}
+
+/** Explicit Session queue commands; task IDs are full UUIDs, never ambiguous prefixes. */
+export interface CancelQueuedTasksInput {
+  session_id: SessionID;
+  task_ids: TaskID[];
+}
+
+export interface ReorderQueuedTasksInput {
+  session_id: SessionID;
+  /** Exact ordered snapshot observed by the caller. */
+  expected_task_ids: TaskID[];
+  /** Exact permutation of expected_task_ids, in desired dispatch order. */
+  task_ids: TaskID[];
+}
+
+/** Authoritative queue at the mutation's serialization point, not a reservation. */
+export interface TaskQueueMutationResult {
+  session_id: SessionID;
+  queue: Pick<Task, 'task_id' | 'queue_position'>[];
+  cancelled_task_ids: TaskID[];
+}

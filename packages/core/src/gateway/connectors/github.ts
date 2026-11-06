@@ -1,0 +1,596 @@
+/**
+ * GitHub Connector
+ *
+ * Polls the GitHub API for @mention comments on PRs/issues and posts
+ * responses via the GitHub API. Uses GitHub App authentication
+ * (installation tokens via @octokit/auth-app).
+ *
+ * Config shape (stored encrypted in gateway_channels.config):
+ *   {
+ *     app_id: number,
+ *     private_key: string,           // PEM, encrypted at rest
+ *     installation_id: number,
+ *     webhook_secret?: string,       // encrypted at rest (webhook mode)
+ *     watch_repos: string[],         // "owner/repo" format, required
+ *     poll_interval_ms?: number,     // default 15000
+ *     require_mention?: boolean,     // default true
+ *     mention_name?: string,         // app slug for @mention detection
+ *     align_github_users?: boolean,  // map GitHub login → Agor user
+ *     user_map?: Record<string, string>, // GitHub login → Agor email
+ *   }
+ *
+ * Thread ID format: "owner/repo#number"
+ *   e.g. "preset-io/agor#42"
+ */
+
+import type { Octokit } from '@octokit/rest';
+import type { ChannelType } from '../../types/gateway';
+import type {
+  GatewayConnector,
+  GatewayInboundCallback,
+  GatewayListenerOptions,
+  InboundMessage,
+} from '../connector';
+import { GatewayListenerError } from '../listener-error';
+import { addToRingBuffer, escapeRegex } from './shared';
+
+// ============================================================================
+// Config & State Types
+// ============================================================================
+
+export interface GitHubChannelConfig {
+  // ── Authentication (encrypted at rest) ──────────────────
+  app_id: number;
+  private_key: string; // PEM format
+  installation_id: number;
+  webhook_secret?: string; // only for webhook mode
+
+  // ── Scope ───────────────────────────────────────────────
+  watch_repos: string[]; // "owner/repo" format, e.g. ["preset-io/agor"]
+
+  // ── Polling ─────────────────────────────────────────────
+  poll_interval_ms?: number; // default 15000
+
+  // ── Trigger Behavior ───────────────────────────────────
+  require_mention?: boolean; // default true
+  mention_name?: string; // app slug for @mention detection (e.g. "agor")
+
+  // ── User Alignment ─────────────────────────────────────
+  align_github_users?: boolean;
+  /** Explicit GitHub login → Agor email mapping (checked first, before email lookup) */
+  user_map?: Record<string, string>;
+}
+
+/** Per-repo poll state for exactly-once processing */
+interface RepoPollState {
+  repo: string; // "owner/repo"
+  lastPollAt: string; // ISO timestamp — used as `since` param
+  processedCommentIds: Set<number>; // Ring buffer for dedup
+}
+
+/** Default poll interval */
+const DEFAULT_POLL_INTERVAL_MS = 15_000;
+const DEFAULT_STARTUP_LOOKBACK_MS = 5 * 60_000;
+const DEFAULT_POLL_OVERLAP_MS = 60_000;
+const GITHUB_COMMENTS_PAGE_SIZE = 100;
+
+/** Default mention keyword */
+const DEFAULT_MENTION_NAME = 'agor';
+
+/** Classify GitHub installation validation without exposing its response payload. */
+export function classifyGitHubInstallationError(error: unknown): GatewayListenerError {
+  const candidate =
+    typeof error === 'object' && error !== null
+      ? (error as {
+          status?: unknown;
+          message?: unknown;
+          response?: { headers?: Record<string, unknown>; data?: { message?: unknown } };
+        })
+      : {};
+  const status = Number(candidate.status);
+  const headers = candidate.response?.headers ?? {};
+  const header = (name: string): string => {
+    const value = headers[name] ?? headers[name.toLowerCase()] ?? headers[name.toUpperCase()];
+    return typeof value === 'string' || typeof value === 'number' ? String(value) : '';
+  };
+  const providerMessage = `${String(candidate.message ?? '')} ${String(
+    candidate.response?.data?.message ?? ''
+  )}`.toLowerCase();
+  const rateLimited =
+    status === 429 ||
+    (status === 403 &&
+      (header('retry-after') !== '' ||
+        header('x-ratelimit-remaining') === '0' ||
+        providerMessage.includes('secondary rate limit') ||
+        providerMessage.includes('rate limit exceeded')));
+
+  if (!rateLimited && (status === 401 || status === 403 || status === 404)) {
+    return new GatewayListenerError(
+      'github_credentials_invalid',
+      'permanent',
+      'Verify the GitHub App id, private key, installation id, and installation access.'
+    );
+  }
+  return new GatewayListenerError(
+    'github_api_unavailable',
+    'transient',
+    'GitHub is unavailable; Agor will retry automatically.'
+  );
+}
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+/**
+ * Parse a thread ID into owner, repo, and issue/PR number.
+ *
+ * Format: "owner/repo#number"
+ * e.g. "preset-io/agor#42" → { owner: "preset-io", repo: "agor", number: 42 }
+ */
+export function parseThreadId(threadId: string): { owner: string; repo: string; number: number } {
+  const match = threadId.match(/^([^/]+)\/([^#]+)#(\d+)$/);
+  if (!match) {
+    throw new Error(
+      `Invalid GitHub thread ID format: "${threadId}" (expected "owner/repo#number")`
+    );
+  }
+  return {
+    owner: match[1],
+    repo: match[2],
+    number: parseInt(match[3], 10),
+  };
+}
+
+/** Stable across repository renames and configured owner/repo casing changes. */
+export function githubIssueCommentProviderEventId(comment: {
+  id: number;
+  node_id?: string | null;
+}): string {
+  const stableCommentId = comment.node_id?.trim() || String(comment.id);
+  return `github:issue_comment:${stableCommentId}`;
+}
+
+/**
+ * Check if text contains an @mention outside of code blocks.
+ *
+ * Strips triple-backtick blocks and inline code spans first,
+ * then tests for the mention pattern — so code-block mentions return false.
+ */
+function hasActiveMention(text: string, mentionName: string): boolean {
+  // Strip triple-backtick blocks first (```...```), then inline code (`...`)
+  const stripped = text.replace(/```[\s\S]*?```/g, '').replace(/`[^`]*`/g, '');
+  // GitHub mentions are @name (not <@ID> like Slack)
+  const pattern = new RegExp(`@${escapeRegex(mentionName)}\\b`, 'i');
+  return pattern.test(stripped);
+}
+
+/**
+ * Strip @mention from text, returning the cleaned message body.
+ */
+function stripMention(text: string, mentionName: string): string {
+  const pattern = new RegExp(`@${escapeRegex(mentionName)}\\s*`, 'gi');
+  return text.replace(pattern, '').trim();
+}
+
+// ============================================================================
+// GitHubConnector
+// ============================================================================
+
+export class GitHubConnector implements GatewayConnector {
+  readonly channelType: ChannelType = 'github';
+
+  private config: GitHubChannelConfig;
+  private octokit: Octokit | null = null;
+  private pollTimer: ReturnType<typeof setInterval> | null = null;
+  private pollStates = new Map<string, RepoPollState>();
+  private polling = false;
+  private startupLookbackMs = 0;
+
+  constructor(config: Record<string, unknown>) {
+    this.config = config as unknown as GitHubChannelConfig;
+
+    if (!this.config.app_id) {
+      throw new Error('GitHub connector requires app_id in config');
+    }
+    if (!this.config.private_key) {
+      throw new Error('GitHub connector requires private_key in config');
+    }
+    if (!this.config.installation_id) {
+      throw new Error('GitHub connector requires installation_id in config');
+    }
+    if (!this.config.watch_repos || this.config.watch_repos.length === 0) {
+      throw new Error(
+        'GitHub connector requires at least one repo in watch_repos (format: "owner/repo")'
+      );
+    }
+  }
+
+  /**
+   * Get an authenticated Octokit instance for the GitHub App installation.
+   *
+   * Uses @octokit/auth-app to automatically manage installation tokens
+   * (creates them on first use, refreshes when expired).
+   */
+  private async getOctokit(): Promise<Octokit> {
+    if (this.octokit) return this.octokit;
+
+    // Dynamic imports — @octokit packages may not be installed yet.
+    // Structured so the code compiles without the packages present.
+    const { Octokit: OctokitClass } = await import('@octokit/rest');
+    const { createAppAuth } = await import('@octokit/auth-app');
+
+    this.octokit = new OctokitClass({
+      authStrategy: createAppAuth,
+      auth: {
+        appId: this.config.app_id,
+        privateKey: this.config.private_key,
+        installationId: this.config.installation_id,
+      },
+    });
+
+    return this.octokit;
+  }
+
+  /**
+   * Resolve the list of repos to poll.
+   * Uses watch_repos directly — entries must be in "owner/repo" format.
+   */
+  private resolveRepos(): string[] {
+    return this.config.watch_repos;
+  }
+
+  /**
+   * Get or create poll state for a repo.
+   */
+  private getRepoPollState(repo: string): RepoPollState {
+    let state = this.pollStates.get(repo);
+    if (!state) {
+      state = {
+        repo,
+        // Distributed mode overlaps before its first durable checkpoint;
+        // standalone mode preserves the historical start-at-now behavior.
+        lastPollAt: new Date(Date.now() - this.startupLookbackMs).toISOString(),
+        processedCommentIds: new Set(),
+      };
+      this.pollStates.set(repo, state);
+    }
+    return state;
+  }
+
+  private serializeCheckpoint(): Record<string, unknown> {
+    return {
+      version: 1,
+      repos: Object.fromEntries(
+        [...this.pollStates].map(([repo, state]) => [
+          repo,
+          {
+            lastPollAt: state.lastPollAt,
+            processedCommentIds: [...state.processedCommentIds],
+          },
+        ])
+      ),
+    };
+  }
+
+  private restoreCheckpoint(checkpoint: Record<string, unknown> | null | undefined): void {
+    const repos = checkpoint?.repos;
+    if (!repos || typeof repos !== 'object' || Array.isArray(repos)) return;
+    for (const [repo, raw] of Object.entries(repos as Record<string, unknown>)) {
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
+      const value = raw as Record<string, unknown>;
+      if (typeof value.lastPollAt !== 'string') continue;
+      this.pollStates.set(repo, {
+        repo,
+        lastPollAt: value.lastPollAt,
+        processedCommentIds: new Set(
+          Array.isArray(value.processedCommentIds)
+            ? value.processedCommentIds.filter((id): id is number => Number.isSafeInteger(id))
+            : []
+        ),
+      });
+    }
+  }
+
+  /**
+   * Poll a single repo for new comments with @mentions.
+   *
+   * Uses the `since` parameter plus a bounded overlap for safe retries.
+   * Returns new InboundMessages for the callback.
+   */
+  private async pollRepo(repo: string): Promise<InboundMessage[]> {
+    const state = this.getRepoPollState(repo);
+    const octokit = await this.getOctokit();
+    const [owner, repoName] = repo.split('/');
+    const mentionName = this.config.mention_name ?? DEFAULT_MENTION_NAME;
+    const requireMention = this.config.require_mention ?? true;
+    // Capture the boundary before any provider request. Advancing to a point
+    // slightly before this instant guarantees that comments created while a
+    // multi-page poll is in flight are observed on the next tick. Stable
+    // provider event IDs and the bounded local ring make the overlap harmless.
+    const pollStartedAt = Date.now();
+
+    const messages: InboundMessage[] = [];
+
+    try {
+      // Fetch every issue/PR comment page before advancing the watermark. The
+      // endpoint caps per_page at 100; stopping after the first page can silently
+      // lose mentions when a busy repository crosses that boundary.
+      const pages = octokit.paginate.iterator(octokit.issues.listCommentsForRepo, {
+        owner,
+        repo: repoName,
+        since: state.lastPollAt,
+        sort: 'created',
+        direction: 'asc',
+        per_page: GITHUB_COMMENTS_PAGE_SIZE,
+      });
+      for await (const response of pages) {
+        for (const comment of response.data) {
+          // Skip if already processed (dedup)
+          if (state.processedCommentIds.has(comment.id)) {
+            continue;
+          }
+
+          // Skip bot's own comments (avoid loops)
+          if (comment.user?.type === 'Bot') {
+            addToRingBuffer(state.processedCommentIds, comment.id);
+            continue;
+          }
+
+          const body = comment.body ?? '';
+
+          // Check for @mention if required
+          if (requireMention && !hasActiveMention(body, mentionName)) {
+            addToRingBuffer(state.processedCommentIds, comment.id);
+            continue;
+          }
+
+          // Extract issue/PR number from the comment's issue_url
+          // issue_url looks like: https://api.github.com/repos/owner/repo/issues/42
+          const issueUrlMatch = comment.issue_url?.match(/\/issues\/(\d+)$/);
+          if (!issueUrlMatch) {
+            console.warn('[github] event="comment_shape_invalid" provider=github');
+            addToRingBuffer(state.processedCommentIds, comment.id);
+            continue;
+          }
+          const issueNumber = parseInt(issueUrlMatch[1], 10);
+
+          // Build thread ID
+          const threadId = `${owner}/${repoName}#${issueNumber}`;
+
+          // Strip mention from body
+          const text = requireMention ? stripMention(body, mentionName) : body;
+
+          // Resolve user identity for alignment
+          // NOTE: user_map lookup is done in the gateway (not here) because the gateway
+          // reads fresh channel config from DB on every message. The connector's this.config
+          // is set at construction time and would go stale if user_map is updated in the UI.
+          const githubLogin = comment.user?.login;
+          let githubUserEmail: string | undefined;
+
+          if (this.config.align_github_users && githubLogin) {
+            // Fetch GitHub user's public email (used by gateway tier-2 alignment)
+            try {
+              const { data: ghUser } = await octokit.users.getByUsername({
+                username: githubLogin,
+              });
+              if (ghUser.email) {
+                githubUserEmail = ghUser.email;
+              }
+            } catch {
+              console.warn('[github] event="user_lookup_failed" provider=github');
+            }
+          }
+
+          messages.push({
+            providerEventId: githubIssueCommentProviderEventId(comment),
+            threadId,
+            text,
+            userId: githubLogin ?? 'unknown',
+            timestamp: comment.created_at,
+            metadata: {
+              comment_id: comment.id,
+              github_user: githubLogin,
+              github_user_url: comment.user?.html_url,
+              issue_number: issueNumber,
+              repo_full_name: repo,
+              comment_url: comment.html_url,
+              ...(this.config.align_github_users ? { align_github_users: true } : {}),
+              ...(githubUserEmail ? { github_user_email: githubUserEmail } : {}),
+            },
+            // Side effects run only after the gateway has won the durable event
+            // identity. GitHub has no idempotency key for createComment, so a
+            // crash after the API accepts the comment but before Agor records
+            // completion remains an explicitly documented at-least-once window.
+            prepareDelivery: async () => {
+              try {
+                await octokit.reactions.createForIssueComment({
+                  owner,
+                  repo: repoName,
+                  comment_id: comment.id,
+                  content: 'eyes',
+                });
+              } catch {
+                console.warn('[github] event="reaction_failed" provider=github');
+              }
+              try {
+                const { data: processingComment } = await octokit.issues.createComment({
+                  owner,
+                  repo: repoName,
+                  issue_number: issueNumber,
+                  body: '⏳ Processing...',
+                });
+                addToRingBuffer(state.processedCommentIds, processingComment.id);
+                return { processing_comment_id: processingComment.id };
+              } catch {
+                console.warn('[github] event="acknowledgement_failed" provider=github');
+              }
+            },
+          });
+
+          addToRingBuffer(state.processedCommentIds, comment.id);
+        }
+      }
+
+      // Only advance after every page succeeds. Never move a standalone
+      // listener behind its start-at-now cursor while introducing overlap.
+      const previousPollAt = Date.parse(state.lastPollAt);
+      state.lastPollAt = new Date(
+        Math.max(
+          Number.isFinite(previousPollAt) ? previousPollAt : 0,
+          pollStartedAt - DEFAULT_POLL_OVERLAP_MS
+        )
+      ).toISOString();
+    } catch {
+      console.error('[github] event="poll_failed" provider=github');
+      // Don't update lastPollAt on error — retry from same point next cycle
+    }
+
+    return messages;
+  }
+
+  /**
+   * Start the poll loop.
+   *
+   * Each tick polls all watched repos for new @mention comments.
+   */
+  async startListening(
+    callback: GatewayInboundCallback,
+    options: GatewayListenerOptions = {}
+  ): Promise<void> {
+    console.log('[github] event="listener_starting" provider=github');
+
+    // Validate we can authenticate
+    const octokit = await this.getOctokit();
+    try {
+      await octokit.apps.getInstallation({
+        installation_id: this.config.installation_id,
+      });
+      console.log('[github] event="listener_authenticated" provider=github');
+    } catch (error) {
+      throw classifyGitHubInstallationError(error);
+    }
+
+    // Resolve repos to watch
+    const repos = this.resolveRepos();
+    console.log(
+      `[github] event="listener_scope_ready" provider=github repository_count=${repos.length}`
+    );
+
+    this.startupLookbackMs = options.durableEventIdempotency ? DEFAULT_STARTUP_LOOKBACK_MS : 0;
+    this.restoreCheckpoint(options.checkpoint);
+    // Initialize poll state for each repo not present in the checkpoint.
+    for (const repo of repos) {
+      this.getRepoPollState(repo);
+    }
+
+    const intervalMs = this.config.poll_interval_ms ?? DEFAULT_POLL_INTERVAL_MS;
+    console.log(`[github] Starting poll loop (interval: ${intervalMs}ms)`);
+
+    // Run one poll immediately
+    await this.pollTick(repos, callback, options.saveCheckpoint);
+
+    // Then start the interval
+    this.pollTimer = setInterval(() => {
+      void this.pollTick(repos, callback, options.saveCheckpoint);
+    }, intervalMs);
+  }
+
+  /**
+   * Single poll tick — polls all repos and emits messages.
+   * Guarded against overlapping ticks.
+   */
+  private async pollTick(
+    repos: string[],
+    callback: GatewayInboundCallback,
+    saveCheckpoint?: GatewayListenerOptions['saveCheckpoint']
+  ): Promise<void> {
+    if (this.polling) {
+      console.warn('[github] Poll tick skipped (previous tick still running)');
+      return;
+    }
+
+    this.polling = true;
+    const before = this.serializeCheckpoint();
+    try {
+      for (const repo of repos) {
+        const messages = await this.pollRepo(repo);
+        for (const msg of messages) {
+          await callback(msg);
+        }
+      }
+      if (saveCheckpoint && !(await saveCheckpoint(this.serializeCheckpoint()))) {
+        this.restoreCheckpoint(before);
+        console.warn('[github] Listener ownership lost while checkpointing; stopping poll loop');
+        await this.stopListening();
+      }
+    } catch {
+      // Do not advance an in-memory cursor past an event the gateway did not
+      // durably accept. The same owner retries, or a replacement starts from
+      // the last fenced checkpoint.
+      this.pollStates.clear();
+      this.restoreCheckpoint(before);
+      console.error('[github] event="poll_tick_failed" provider=github');
+    } finally {
+      this.polling = false;
+    }
+  }
+
+  /**
+   * Stop the poll loop and save state.
+   */
+  async stopListening(): Promise<void> {
+    if (this.pollTimer) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = null;
+    }
+    this.polling = false;
+    console.log('[github] Poll loop stopped');
+    // Future: persist pollStates to DB for restart recovery
+  }
+
+  /**
+   * Post or edit a comment on a PR/issue.
+   *
+   * If `metadata.edit_comment_id` is set, edits that comment instead of
+   * creating a new one. This is used to replace the "Processing..." comment
+   * with the final agent response.
+   */
+  async sendMessage(req: {
+    threadId: string;
+    text: string;
+    metadata?: Record<string, unknown>;
+  }): Promise<string> {
+    const { owner, repo, number: issueNumber } = parseThreadId(req.threadId);
+    const octokit = await this.getOctokit();
+    const editCommentId = req.metadata?.edit_comment_id as number | undefined;
+
+    if (editCommentId) {
+      // Edit existing comment (the "Processing..." comment → final response)
+      await octokit.issues.updateComment({
+        owner,
+        repo,
+        comment_id: editCommentId,
+        body: req.text,
+      });
+      return String(editCommentId);
+    }
+
+    // Create new comment
+    const { data } = await octokit.issues.createComment({
+      owner,
+      repo,
+      issue_number: issueNumber,
+      body: req.text,
+    });
+
+    return String(data.id);
+  }
+
+  /**
+   * GitHub natively supports markdown — pass through with no conversion.
+   */
+  formatMessage(markdown: string): string {
+    return markdown;
+  }
+}

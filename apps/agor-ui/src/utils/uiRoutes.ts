@@ -1,0 +1,95 @@
+import { type BoardID, boardPath, type SessionID, sessionPath } from '@agor-live/client';
+import { matchPath, type NavigateFunction } from 'react-router-dom';
+import { resolveUiRuntime, routerBasenameForRuntime } from '../config/urlRuntime';
+import { resolveBoardFromUrlPure, resolveSessionFromShortIdPure } from './urlResolution';
+
+function currentPathname(): string {
+  return typeof window === 'undefined' ? '/' : window.location.pathname;
+}
+
+// Remote watch can mount Vite at /ui too; the URL base, not production mode,
+// determines routing for both packaged and live-preview UIs.
+export function getRouterBasename(
+  baseUrl = import.meta.env.BASE_URL,
+  pathname = currentPathname()
+): string {
+  return routerBasenameForRuntime(resolveUiRuntime({ baseUrl, pathname }));
+}
+
+export function uiRouteHref(path: string, baseUrl = import.meta.env.BASE_URL): string {
+  return `${getRouterBasename(baseUrl)}${path.startsWith('/') ? path : `/${path}`}`;
+}
+
+/**
+ * Whether Back stays inside Agor. The browser router keeps `idx` in history state across
+ * replaces, so a redirected deep link still counts as the first entry; without that state (memory-router tests) the key decides.
+ */
+export function hasInAppHistory(locationKey: string): boolean {
+  const idx = (typeof window === 'undefined' ? undefined : window.history.state)?.idx;
+  return typeof idx === 'number' ? idx > 0 : locationKey !== 'default';
+}
+
+/** Back one entry when `canPop`; else to `fallback`, replacing this entry so Back from there skips it. */
+export function backOr(navigate: NavigateFunction, canPop: boolean, fallback: string): void {
+  if (canPop) navigate(-1);
+  else navigate(fallback, { replace: true });
+}
+
+/** Whether `pathname` belongs to the mobile shell (`/m` and below). */
+export const isMobileShellPath = (pathname: string): boolean =>
+  matchPath({ path: '/m', end: false }, pathname) !== null;
+
+/** Directory of AI teammates shared with the caller; `/m` prefixes it on mobile. */
+export const TEAMMATES_ROUTE_PATH = '/teammates';
+export const MOBILE_TEAMMATES_ROUTE_PATH = `/m${TEAMMATES_ROUTE_PATH}`;
+const TEAMMATES_ROUTE_PATHS = [TEAMMATES_ROUTE_PATH, MOBILE_TEAMMATES_ROUTE_PATH] as const;
+
+/** Whether `pathname` is the teammates directory on either shell, trailing slash included. */
+export const isTeammatesRoute = (pathname: string): boolean =>
+  TEAMMATES_ROUTE_PATHS.some((path) => matchPath({ path, end: true }, pathname) !== null);
+
+type ResponsiveRouteEntities = {
+  boards: Iterable<{ board_id: string; slug?: string }>;
+  sessions: Iterable<{ session_id: string }>;
+};
+
+/** Preserve the selected board/session when crossing the mobile breakpoint. */
+export function responsiveRoutePath(
+  pathname: string,
+  target: 'mobile' | 'desktop',
+  entities: ResponsiveRouteEntities
+): string {
+  if (isTeammatesRoute(pathname)) {
+    return target === 'mobile' ? MOBILE_TEAMMATES_ROUTE_PATH : TEAMMATES_ROUTE_PATH;
+  }
+  if (target === 'mobile') {
+    const boardToken = pathname.match(/^\/b\/([^/]+)\/?$/)?.[1];
+    if (boardToken) {
+      const boards = new Map(Array.from(entities.boards, (board) => [board.board_id, board]));
+      const boardId = resolveBoardFromUrlPure(boardToken, boards);
+      // Keep a cold slug/short-id deep link intact. Mobile board resolution uses
+      // the same ambiguity-safe resolver once the initial board list arrives.
+      return `/m/board/${boardId ?? boardToken}`;
+    }
+    const sessionToken = pathname.match(/^\/s\/([^/]+)\/?$/)?.[1];
+    if (sessionToken) {
+      const sessions = new Map(
+        Array.from(entities.sessions, (session) => [session.session_id, session])
+      );
+      const sessionId = resolveSessionFromShortIdPure(sessionToken, sessions);
+      // The loader accepts short IDs, so preserve a cold canonical token rather
+      // than discarding navigation context while the store is still empty.
+      return `/m/session/${sessionId ?? sessionToken}`;
+    }
+    return '/m';
+  }
+
+  const match = pathname.match(/^\/m\/(board|comments|session)\/([^/]+)\/?$/);
+  if (!match) return '/';
+  const [, kind, id] = match;
+  // Build the desktop targets with the same helpers the rest of the app uses, so
+  // the short-id form here can't drift from what `useUrlState` resolves.
+  if (kind === 'session') return sessionPath(id as SessionID);
+  const board = Array.from(entities.boards).find((item) => item.board_id === id);
+  return boardPath(id as BoardID, board?.slug);
+}

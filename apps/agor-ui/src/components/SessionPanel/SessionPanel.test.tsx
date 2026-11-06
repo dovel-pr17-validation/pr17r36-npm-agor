@@ -1,0 +1,782 @@
+import type { AgorClient, Branch, Session, Task, User } from '@agor-live/client';
+import { SESSION_LIST_ROW_SHAPE } from '@agor-live/client';
+import {
+  cleanup,
+  createEvent,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from '@testing-library/react';
+import { App as AntApp } from 'antd';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { AppActionsProvider } from '../../contexts/AppActionsContext';
+import { ConnectionProvider } from '../../contexts/ConnectionContext';
+import { buildSessionMaps } from '../../store/agorMaps';
+import { agorStore } from '../../store/agorStore';
+import { setRealtimeAuthorityScope } from '../../store/realtimeBatch';
+import { MOBILE_SHELL_MAX_WIDTH } from '../../utils/deviceDetection';
+import SessionPanel from './SessionPanel';
+
+// Accounting transport has dedicated hook tests; these suites exercise panel actions/composer.
+
+const autocomplete = vi.hoisted(() => ({ props: null as Record<string, unknown> | null }));
+vi.mock('../AutocompleteTextarea', () => ({
+  AutocompleteTextarea: (props: Record<string, unknown>) => {
+    autocomplete.props = props;
+    return <textarea aria-label="Prompt" />;
+  },
+}));
+
+vi.mock('../FileUpload', () => ({
+  FileUpload: () => null,
+  FileUploadButton: (props: { onClick?: () => void; disabled?: boolean }) => (
+    <button type="button" disabled={props.disabled} onClick={props.onClick}>
+      Upload Files
+    </button>
+  ),
+}));
+
+vi.mock('../ForkSpawnModal/ForkSpawnModal', () => ({
+  ForkSpawnModal: () => null,
+}));
+
+vi.mock('../MCPServer', () => ({
+  MCPServerPill: () => <span>MCP server</span>,
+}));
+
+vi.mock('../Pill', () => ({
+  ContextWindowPill: () => <span>Context window</span>,
+  TimerPill: () => <span>Timer</span>,
+  TokenCountPill: () => <span>Tokens</span>,
+}));
+
+vi.mock('../SessionIds', () => ({
+  SessionIdsButton: () => <span>Session IDs</span>,
+  SessionIdsList: () => <span>Session IDs List</span>,
+}));
+
+vi.mock('../ToolIcon', () => ({
+  ToolIcon: () => <span>Tool icon</span>,
+}));
+
+vi.mock('./SessionAttachmentsDropdown', () => ({
+  SessionAttachmentsDropdown: () => null,
+}));
+
+vi.mock('./SessionMcpFooterControl', () => ({
+  SessionMcpFooterControl: () => null,
+}));
+
+vi.mock('./SessionPanelContent', () => ({
+  SessionPanelContent: () => <div>Session content</div>,
+}));
+
+vi.mock('./SessionRunSettingsPopover', () => ({
+  SessionRunSettingsPopover: () => null,
+}));
+
+const reactive = vi.hoisted(() => {
+  const state = { tasks: [] as Task[] };
+  return {
+    get tasks() {
+      return state.tasks;
+    },
+    set tasks(tasks: Task[]) {
+      state.tasks = tasks;
+    },
+    useSharedReactiveSession: vi.fn(() => ({ state: { tasks: state.tasks } })),
+  };
+});
+vi.mock('../../hooks/useSharedReactiveSession', () => ({
+  useSharedReactiveSession: reactive.useSharedReactiveSession,
+}));
+
+const viewport = vi.hoisted(() => ({ isMobile: false }));
+vi.mock('../../hooks/useIsMobileViewport', () => ({
+  useIsMobileViewport: () => viewport.isMobile,
+}));
+
+const connected = {
+  connected: true,
+  connecting: false,
+  outOfSync: false,
+  capturedSha: null,
+  currentSha: null,
+};
+
+const session = {
+  session_id: 'session-1',
+  branch_id: 'branch-1',
+  title: 'Terminal routing session',
+  agentic_tool: 'claude-code-cli',
+  status: 'idle',
+  archived: false,
+  created_at: '2026-06-24T00:00:00.000Z',
+  last_updated: '2026-06-24T00:00:00.000Z',
+} as unknown as Session;
+
+const branch = {
+  branch_id: 'branch-1',
+  board_id: 'board-1',
+  name: 'feature/same-name',
+  path: '/tmp/feature-same-name',
+  primary_owner_user_id: 'branch-owner',
+  filesystem_status: 'ready',
+  archived: false,
+} as unknown as Branch;
+
+function stopIo() {
+  const socket = {
+    connected: true,
+    timeout: vi.fn(() => socket),
+    once: vi.fn(),
+    off: vi.fn(),
+  };
+  return socket;
+}
+
+function renderPanel({
+  onOpenTerminal = vi.fn(),
+  onChooseAgenticTool,
+  client = null,
+  activeSession = session,
+  open = true,
+  onClose = vi.fn(),
+  currentUserId,
+}: {
+  onOpenTerminal?: ReturnType<typeof vi.fn>;
+  onChooseAgenticTool?: ReturnType<typeof vi.fn>;
+  client?: AgorClient | null;
+  activeSession?: Session;
+  open?: boolean;
+  onClose?: ReturnType<typeof vi.fn>;
+  currentUserId?: string;
+} = {}) {
+  render(
+    <ConnectionProvider value={connected}>
+      <AppActionsProvider value={{ onOpenTerminal, onChooseAgenticTool }}>
+        <AntApp>
+          <SessionPanel
+            client={client}
+            session={activeSession}
+            branch={branch}
+            open={open}
+            onClose={onClose}
+            currentUserId={currentUserId}
+          />
+        </AntApp>
+      </AppActionsProvider>
+    </ConnectionProvider>
+  );
+  return { onOpenTerminal, onClose };
+}
+
+const findShortcuts = [
+  { label: 'Cmd+F', modifiers: { metaKey: true } },
+  { label: 'Ctrl+F', modifiers: { ctrlKey: true } },
+] as const;
+
+function pressFind(target: Window | Element, modifiers: { metaKey?: boolean; ctrlKey?: boolean }) {
+  const event = createEvent.keyDown(target, {
+    key: 'f',
+    bubbles: true,
+    cancelable: true,
+    ...modifiers,
+  });
+  const notCancelled = fireEvent(target, event);
+  return { event, notCancelled };
+}
+
+function getSearchRow() {
+  return screen.getByPlaceholderText('Search session...').closest('div[style*="max-height"]');
+}
+
+describe.each(findShortcuts)('SessionPanel native $label behavior', ({ modifiers }) => {
+  afterEach(() => {
+    reactive.tasks = [];
+    vi.restoreAllMocks();
+  });
+
+  it('does not prevent or replace browser Find while the panel is open', () => {
+    renderPanel();
+    const searchInput = screen.getByPlaceholderText('Search session...');
+
+    const { event, notCancelled } = pressFind(window, modifiers);
+
+    expect(notCancelled).toBe(true);
+    expect(event.defaultPrevented).toBe(false);
+    expect(getSearchRow()).toHaveStyle({ maxHeight: '0px' });
+    expect(searchInput).not.toHaveFocus();
+  });
+
+  it('does not prevent browser Find while the panel is closed', () => {
+    renderPanel({ open: false });
+
+    const { event, notCancelled } = pressFind(window, modifiers);
+
+    expect(notCancelled).toBe(true);
+    expect(event.defaultPrevented).toBe(false);
+  });
+
+  it('does not prevent or replace browser Find from the focused composer', () => {
+    renderPanel({ activeSession: { ...session, agentic_tool: 'codex' } });
+    const composer = screen.getByRole('textbox', { name: 'Prompt' });
+    const searchInput = screen.getByPlaceholderText('Search session...');
+    composer.focus();
+
+    const { event, notCancelled } = pressFind(composer, modifiers);
+
+    expect(notCancelled).toBe(true);
+    expect(event.defaultPrevented).toBe(false);
+    expect(getSearchRow()).toHaveStyle({ maxHeight: '0px' });
+    expect(searchInput).not.toHaveFocus();
+  });
+
+  it('does not prevent browser Find when conversation search is already open', async () => {
+    renderPanel();
+    fireEvent.click(screen.getByRole('button', { name: 'Search session' }));
+    const searchInput = screen.getByPlaceholderText('Search session...');
+    await waitFor(() => expect(searchInput).toHaveFocus());
+
+    const { event, notCancelled } = pressFind(searchInput, modifiers);
+
+    expect(notCancelled).toBe(true);
+    expect(event.defaultPrevented).toBe(false);
+    expect(getSearchRow()).toHaveStyle({ maxHeight: '36px' });
+  });
+
+  it('does not prevent or replace browser Find while a modal is open', async () => {
+    renderPanel({
+      activeSession: { ...session, agentic_tool: 'codex' },
+      onChooseAgenticTool: vi.fn(),
+    });
+    fireEvent.click(screen.getAllByRole('img', { name: 'ellipsis' })[0].closest('button')!);
+    fireEvent.click(await screen.findByText('Switch tool…'));
+    const dialog = await screen.findByRole('dialog', { name: 'Switch tool' });
+    const searchInput = screen.getByPlaceholderText('Search session...');
+
+    const { event, notCancelled } = pressFind(dialog, modifiers);
+
+    expect(notCancelled).toBe(true);
+    expect(event.defaultPrevented).toBe(false);
+    expect(getSearchRow()).toHaveStyle({ maxHeight: '0px' });
+    expect(searchInput).not.toHaveFocus();
+  });
+});
+
+describe('SessionPanel search control', () => {
+  afterEach(() => {
+    reactive.tasks = [];
+    vi.restoreAllMocks();
+  });
+
+  it('keeps session search accessible through its visible native button', async () => {
+    renderPanel();
+    const searchButton = screen.getByRole('button', { name: 'Search session' });
+    expect(searchButton.tagName).toBe('BUTTON');
+
+    searchButton.focus();
+    expect(searchButton).toHaveFocus();
+    fireEvent.click(searchButton, { detail: 0 });
+
+    expect(getSearchRow()).toHaveStyle({ maxHeight: '36px' });
+    const searchInput = screen.getByPlaceholderText('Search session...');
+    await waitFor(() => expect(searchInput).toHaveFocus());
+
+    fireEvent.keyDown(searchInput, { key: 'Escape' });
+    expect(getSearchRow()).toHaveStyle({ maxHeight: '0px' });
+  });
+
+  it('does not fetch a duplicate queue in the panel', () => {
+    const service = vi.fn(() => ({ find: vi.fn(async () => ({ data: [] })) }));
+    renderPanel({ client: { service } as unknown as AgorClient });
+    expect(service.mock.calls.flat().some((name) => String(name).includes('/tasks/queue'))).toBe(
+      false
+    );
+  });
+
+  it('takes composer slash commands and skills from the full reactive session', () => {
+    const leanRow = {
+      ...session,
+      agentic_tool: 'claude-code',
+      custom_context: { teamName: 'Backend' },
+    } as unknown as Session;
+    reactive.useSharedReactiveSession.mockReturnValue({
+      state: {
+        tasks: [],
+        session: {
+          ...leanRow,
+          custom_context: { teamName: 'Backend', slash_commands: ['/review'], skills: ['pdf'] },
+        },
+      },
+    } as never);
+    try {
+      renderPanel({ activeSession: leanRow });
+
+      expect(autocomplete.props?.slashCommands).toEqual(['/review']);
+      expect(autocomplete.props?.skills).toEqual(['pdf']);
+    } finally {
+      reactive.useSharedReactiveSession.mockImplementation(() => ({
+        state: { tasks: reactive.tasks },
+      }));
+    }
+  });
+
+  it('reads composer inventories from a full store row but never from a lean one', () => {
+    const fullRow = {
+      ...session,
+      agentic_tool: 'claude-code',
+      custom_context: { slash_commands: ['/full'], skills: ['full-skill'] },
+    } as unknown as Session;
+    // The reactive session has not loaded yet.
+    renderPanel({ activeSession: fullRow });
+    expect(autocomplete.props?.slashCommands).toEqual(['/full']);
+    expect(autocomplete.props?.skills).toEqual(['full-skill']);
+    cleanup();
+
+    // A lean row is a summary: even if it somehow still carried the keys, the
+    // composer waits for the full record instead of trusting it.
+    renderPanel({
+      activeSession: { ...fullRow, read_shape: SESSION_LIST_ROW_SHAPE } as unknown as Session,
+    });
+    expect(autocomplete.props?.slashCommands).toBeUndefined();
+    expect(autocomplete.props?.skills).toBeUndefined();
+  });
+
+  it('retains the same lean reactive-session cache key as ConversationView', () => {
+    renderPanel();
+
+    expect(reactive.useSharedReactiveSession).toHaveBeenLastCalledWith(null, session.session_id, {
+      enabled: true,
+      foreground: true,
+      reactiveOptions: { taskHydration: 'lean' },
+    });
+  });
+});
+
+describe('SessionPanel header status line', () => {
+  afterEach(() => {
+    agorStore.setState({ userById: new Map() });
+  });
+
+  it('shows sentence-case status and the creator as quiet text with a tooltip', async () => {
+    const creator = { user_id: 'user-2', name: 'Kasia', email: 'kasia@example.com' } as User;
+    agorStore.setState({ userById: new Map([[creator.user_id, creator]]) });
+    renderPanel({ activeSession: { ...session, created_by: creator.user_id } as Session });
+
+    expect(screen.getByText('Idle')).toBeInTheDocument();
+    expect(screen.queryByText(/Created by/)).toBeNull();
+    fireEvent.mouseEnter(screen.getByText('Kasia'));
+    expect(await screen.findByText('Created by Kasia')).toBeInTheDocument();
+  });
+});
+
+describe('SessionPanel historical runtime handling and terminal actions', () => {
+  afterEach(() => {
+    reactive.tasks = [];
+    vi.restoreAllMocks();
+  });
+
+  it('keeps removed-runtime history visible without a prompt composer', () => {
+    renderPanel();
+
+    expect(screen.getByText('Historical session — runtime removed')).toBeVisible();
+    expect(screen.getByText(/stored conversation remains readable/i)).toBeVisible();
+    expect(screen.queryByLabelText('Prompt')).not.toBeInTheDocument();
+    expect(screen.getByText('Session content')).toBeVisible();
+  });
+
+  it('opens branch terminals with structured branch id routing instead of raw cd input', async () => {
+    const { onOpenTerminal } = renderPanel();
+
+    fireEvent.click(screen.getByRole('img', { name: 'ellipsis' }).closest('button')!);
+    fireEvent.click(await screen.findByText('Open terminal'));
+
+    expect(onOpenTerminal).toHaveBeenCalledWith([], 'branch-1');
+    expect(onOpenTerminal.mock.calls[0][0]).not.toContain(branch.path);
+  });
+
+  it('surfaces an initial Stop request failure as retryable', async () => {
+    reactive.tasks = [
+      {
+        task_id: '018f0000-0000-7000-8000-000000000010',
+        session_id: session.session_id,
+        status: 'running',
+      } as Task,
+    ];
+    const create = vi
+      .fn()
+      .mockRejectedValue(Object.assign(new Error('database scope missing'), { code: 500 }));
+    const get = vi.fn().mockRejectedValue(new Error('task read unavailable'));
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    renderPanel({
+      client: {
+        io: stopIo(),
+        service: (path: string) =>
+          path === 'tasks'
+            ? ({ get, on: vi.fn(), off: vi.fn() } as never)
+            : ({
+                create,
+                find: vi.fn().mockResolvedValue({ data: [] }),
+                on: vi.fn(),
+                off: vi.fn(),
+              } as never),
+      } as unknown as AgorClient,
+      activeSession: { ...session, status: 'running', agentic_tool: 'codex' },
+    });
+
+    fireEvent.click(await screen.findByRole('button', { name: /stop/i }));
+
+    await waitFor(() =>
+      expect(create).toHaveBeenCalledWith({
+        expected_task_id: '018f0000-0000-7000-8000-000000000010',
+      })
+    );
+    expect(get).not.toHaveBeenCalled();
+    expect(
+      await screen.findByText("Couldn't stop the agent. (database scope missing)")
+    ).toBeVisible();
+  });
+
+  it('reports an unresolved lost Stop acknowledgement as unconfirmed, not failed', async () => {
+    const taskId = '018f0000-0000-7000-8000-000000000013';
+    reactive.tasks = [
+      { task_id: taskId, session_id: session.session_id, status: 'running' } as Task,
+    ];
+    const create = vi.fn().mockRejectedValue(new Error('socket disconnected before ack'));
+    const get = vi.fn().mockRejectedValue(new Error('task read unavailable'));
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    renderPanel({
+      client: {
+        io: stopIo(),
+        service: (path: string) =>
+          path === 'tasks'
+            ? ({ get, on: vi.fn(), off: vi.fn() } as never)
+            : ({ create, on: vi.fn(), off: vi.fn() } as never),
+      } as unknown as AgorClient,
+      activeSession: { ...session, status: 'running', agentic_tool: 'codex' },
+    });
+
+    fireEvent.click(await screen.findByRole('button', { name: /stop/i }));
+
+    expect(
+      await screen.findByText(
+        "The connection to Agor dropped before this was confirmed. If it didn't go through, try to stop the agent again once the connection is back. (The Stop acknowledgement was not received.)"
+      )
+    ).toBeVisible();
+    expect(create).toHaveBeenCalledOnce();
+    expect(screen.queryByText(/^Couldn't stop the agent\./)).not.toBeInTheDocument();
+  });
+
+  it('reconciles a committed Stop when the Socket.IO acknowledgement is lost without retrying', async () => {
+    const taskId = '018f0000-0000-7000-8000-000000000012';
+    reactive.tasks = [
+      {
+        task_id: taskId,
+        session_id: session.session_id,
+        status: 'running',
+      } as Task,
+    ];
+    const create = vi.fn().mockRejectedValue(new Error('socket disconnected before ack'));
+    const get = vi.fn().mockResolvedValue({
+      task_id: taskId,
+      session_id: session.session_id,
+      status: 'stopping',
+      termination_request: {
+        cause: 'user_stop',
+        requested_at: '2026-08-29T00:00:00.000Z',
+      },
+    } as Task);
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    renderPanel({
+      client: {
+        io: stopIo(),
+        service: (path: string) =>
+          path === 'tasks'
+            ? ({ get, on: vi.fn(), off: vi.fn() } as never)
+            : ({ create, on: vi.fn(), off: vi.fn() } as never),
+      } as unknown as AgorClient,
+      activeSession: { ...session, status: 'running', agentic_tool: 'codex' },
+    });
+
+    fireEvent.click(await screen.findByRole('button', { name: /stop/i }));
+
+    expect(
+      await screen.findByText('Stop was accepted; waiting for executor termination.')
+    ).toBeVisible();
+    expect(create).toHaveBeenCalledOnce();
+    expect(create).toHaveBeenCalledWith({ expected_task_id: taskId });
+    expect(get).toHaveBeenCalledWith(taskId);
+    expect(
+      screen.queryByText("Couldn't stop the agent. (socket disconnected before ack)")
+    ).not.toBeInTheDocument();
+  });
+
+  it('distinguishes accepted-but-pending Stop from an initial request failure', async () => {
+    reactive.tasks = [
+      {
+        task_id: '018f0000-0000-7000-8000-000000000011',
+        session_id: session.session_id,
+        status: 'running',
+      } as Task,
+    ];
+    const create = vi.fn().mockResolvedValue({
+      success: false,
+      reason: 'Waiting for the daemon that owns the local executor process handle.',
+    });
+    renderPanel({
+      client: {
+        io: stopIo(),
+        service: () => ({
+          create,
+          find: vi.fn().mockResolvedValue({ data: [] }),
+          on: vi.fn(),
+          off: vi.fn(),
+        }),
+      } as unknown as AgorClient,
+      activeSession: { ...session, status: 'running', agentic_tool: 'codex' },
+    });
+
+    fireEvent.click(await screen.findByRole('button', { name: /stop/i }));
+
+    expect(
+      await screen.findByText('Waiting for the daemon that owns the local executor process handle.')
+    ).toBeVisible();
+    expect(screen.queryByText(/^Couldn't stop the agent\./)).not.toBeInTheDocument();
+  });
+
+  it.each([
+    [
+      Object.assign(new Error('Forbidden'), { code: 403 }),
+      'You do not have permission to retry cleanup. Ask the session owner or a branch manager for help.',
+    ],
+    [
+      Object.assign(new Error('Not authenticated'), { code: 401 }),
+      'Sign in again before retrying cleanup.',
+    ],
+    [
+      new Error('socket disconnected'),
+      'We could not confirm the cleanup request. Reconnect and check the status before retrying.',
+    ],
+  ])('distinguishes cleanup rejection from transport ambiguity (%s)', async (error, message) => {
+    reactive.tasks = [
+      {
+        task_id: '018f0000-0000-7000-8000-000000000001',
+        status: 'stopping',
+        sdk_failure: { termination: 'unverified' },
+        termination_request: { cause: 'heartbeat_lost', requested_at: '2026-06-24T00:00:01.000Z' },
+      } as Task,
+    ];
+    const create = vi.fn().mockRejectedValue(error);
+    renderPanel({
+      client: {
+        io: stopIo(),
+        service: () => ({ create, on: vi.fn(), off: vi.fn() }),
+      } as unknown as AgorClient,
+      activeSession: { ...session, status: 'stopping', agentic_tool: 'codex' },
+    });
+    fireEvent.click(await screen.findByRole('button', { name: 'Try again' }));
+    expect(await screen.findByText(message as string)).toBeVisible();
+    expect(create).toHaveBeenCalledOnce();
+  });
+
+  it('surfaces errors when the branch owner reopens without confirmed cleanup', async () => {
+    reactive.tasks = [
+      {
+        task_id: '018f0000-0000-7000-8000-000000000001',
+        status: 'stopping',
+        sdk_failure: { termination: 'unverified' },
+        termination_request: {
+          cause: 'user_stop',
+          requested_at: '2026-06-24T00:00:01.000Z',
+        },
+      } as Task,
+    ];
+    const create = vi.fn().mockRejectedValue(new Error('denied'));
+    const nativePrompt = vi.spyOn(window, 'prompt');
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    renderPanel({
+      currentUserId: branch.primary_owner_user_id,
+      client: {
+        service: () => ({ create, on: vi.fn(), off: vi.fn() }),
+      } as unknown as AgorClient,
+      activeSession: { ...session, status: 'stopping', agentic_tool: 'codex' },
+    });
+
+    expect(screen.queryByRole('button', { name: 'Stop' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Try again' })).toBeEnabled();
+    fireEvent.click(await screen.findByRole('button', { name: 'Reopen anyway…' }));
+
+    const dialog = within(
+      await screen.findByRole('dialog', { name: 'Reopen without confirmed cleanup?' })
+    );
+    expect(dialog.getByText('The previous work may still be running')).toBeInTheDocument();
+    expect(dialog.getByText(/without stopping the previous work/i)).toBeInTheDocument();
+    const forceFail = dialog.getByRole('button', { name: 'Reopen anyway' });
+    expect(forceFail).toBeDisabled();
+    const confirmation = screen.getByRole('textbox', {
+      name: 'Type STOP to reopen without confirmed cleanup',
+    });
+    await waitFor(() => expect(confirmation).toHaveFocus());
+    fireEvent.change(confirmation, { target: { value: 'STOP' } });
+    expect(forceFail).toBeEnabled();
+    fireEvent.keyDown(confirmation, { key: 'Enter', code: 'Enter' });
+
+    await waitFor(() => expect(create).toHaveBeenCalledOnce());
+    expect(create).toHaveBeenCalledWith({
+      force_unverified: true,
+      confirmation: 'STOP',
+      task_id: '018f0000-0000-7000-8000-000000000001',
+      termination_requested_at: '2026-06-24T00:00:01.000Z',
+      recovery_revision: '2026-06-24T00:00:01.000Z',
+    });
+    expect(nativePrompt).not.toHaveBeenCalled();
+    expect(
+      await dialog.findByText(
+        "Couldn't reopen this session. Ask a branch owner or administrator to help. (denied)"
+      )
+    ).toBeVisible();
+  });
+});
+
+describe.each([390, 1280])('shared Stop path at %ipx', (width) => {
+  afterEach(() => {
+    reactive.tasks = [];
+    viewport.isMobile = false;
+    vi.restoreAllMocks();
+  });
+
+  it('sends the canonical task-fenced Stop once and surfaces permission denial without fallback', async () => {
+    viewport.isMobile = width < MOBILE_SHELL_MAX_WIDTH;
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const taskId = '018f0000-0000-7000-8000-000000000010';
+    reactive.tasks = [
+      { task_id: taskId, session_id: session.session_id, status: 'running' } as Task,
+    ];
+    let rejectStop!: (error: Error) => void;
+    const create = vi.fn(
+      () =>
+        new Promise<never>((_, reject) => {
+          rejectStop = reject;
+        })
+    );
+    const service = vi.fn((path: string) => ({
+      create: path === `sessions/${session.session_id}/stop` ? create : vi.fn(),
+      find: vi.fn().mockResolvedValue({ data: [] }),
+      on: vi.fn(),
+      off: vi.fn(),
+    }));
+    renderPanel({
+      client: { io: stopIo(), service } as unknown as AgorClient,
+      activeSession: { ...session, status: 'running', agentic_tool: 'codex' },
+    });
+    // Proves the width actually selected the shell, so this cannot quietly run the desktop path twice.
+    const closeLabel = viewport.isMobile ? 'Close' : 'Close panel';
+    expect(screen.getByRole('button', { name: closeLabel })).toBeInTheDocument();
+    // Label lookup avoids jsdom's CSS-variable shorthand bug in accessible-name
+    // calculation; real-browser QA covers the visible button and touch target.
+    const stop = screen.getByLabelText('Stop');
+    fireEvent.click(stop);
+    fireEvent.click(stop);
+    expect(stop).toBeDisabled();
+    expect(create).toHaveBeenCalledExactlyOnceWith({ expected_task_id: taskId });
+    expect(service).toHaveBeenCalledWith(`sessions/${session.session_id}/stop`);
+    rejectStop(Object.assign(new Error('Not allowed to stop this session'), { code: 403 }));
+    await screen.findByText(
+      "Couldn't stop the agent. You don't have permission to do this. (Not allowed to stop this session)"
+    );
+    expect(create).toHaveBeenCalledOnce();
+    await waitFor(() => expect(stop).toBeEnabled());
+  });
+});
+
+describe('SessionPanel mobile header', () => {
+  afterEach(() => {
+    viewport.isMobile = false;
+    reactive.tasks = [];
+    vi.restoreAllMocks();
+  });
+
+  it('shows a leading Close (X) and no far-right Back on the mobile shell', () => {
+    viewport.isMobile = true;
+    const { onClose } = renderPanel();
+
+    // Leading close uses the "Close" label; the old right-side "Back" is gone.
+    const close = screen.getByRole('button', { name: 'Close' });
+    expect(close).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Back' })).not.toBeInTheDocument();
+    // Desktop's trailing "Close panel" is not rendered on mobile.
+    expect(screen.queryByRole('button', { name: 'Close panel' })).not.toBeInTheDocument();
+
+    // The X is the leading control (before Search / More actions in DOM order).
+    const search = screen.getByRole('button', { name: 'Search session' });
+    expect(close.compareDocumentPosition(search) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+
+    fireEvent.click(close);
+    expect(onClose).toHaveBeenCalled();
+  });
+
+  it('keeps the desktop trailing Close panel and no leading Close', () => {
+    viewport.isMobile = false;
+    renderPanel();
+    expect(screen.getByRole('button', { name: 'Close panel' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Close' })).not.toBeInTheDocument();
+  });
+});
+
+describe('SessionPanel archive feedback', () => {
+  afterEach(() => {
+    setRealtimeAuthorityScope(null);
+    agorStore.getState().reset();
+    vi.restoreAllMocks();
+  });
+
+  it.each(['read-failure', 'mutation-failure', 'confirmed'] as const)(
+    'renders the correct archive outcome for %s',
+    async (outcome) => {
+      setRealtimeAuthorityScope('tenant-a:user-a:1');
+      agorStore.getState().applyMaps((prev) => ({ ...prev, ...buildSessionMaps([session]) }));
+      const archived = { ...session, archived: true };
+      const create = vi.fn(async () => {
+        if (outcome === 'mutation-failure') throw new Error('Archive denied');
+        return { session: archived };
+      });
+      const get = vi.fn(async () => {
+        if (outcome === 'read-failure') throw new Error('Read unavailable');
+        return archived;
+      });
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+      const client = {
+        service: (name: string) => {
+          if (name === `sessions/${session.session_id}/archive`) return { create };
+          if (name === 'sessions') return { get };
+          if (name === 'tasks') return { on: vi.fn(), off: vi.fn() };
+          if (name.endsWith('/tasks/queue')) return { find: async () => ({ data: [] }) };
+          throw new Error(`Unexpected service: ${name}`);
+        },
+      } as unknown as AgorClient;
+      const { onClose } = renderPanel({ client });
+      fireEvent.click(screen.getByRole('button', { name: 'More actions' }));
+      fireEvent.click(await screen.findByRole('menuitem', { name: /Archive session/ }));
+      fireEvent.click(await screen.findByRole('button', { name: 'Archive', exact: true }));
+      const expected =
+        outcome === 'read-failure'
+          ? 'Session and its subsessions archived. Refresh to update the list.'
+          : outcome === 'mutation-failure'
+            ? "Couldn't archive the session. (Archive denied)"
+            : 'Session archived.';
+      expect(await screen.findByText(expected)).toBeVisible();
+      expect(create).toHaveBeenCalledTimes(1);
+      expect(get).toHaveBeenCalledTimes(outcome === 'mutation-failure' ? 0 : 1);
+      if (outcome === 'confirmed') expect(onClose).toHaveBeenCalledTimes(1);
+      else expect(onClose).not.toHaveBeenCalled();
+      if (outcome === 'read-failure') {
+        expect(screen.queryByText(/^Couldn't archive the session\./)).not.toBeInTheDocument();
+        expect(screen.queryByText('Session archived.')).not.toBeInTheDocument();
+        expect(agorStore.getState().sessionById.get(session.session_id)).toEqual(session);
+      }
+    }
+  );
+});

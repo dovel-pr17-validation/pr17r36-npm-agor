@@ -1,0 +1,262 @@
+---
+title: TypeScript Client
+description: Drive Agor from TypeScript or JavaScript with @agor-live/client, the same fully-typed client Agor's UI uses, including REST, real-time Socket.IO, and a reactive session API.
+---
+
+# TypeScript Client
+
+If you're scripting Agor from Node, building a custom dashboard, wiring it into a CI workflow, or embedding live session views in your own app, **`@agor-live/client` is the way**. It's the same fully-typed client the Agor UI consumes internally, so it stays in lockstep with the daemon API and ships first-class types for every service, model, and event.
+
+**Two doorways into Agor (same daemon, two audiences):**
+
+- **Inside agents** (Claude Code, Codex, Gemini), the [Agor MCP Server](/guide/internal-mcp) gives sessions self-aware orchestration.
+- **Outside agents** (TS/JS apps, scripts, services), `@agor-live/client` gives humans and services the same API.
+
+Use whichever side of the fence you're on.
+
+## Install
+
+```bash
+npm install @agor-live/client
+# or
+pnpm add @agor-live/client
+```
+
+Requires Node ≥ 22.12 (or any modern browser). ESM and CJS builds are both included; TypeScript types are first-class.
+
+## Quickstart (REST)
+
+For one-off scripts, automation, or anywhere you don't need real-time updates:
+
+```ts
+import { createRestClient, getApiKeyFromEnv } from '@agor-live/client';
+
+const apiKey = getApiKeyFromEnv() ?? 'agor_sk_…'; // from User Settings → Personal API Keys
+const client = await createRestClient('http://localhost:3030', apiKey);
+
+const branches = await client.service('branches').find({ query: { $limit: 50 } });
+const session = await client.service('sessions').create({
+  branch_id: branches.data[0].branch_id,
+  agentic_tool: 'claude-code',
+  initial_prompt: 'Run the test suite and summarize the output.',
+});
+
+console.log(`Session ${session.session_id} started`);
+```
+
+REST clients exit cleanly without keeping a socket open. Perfect for CLI tools and short-lived scripts.
+
+### Bounded session lists without totals
+
+For a recent-session slice, `sessions.find` accepts `$count: false` to skip the
+exact count and return a bounded array rather than `{ data, total, limit, skip }`:
+
+```ts
+const recent = await client.service('sessions').find({
+  query: { archived: false, $sort: { updated_at: -1 }, $limit: 50, $count: false },
+});
+```
+
+The default remains exact-count pagination. No-count requests still enforce the
+server's default/max page size and preserve authorization. `$limit: 0` returns an
+empty array without counting. This option supports the SQL list filters
+`archived`, `status`, `board_id`, and `branch_id` (a string or `$in` list), sorting
+by `updated_at` or `created_at`, and non-negative integer `$limit`/`$skip`.
+Other query shapes are rejected when `$count` is supplied. Use this with `find`,
+not `findAll`: an array has no continuation metadata and represents only one slice.
+
+### Lean session list rows
+
+Session rows carry a few large, single-session `custom_context` values. A list that
+does not need them can ask for lean rows:
+
+```ts
+import { isSessionListRow } from '@agor-live/client';
+
+const result = await client.service('sessions').find({
+  query: { archived: false, $sort: { updated_at: -1 }, $limit: 50, lean: true },
+});
+// `find` returns a page ({ data, total, ... }) or, without pagination, an array.
+const rows = Array.isArray(result) ? result : result.data;
+for (const row of rows) {
+  if (isSessionListRow(row)) {
+    // read_shape === 'session-list-v1': scheduled_run, slash_commands and
+    // skills are withheld here, not absent. Use sessions.get(row.session_id).
+  }
+}
+```
+
+`lean: true` works with any `sessions.find` query. It can only remove data, never
+add it. It does not change which sessions you can see, and it does not change
+filtering or pagination. On each row it:
+
+- **withholds** `custom_context.scheduled_run` (the scheduler's run snapshot) and
+  `custom_context.slash_commands` / `custom_context.skills` (the agent SDK's command and
+  skill lists). The rest of `custom_context`, such as `gateway_source` or your own
+  template fields, is kept.
+- **marks** the row with `read_shape: 'session-list-v1'`. The mark is there even when
+  the session never had those keys, so "withheld" and "absent" can't be confused.
+  Full records never carry it, and only the server sets it: `create`, `patch`, and
+  `update` reject a `read_shape` field with 400.
+
+Use `isSessionListRow(row)` / `hasFullSessionDetails(row)` (types: `SessionListRow`)
+before trusting a missing withheld key. To get the complete record, call
+`client.service('sessions').get(id)`: `get` always returns the full session, and so do a
+`find` without `lean` and realtime `created`/`patched` events. Patch with
+`custom_context` only when you mean to change it. Do not send back the trimmed
+context from a lean row.
+
+The MCP tool `agor_sessions_list` also takes a `lean` flag, but it is a **different,
+smaller format** for agents. It returns a short fixed set of fields (by default,
+`lean: true`), drops `custom_context` completely, and has no `read_shape` mark. Do not
+treat one format as the other. Agents should use `agor_sessions_get` for full details.
+
+### Driving the executor without MCP
+
+Two equivalent ways to send work to a session. Pick whichever fits your harness:
+
+```ts
+// One-shot: create the task and start execution in a single call.
+await client.sessions.prompt(session.session_id, 'Run the tests and summarize.', {
+  stream: true,
+});
+
+// Or do it in two steps if your orchestrator wants the task_id up-front.
+const task = await client.service('tasks').create({
+  session_id: session.session_id,
+  full_prompt: 'Run the tests and summarize.',
+  status: 'created',
+});
+await client.tasks.run(task.task_id, { stream: true });
+```
+
+`client.tasks.run()` calls `POST /tasks/:id/run`, the explicit "fire this task now" trigger. It accepts `created` tasks on idle sessions; `queued` tasks drain automatically in order, and busy sessions should be prompted via `client.sessions.prompt()` (which queues atomically).
+Both authenticated forms are classified server-side as direct human prompts;
+clients cannot select provider trust metadata themselves.
+
+## Quickstart (Real-time)
+
+For UIs, live dashboards, or anything that needs to react to session events as they fire:
+
+```ts
+import { createClient, createRestClient } from '@agor-live/client';
+
+const url = 'http://localhost:3030';
+const loginClient = await createRestClient(url);
+const { accessToken } = await loginClient.authenticate({
+  strategy: 'local',
+  email: 'you@example.com',
+  password: '…',
+});
+
+const client = createClient(url, true, {
+  socketAuthentication: { accessToken },
+});
+
+client.service('messages').on('created', msg => {
+  console.log('[message]', msg.session_id, msg.role, msg.content?.slice(0, 80));
+});
+
+client.service('sessions').on('patched', session => {
+  console.log('[session]', session.session_id, session.status);
+});
+```
+
+`createClient()` returns a Socket.IO-backed Feathers client with full event subscriptions: `created`, `patched`, `removed` per service, plus the streaming events that power live agent transcripts. The daemon verifies the bearer during every Socket.IO handshake, before the connection can call a service or receive events. Do not call `client.authenticate()` to replace identity on a live socket.
+
+## Reactive Sessions (the cool part)
+
+The headline feature: a **reactive session handle** that mirrors the entire UI state surface for one session (tasks, messages, queued prompts, streaming chunks, tool executions) and notifies you on every change. Same primitive that powers the Agor UI's session panel.
+
+```ts
+import { createClient, retainReactiveSession } from '@agor-live/client';
+
+const client = createClient('http://localhost:3030', true, {
+  socketAuthentication: { accessToken: '…' },
+});
+
+const handle = retainReactiveSession(client, sessionId, { taskHydration: 'lazy' });
+await handle.ready();
+
+const unsubscribe = handle.subscribe(() => {
+  const { tasks, messagesByTask, streamingMessages, queuedTasks, connected } = handle.state;
+  // Re-render whatever you're driving — React, Vue, plain DOM, terminal UI, etc.
+});
+
+await handle.prompt('Now write a follow-up summary in 3 bullet points.');
+
+// When you're done:
+unsubscribe();
+handle.release();
+```
+
+What you get on `handle.state`:
+
+| Field                                           | Description                                                                     |
+| ----------------------------------------------- | ------------------------------------------------------------------------------- |
+| `session`                                       | The full `Session` model (status, current task, agent config, …)                |
+| `tasks`                                         | All tasks for this session, ordered                                             |
+| `messagesByTask`                                | `Map<taskId, Message[]>`, hydrated lazily or eagerly per `taskHydration` option |
+| `queuedTasks`                                   | Tasks queued but not yet running, ordered by `queue_position`                   |
+| `streamingMessages`                             | In-flight assistant messages with live `content` + `thinkingContent`            |
+| `toolsByTask`                                   | Tool executions per task, with `executing` / `complete` status                  |
+| `connected`, `loading`, `error`, `lastSyncedAt` | Connection + sync metadata                                                      |
+
+`retainReactiveSession()` is reference-counted. Multiple subscribers on the same session ID share one handle and one set of socket listeners. Call `release()` when you're done; the handle tears itself down when the last consumer releases.
+
+This is what you'd reach for if you wanted to:
+
+- Build a custom session viewer in your own React/Vue/Svelte app
+- Mirror Agor sessions into a Slack or terminal UI
+- Pipe live tool calls into your own observability stack
+- Embed an Agor session widget in an internal portal
+
+## Authentication
+
+| Strategy    | When to use                   | How                                                                                                   |
+| ----------- | ----------------------------- | ----------------------------------------------------------------------------------------------------- |
+| **API Key** | Scripts, services, CI         | Pass to `createRestClient(url, apiKey)`, or set `AGOR_API_KEY=agor_sk_…` and use `getApiKeyFromEnv()` |
+| **JWT**     | Browser apps after REST login | Pass `socketAuthentication: { accessToken }` to `createClient()`                                      |
+
+Authentication is required on every endpoint. There is no anonymous strategy.
+
+For long-lived browser clients, `accessToken` may be a getter. Update the value
+after refresh. Keep a healthy socket connected so terminals and subscriptions
+are not interrupted; Socket.IO's next normal transport reconnect reads the
+latest value:
+
+```ts
+let currentAccessToken = accessToken;
+const client = createClient(url, true, {
+  socketAuthentication: { accessToken: () => currentAccessToken },
+});
+
+currentAccessToken = refreshed.accessToken;
+```
+
+Issue API keys from **User Settings → Personal API Keys**. Keys are scoped to your user. Every action runs under your identity, billing, env vars, and MCP OAuth grants.
+
+## What's in the surface
+
+Service types are exported and fully typed, including `client.service('sessions')`, `client.service('branches')`, `client.service('boards')`, `client.service('messages')`, `client.service('tasks')`, `client.service('repos')`, `client.service('users')`, and the rest. Every model lives in `@agor/core/types` (re-exported from `@agor-live/client`), so `Session`, `Branch`, `Task`, `Message`, `Board`, etc. are available without round-tripping through `any`.
+
+Helpers worth knowing:
+
+- `isDaemonRunning(url)` runs a health check before connecting
+- `getApiKeyFromEnv()` pulls `AGOR_API_KEY` from the environment
+- `shortId(id)` renders the canonical short form Agor uses everywhere (URLs, pills, logs, notifications)
+
+## When to reach for which client
+
+| You are…                            | Use…                                                                        |
+| ----------------------------------- | --------------------------------------------------------------------------- |
+| An agent running inside a session   | [Agor MCP Server](/guide/internal-mcp) (already injected)                   |
+| A Node script poking at the daemon  | `createRestClient()`                                                        |
+| A live dashboard or custom UI       | `createClient()` + reactive sessions                                        |
+| A long-lived service routing events | `createClient()` with service `.on('created' \| 'patched' \| 'removed', …)` |
+
+## Related
+
+- [Agor MCP Server](/guide/internal-mcp) (the agent-facing companion to this client)
+- [Architecture](/guide/architecture) (how services, sockets, and the daemon fit together)
+- [Sessions & Trees](/guide/sessions) (the data model the client surfaces)

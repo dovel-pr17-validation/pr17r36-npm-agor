@@ -1,0 +1,119 @@
+agentic_tools:
+  # This disposable validation stack deliberately opts into native Claude
+  # subscription OAuth. Production remains default-off unless an operator
+  # makes the same explicit release decision.
+  claude_subscription_oauth: true
+  # Headless/container deployments must declare their managed integrations.
+  # The Compose preparation job reconciles this exact list before either
+  # daemon starts, into the shared /home/agor/.agor volume.
+  installed:
+    - claude-code
+    - codex
+    - copilot
+    - gemini
+    - opencode
+    - cursor
+deployment:
+  mode: ha
+  ha:
+    # Explicit constrained active-active profile. Durable PostgreSQL workers,
+    # noninteractive Tasks, and audited gateway providers are enabled; the
+    # process-affine surfaces documented in the HA guide still fail closed.
+    support_profile: constrained-active-active
+    # This one-host smoke stack runs executors beside either daemon. Cloud
+    # should select `external` and configure executor_command_template instead.
+    execution_topology: shared-local
+    shared_filesystem: true
+    ingress_affinity: true
+execution:
+  # These are assertions about the named shared home and nested Agor workspace
+  # volumes mounted at the same paths on both daemons. They do not configure mounts.
+  executor_storage:
+    # The nested Agor volume contains the tenant/user-keyed sandbox home stores
+    # at the same path on both replicas. Device completion and later Codex Tasks
+    # therefore resolve the same exact user's `.codex/auth.json` without
+    # sharing a credential directory across development tenants.
+    user_home: persistent-per-user
+    # Docker's same-host named volume propagates kernel flock between these
+    # replicas. Multi-host operators must verify this for their storage.
+    #
+    # If execution.sandbox.sdk_home_mode is set to per_branch, the tenant data
+    # root's branch-homes/<branch-id>/ tree needs this SAME shared-storage +
+    # cross-replica-flock guarantee: a branch-scoped Session dispatched to
+    # either replica must see what the other wrote. Local Codex subscription
+    # auth remains caller-scoped: the dispatching replica pins that caller's
+    # persistent auth.json and overlays it only in that executor's sandbox.
+    # There is no separate executor_storage key for branch homes — keep them on
+    # the same backing store as the nested Agor volume, at the same absolute
+    # path on both replicas. (Left at the inherit default here.)
+    user_home_locking: cross-replica-flock
+    branch_workspace: shared
+    base_repository: shared
+  # Auth-resolved tenants cannot share native worktree metadata. Keep branch
+  # creation clone-only, including callers (such as onboarding) that omit an
+  # explicit storage mode and rely on the daemon-owned default.
+  branch_storage:
+    default_mode: clone
+    allowed_modes:
+      - clone
+  # The checked-in HA smoke must exercise the same exact-user credential route
+  # it advertises. Sandbox mode adds per-user home overlays and
+  # fail-closed bubblewrap isolation; it does not impersonate host accounts.
+  unix_user_mode: sandbox
+  sandbox:
+    # These explicit values are also the concrete Claude runtime credential
+    # containment predicate: bubblewrap makes the real .claude parent an
+    # immutable mountpoint and masks the credential plus both authority sidecars.
+    enabled: true
+    home_mode: per_user
+  # PTY transport is replica-local and ephemeral. Sticky Socket.IO keeps the
+  # create/control connection on its owner; owner loss is a visible disconnect
+  # and reconnect creates a new attachment (possibly reattaching local Zellij).
+  allow_web_terminal: true
+  # Local managed-environment commands are process/host-affine. HA accepts
+  # only an external webhook execution substrate in this first topology. The
+  # legacy unfenced environment HealthMonitor is also disabled in HA.
+  managed_envs_execution_mode: webhook-only
+database:
+  dialect: postgresql
+multi_tenancy:
+  # The Compose-only dev launcher returns a signed tenant_id assertion. Agor
+  # copies that verified claim into its own access/refresh tokens; browser
+  # query parameters, headers, and Socket.IO payloads never select the tenant.
+  mode: required_from_auth
+  auth_claim: tenant_id
+  filesystem_isolation_enabled: true
+identity:
+  # Every fixed HA persona is projected on first login. There is deliberately
+  # no password login in this disposable environment.
+  user_lifecycle: external
+  role_authority: claims
+  local_auth: disabled
+  external:
+    provider: external_launch
+    provisioning: jit
+external_launch:
+  enabled: true
+  exchange_url: http://dev-launcher:4000/exchange
+  issuer: http://dev-launcher:4000
+  audience: agor-runtime:ha-dev
+  instance_id: agor-ha-dev
+  provider_id: agor-ha-dev-launcher
+  dev_shared_secret_env: AGOR_EXTERNAL_LAUNCH_SHARED_SECRET
+  allow_admin_roles: true
+  # Production-shaped like Agor Cloud Cells: the ingress (docker/ha/nginx.conf)
+  # overwrites Host with the exact browser host:port, and the daemon trusts it.
+  # Launch forwards it as request_host, and personal API keys are routed to the
+  # tenant whose launch-observed public URL owns that host.
+  forward_request_host: true
+  trusted_host_header: host
+  # Materialized by docker/ha/docker-entrypoint.sh from the branch-specific
+  # public ingress origin. The launcher itself remains outside the product UI.
+  login_redirect_url: __AGOR_HA_PUBLIC_ORIGIN__/dev-auth/
+daemon:
+  # Stable identity shared by both replicas in the checked-in disposable
+  # Compose deployment. Production deployments must supply their own UUID.
+  deployment_id: 019c83b2-1f53-7e51-8e04-1f2df20d25de
+  host: 0.0.0.0
+  port: 3030
+  trust_proxy_hops: 1

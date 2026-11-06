@@ -1,0 +1,1035 @@
+// src/types/session.ts
+
+/**
+ * Effort level controls how much reasoning a supported agent applies.
+ * Runtime adapters map this shared value to their native effort option.
+ */
+export type EffortLevel = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+
+import type {
+  AgenticToolName,
+  ClaudeCodePermissionMode,
+  CodexApprovalPolicy,
+  CodexPermissionMode,
+  CodexSandboxMode,
+  CursorPermissionMode,
+  GeminiPermissionMode,
+  OpenCodePermissionMode,
+  PersistedAgenticToolName,
+} from './agentic-tool';
+import type { AgenticToolConfigurationReference } from './agentic-tool-preset';
+import type { ContextFilePath } from './context';
+import type { ChannelType } from './gateway';
+import type { BoardID, BranchID, SessionID, SessionRelationshipID, TaskID, UserID } from './id';
+import type { ScheduleID } from './schedule';
+import type { TaskStatus, TerminationCoordinationPendingCode } from './task';
+
+export const SessionStatus = {
+  IDLE: 'idle',
+  RUNNING: 'running',
+  STOPPING: 'stopping', // Stop requested, waiting for task to stop
+  AWAITING_PERMISSION: 'awaiting_permission',
+  AWAITING_INPUT: 'awaiting_input', // Legacy / pre-#1177: AskUserQuestion was disallowed at the SDK; new sessions never enter this state, kept for historical rows
+  TIMED_OUT: 'timed_out', // Permission/input request timed out, executor exited — user must re-prompt
+  COMPLETED: 'completed',
+  FAILED: 'failed',
+} as const;
+
+export type SessionStatus = (typeof SessionStatus)[keyof typeof SessionStatus];
+
+/** Durable outcome reported by the authenticated Session Stop endpoint. */
+export const SESSION_STOP_OUTCOMES = [
+  'stopped',
+  'already_idle',
+  'pending',
+  'unverified',
+  'condition_changed',
+  'not_stoppable',
+  'force_failed',
+] as const;
+
+export type SessionStopOutcome = (typeof SESSION_STOP_OUTCOMES)[number];
+
+/** Authenticated Session Stop endpoint request. */
+export type SessionStopRequest =
+  | {
+      retry_cleanup: true;
+      expected_task_id: TaskID;
+      termination_requested_at: string;
+      recovery_revision: string;
+      force_unverified?: false;
+    }
+  | {
+      force_unverified?: false;
+      reason?: string;
+      expected_task_id?: TaskID;
+      task_id?: never;
+      termination_requested_at?: never;
+      confirmation?: never;
+    }
+  | {
+      force_unverified: true;
+      recovery_revision?: string;
+      task_id: TaskID;
+      termination_requested_at: string;
+      confirmation: string;
+      reason?: never;
+      expected_task_id?: never;
+    };
+
+interface SessionStopResultBase {
+  reason?: string;
+  stoppedTaskId?: TaskID;
+  queuedTasksPreserved?: number;
+}
+
+/** Result returned by the authenticated Session Stop endpoint. */
+export type SessionStopResult =
+  | (SessionStopResultBase & {
+      success: true;
+      outcome: 'stopped' | 'already_idle';
+      status: typeof SessionStatus.IDLE;
+    })
+  | (SessionStopResultBase & {
+      /** The Stop claim is durable; a different HA coordination step owns containment. */
+      success: false;
+      outcome: 'pending';
+      status: typeof SessionStatus.STOPPING;
+      reason: string;
+      stoppedTaskId: TaskID;
+      pendingCode: TerminationCoordinationPendingCode;
+    })
+  | (SessionStopResultBase & {
+      success: false;
+      outcome: 'unverified';
+      status: typeof SessionStatus.STOPPING;
+      reason: string;
+      stoppedTaskId: TaskID;
+    })
+  | (SessionStopResultBase & {
+      success: false;
+      outcome: 'condition_changed' | 'not_stoppable';
+      status?: SessionStatus;
+      reason: string;
+    })
+  | {
+      /** Explicit owner/admin recovery; does not prove executor containment. */
+      success: true;
+      outcome: 'force_failed';
+      status: typeof TaskStatus.FAILED;
+      stoppedTaskId: TaskID;
+    };
+
+/**
+ * Permission mode controls how agentic tools handle execution approvals
+ *
+ * This is a union of all native SDK permission modes. Each agent uses its own
+ * subset - no mapping/translation needed at the executor level.
+ *
+ * Claude Code modes (Claude Agent SDK):
+ * - default: Prompt for each tool use (most restrictive)
+ * - acceptEdits: Auto-accept file edits, ask for other tools (recommended)
+ * - bypassPermissions: Allow all operations without prompting
+ * - plan: Plan mode (generate plan without executing)
+ * - auto: Model classifier approves/denies prompts; unresolved ones fall through to Agor's UI
+ * - dontAsk: Legacy mode for backward compatibility
+ *
+ * Gemini modes (Gemini CLI SDK - ApprovalMode):
+ * - default: Prompt for each tool use (ApprovalMode.DEFAULT)
+ * - autoEdit: Auto-approve file edits only (ApprovalMode.AUTO_EDIT)
+ * - yolo: Auto-approve all operations (ApprovalMode.YOLO)
+ *
+ * Codex modes (OpenAI Codex SDK):
+ * - ask: Require approval for every tool use (read-only/suggest mode)
+ * - auto: Auto-approve safe operations, ask for dangerous ones (auto-edit mode)
+ * - on-failure: Auto-approve all, ask only when commands fail
+ * - allow-all: Auto-approve all operations (full-auto mode)
+ */
+export type PermissionMode =
+  // Claude Code native modes
+  | 'default'
+  | 'acceptEdits'
+  | 'bypassPermissions'
+  | 'plan'
+  | 'dontAsk'
+  // Gemini native modes
+  | 'autoEdit'
+  | 'yolo'
+  // Codex native modes
+  | 'ask'
+  | 'auto'
+  | 'on-failure'
+  | 'allow-all';
+
+// Re-export permission types from agentic-tool for convenience
+export type {
+  ClaudeCodePermissionMode,
+  CodexApprovalPolicy,
+  CodexPermissionMode,
+  CodexSandboxMode,
+  CursorPermissionMode,
+  GeminiPermissionMode,
+  OpenCodePermissionMode,
+};
+
+/**
+ * Get the default permission mode for a given agentic tool
+ *
+ * Per tool:
+ * - Claude Code: 'auto' — the SDK's model classifier approves/denies each
+ *   permission prompt; anything it doesn't confidently auto-resolve still
+ *   falls through to Agor's permission UI via the executor's canUseTool hook
+ *   (see sdk-handlers/base/permission-hooks.ts). MCP tool calls
+ *   for the built-in `agor` server and any attached MCP servers are
+ *   auto-approved by that same hook, so MCP-heavy sessions don't
+ *   death-by-modal. Users can flip a running session to `acceptEdits` or
+ *   `bypassPermissions` mid-flight from the session UI.
+ * - Codex: 'allow-all' — maps to sandbox `workspace-write` + approval
+ *   `never` + network-on. Codex's MCP auto-approve is wired through
+ *   `default_tools_approval_mode = "approve"` on each server config
+ *   (see prompt-service.ts buildMcpServersConfig), so Agor self-calls
+ *   don't get silently cancelled by the elicitation prompt. Workspace
+ *   sandbox still constrains shell exec.
+ * - Gemini: 'autoEdit' (unchanged — pending separate audit)
+ * - OpenCode: 'autoEdit' (unchanged — pending separate audit)
+ * - Cursor: 'bypassPermissions' — scaffolded as autonomous until the SDK
+ *   exposes/Agor wires a permission callback.
+ *
+ * Users / parent sessions / per-session overrides still trump these
+ * defaults via resolvePermissionConfig.
+ */
+export function getDefaultPermissionMode(agenticTool: AgenticToolName): PermissionMode {
+  switch (agenticTool) {
+    case 'gemini':
+      return 'autoEdit'; // Native Gemini SDK mode
+    case 'codex':
+      return 'allow-all'; // Maps to Codex sandbox=workspace-write + approval=never
+    case 'opencode':
+      return 'autoEdit'; // OpenCode auto-approves, similar to Gemini
+    case 'copilot':
+      return 'acceptEdits'; // Copilot uses same semantics as Claude Code
+    case 'cursor':
+      return 'bypassPermissions'; // Cursor SDK is experimental/autonomous until permission callbacks exist
+    default:
+      return 'auto'; // Claude Code: model-classifier permissions
+  }
+}
+
+/**
+ * Durable SDK-state boundary for a session.
+ *
+ * This is stamped once when the session is created. It is deliberately not
+ * derived from the branch or the live deployment flag at prompt time: doing
+ * so would silently move a resumable SDK conversation between homes after an
+ * upgrade or configuration change.
+ */
+export const SESSION_SDK_HOME_SCOPES = ['execution_home', 'branch'] as const;
+export type SessionSdkHomeScope = (typeof SESSION_SDK_HOME_SCOPES)[number];
+
+export interface SessionUsageSummary {
+  total: number;
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheCreation: number;
+  cost: number;
+}
+
+export interface Session {
+  /** Create-response-only warning count; not persisted. No server identity is disclosed. */
+  mcp_defaults_skipped?: number;
+
+  /** Read-only, opt-in aggregate over all tasks, independent of transcript paging. */
+  usage_summary?: SessionUsageSummary;
+
+  /**
+   * Read-only, opt-in (`include_tasks_complete` on get): `tasks` lists every
+   * dispatched Task of this Session, once each, in dispatch order. False for a
+   * legacy row whose list lost or misnames Tasks; absent from older daemons.
+   */
+  tasks_complete?: boolean;
+
+  /** Unique session identifier (UUIDv7) */
+  session_id: SessionID;
+
+  /** Which agentic coding tool is running this session (Claude Code, Codex, Gemini) */
+  agentic_tool: PersistedAgenticToolName;
+  /** Live tenant preset reference. When set, atomic runtime fields are read-only. */
+  agentic_tool_preset_id?: import('./agentic-tool-preset').AgenticToolPresetID | null;
+  /** Agentic tool/CLI version */
+  agentic_tool_version?: string;
+  /** SDK session ID for maintaining conversation history (Claude Agent SDK, Codex SDK, etc.) */
+  sdk_session_id?: string;
+  /** MCP authentication token for Agor self-access */
+  mcp_token?: string;
+  /** Server-owned: a complete MCP selection was supplied, including an empty set. */
+  mcp_selection_explicit?: boolean;
+  status: SessionStatus;
+  created_at: string;
+  last_updated: string;
+
+  /** User ID of the user who created this session */
+  created_by: string;
+
+  /**
+   * Immutable execution-home key for this session.
+   *
+   * Set once at session creation time from the creator's unix_username.
+   * IMMUTABLE - never changes, even if the user's unix_username changes.
+   *
+   * Why immutable?
+   * - SDK sessions (Claude Code, Codex) store data in user home directories
+   * - Changing it would break access to existing SDK session state
+   * - If the delegated home key changes or disappears, resumable state may be unreachable
+   *
+   * Before prompting an execution-home Session, the creator's current key is
+   * checked against the stamp. Branch-home Sessions execute as the current
+   * prompt actor and do not consult this historical compatibility key.
+   */
+  unix_username: string | null;
+
+  /**
+   * Immutable owner of this session's resumable SDK/config state.
+   *
+   * `execution_home` preserves the historical behavior: the session resumes
+   * from the execution home stamped by `unix_username`. `branch` uses the
+   * branch-owned SDK home and the current prompt actor's execution identity.
+   * Existing rows are backfilled to `execution_home`; only newly admitted
+   * sessions may opt into `branch`.
+   */
+  sdk_home_scope: SessionSdkHomeScope;
+
+  /** Branch ID - all sessions must be associated with an Agor-managed branch */
+  branch_id: BranchID;
+
+  /**
+   * Board ID from the session's branch (populated via LEFT JOIN)
+   *
+   * This is a computed property populated by the repository layer when fetching sessions.
+   * It avoids N+1 queries by joining with the branches table.
+   * Null if the branch is not placed on any board.
+   */
+  branch_board_id?: BoardID | null;
+
+  /**
+   * External/user-facing URL for viewing this session in the UI.
+   *
+   * Computed property added by the repository layer.
+   * Format: `{baseUrl}/ui/s/{sessionShortId}/`
+   * Visiting the URL resolves the session, switches to its branch's
+   * board, and opens the conversation panel. Always present when the
+   * repo computes it (baseUrl available); board lookup happens at
+   * click time, so we don't need to know about the board to mint the
+   * URL.
+   */
+  url: string | null;
+
+  // Context (context file paths relative to context/)
+  contextFiles: ContextFilePath[];
+
+  // Genealogy
+  genealogy: {
+    /** Session this was forked from (sibling relationship) */
+    forked_from_session_id?: SessionID;
+    /** Task where fork occurred */
+    fork_point_task_id?: TaskID;
+    /** Message index where fork occurred (count of parent's messages at fork time) */
+    fork_point_message_index?: number;
+    /** Parent session that spawned this one (child relationship) */
+    parent_session_id?: SessionID;
+    /** Task where spawn occurred */
+    spawn_point_task_id?: TaskID;
+    /** Message index where spawn occurred (count of parent's messages at spawn time) */
+    spawn_point_message_index?: number;
+    /** Child sessions spawned from this session */
+    children: SessionID[];
+  };
+
+  // Tasks
+  /** Task IDs in this session */
+  tasks: TaskID[];
+
+  // UI metadata
+  /** Session title (user-provided or auto-generated) */
+  title?: string;
+  /** Session description (legacy field, may contain first prompt) */
+  description?: string;
+
+  // Permission config (session-level permission settings)
+  permission_config?: {
+    /** Permission mode for agent tool execution (Claude/Gemini unified mode)
+     *  Tool-level permissions are handled by SDK via settings.json files */
+    mode?: PermissionMode;
+    /** Codex-specific runtime settings (sandbox, approvals, network and native plugins). */
+    codex?: {
+      /** Sandbox mode controls WHERE Codex can write (filesystem boundaries) */
+      sandboxMode: CodexSandboxMode;
+      /** Approval policy controls WHETHER Codex asks before executing */
+      approvalPolicy: CodexApprovalPolicy;
+      /** Network access controls whether outbound HTTP/HTTPS requests are allowed (workspace-write only) */
+      networkAccess?: boolean;
+      /** Allow native plugins; false/omitted vetoes loading, true respects native settings. */
+      includePlugins?: boolean;
+    };
+  } | null;
+
+  // Model configuration (session-level model selection)
+  model_config?: {
+    /** Model selection mode: alias (e.g., 'claude-sonnet-4-5-latest') or exact (e.g., 'claude-sonnet-4-5-20250929') */
+    mode: 'alias' | 'exact';
+    /** Model identifier (alias or exact ID) */
+    model: string;
+    /** When this config was last updated */
+    updated_at: string;
+    /** Optional user notes about why this model was selected */
+    notes?: string;
+    /** Optional session override for reasoning depth; unset delegates to the runtime default. */
+    effort?: EffortLevel;
+    /** Claude Code advisor model (e.g., 'opus', 'sonnet', 'fable'); unset means no session override */
+    advisorModel?: string;
+    /**
+     * Provider ID for OpenCode sessions (e.g., 'openai', 'anthropic', 'opencode')
+     * Used in combination with model to specify which provider's API to use
+     * Only applicable when agentic_tool='opencode'
+     */
+    provider?: string;
+  } | null;
+
+  /**
+   * Read-only metadata left by the removed Claude Code CLI adapter.
+   *
+   * Kept in the wire type so historical rows remain inspectable. No runtime
+   * reads or mutates this state.
+   */
+  cli_state?: {
+    /** Bytes consumed from the historical transcript. */
+    watcher_offset?: number;
+    /** ISO 8601 of the most recent processed transcript line. */
+    last_event_ts?: string;
+    /** `uuid` of the most recent processed transcript line. */
+    last_event_uuid?: string;
+    /** Former transcript directory slug. */
+    slug?: string;
+    /** Former absolute transcript path. */
+    jsonl_path?: string;
+    /** Former terminal pane handle. */
+    zellij_pane_id?: string;
+    /** Former terminal tab name. */
+    zellij_tab_name?: string;
+    /** Last in-flight turn snapshot recorded before the integration was removed. */
+    active_turn?: {
+      task_id: string;
+      user_message_index: number;
+      started_at_ms: number;
+    } | null;
+  };
+
+  /** Historical billing metadata written by the removed integration. */
+  billing_mode?: 'subscription' | 'api-key' | 'unknown';
+
+  // Custom context for Handlebars templates
+  /**
+   * User-defined JSON context for Handlebars templates in zone triggers
+   * Example: { "teamName": "Backend", "sprintNumber": 42 }
+   * Access in templates: {{ session.context.teamName }}
+   */
+  custom_context?: Record<string, unknown> & {
+    /** Server-owned provenance for sessions admitted by a gateway channel. */
+    gateway_source?: GatewaySource;
+    /**
+     * Scheduled run metadata (populated by scheduler)
+     *
+     * Present only if this session was created by the scheduler.
+     * Contains execution details and config snapshot at run time.
+     */
+    scheduled_run?: ScheduledRunMetadata;
+  };
+
+  // ===== Context Window Tracking =====
+
+  /**
+   * Current context window usage (cumulative tokens in context)
+   *
+   * Calculated as: input_tokens + cache_read_tokens + cache_creation_tokens
+   * from the most recent task with usage data.
+   *
+   * Based on algorithm from: https://codelynx.dev/posts/calculate-claude-code-context
+   *
+   * Note: Each API turn returns cumulative totals, so we only need the latest task's usage.
+   * We do NOT sum across tasks (that would double-count cached content).
+   */
+  current_context_usage?: number;
+
+  /**
+   * Context window limit for this session's model
+   *
+   * Examples:
+   * - Claude Sonnet: 200,000 tokens
+   * - Claude Opus: 200,000 tokens
+   * - Extended context models: varies
+   */
+  context_window_limit?: number;
+
+  /**
+   * Timestamp when context was last updated (ISO 8601)
+   */
+  last_context_update_at?: string;
+
+  // ===== Scheduler Tracking =====
+
+  /**
+   * Authoritative run ID for scheduled sessions (Unix timestamp in ms)
+   *
+   * Stores the exact scheduled time (rounded to minute), NOT when session was created.
+   * Used for deduplication and retention cleanup.
+   *
+   * Example: Midnight run scheduled for 2025-11-03 00:00:00 UTC
+   * Even if triggered at 00:00:32, we store 00:00:00 (1730592000000)
+   *
+   * This becomes the unique run identifier to prevent duplicate scheduling.
+   */
+  scheduled_run_at?: number;
+
+  /**
+   * Whether this session was created by the scheduler
+   *
+   * Materialized for UI filtering (show clock icon) and analytics.
+   * True = created by scheduler, False = created manually by user
+   */
+  scheduled_from_branch: boolean;
+
+  /**
+   * First-class schedule this session was spawned from (if any).
+   *
+   * Nullable: null for ad-hoc sessions and for back-compat rows that
+   * predate the `schedules` table. `ON DELETE SET NULL` so when a
+   * schedule is removed, its sessions become orphaned runs rather
+   * than cascading deletions.
+   *
+   * Use this as the canonical link to a run's schedule;
+   * `scheduled_from_branch` + `scheduled_run_at` are kept for dedup
+   * and UI back-compat.
+   */
+  schedule_id?: ScheduleID;
+
+  /** Safe durable scheduler initialization diagnosis (internal lifecycle). */
+  scheduler_init_failure_code?: SchedulerInitializationFailureCode;
+  scheduler_init_failure_stage?: SchedulerInitializationStage;
+  scheduler_init_attempt_count?: number;
+  scheduler_init_retry_at?: string;
+
+  /**
+   * Whether this session is ready to receive a new prompt
+   *
+   * Set to true when a task completes successfully, indicating the agent is ready for more work.
+   * Cleared when the user opens the conversation drawer (acknowledging completion).
+   * Used to highlight branch cards to show which sessions need attention.
+   */
+  ready_for_prompt: boolean;
+
+  // ===== Callback Configuration =====
+
+  /**
+   * Callback configuration for child session completion notifications
+   *
+   * When a child session (spawned via subsession) completes its task,
+   * Agor can automatically notify the parent session with relevant context.
+   *
+   * Default behavior: Callbacks enabled with default template.
+   */
+  callback_config?: {
+    /** Enable/disable child completion callbacks (default: true for spawn, false for create) */
+    enabled?: boolean;
+    /** Custom Handlebars template for callback messages */
+    template?: string;
+    /** Whether to include last assistant message content inline (default: true) */
+    include_last_message?: boolean;
+    /** Whether to include original spawn prompt in callback (default: false) */
+    include_original_prompt?: boolean;
+    /**
+     * Session ID to notify on completion (for remote session callbacks)
+     *
+     * When set, completion callbacks are sent to this session instead of
+     * (or in addition to) the genealogy parent. This enables cross-branch
+     * callbacks where a session creates another session on a different branch
+     * and wants to be notified when it completes.
+     *
+     * Defaults to the creating session's ID when enableCallback is true
+     * in agor_sessions_create.
+     */
+    callback_session_id?: SessionID;
+    /**
+     * User ID of the person who set up this callback. Server-managed: the
+     * daemon discards client-supplied values and stamps the authenticated
+     * caller after checking they may prompt the callback target.
+     *
+     * Becomes the delivered callback Task's `created_by`, i.e. its executor
+     * principal (identity, environment, and credentials).
+     */
+    callback_created_by?: string;
+    /**
+     * Callback firing mode:
+     * - "persistent": Fire on every completion until disabled (default when omitted)
+     * - "once": Fire callback on first completion, then auto-disable
+     */
+    callback_mode?: 'once' | 'persistent';
+  };
+
+  // ===== Fork Origin =====
+
+  /**
+   * Tracks how this session was created via fork:
+   * - "btw": Ephemeral fork created via sessions.prompt mode:"btw" or UI btw button
+   *
+   * Undefined for regular forks, spawned sessions, or directly created sessions.
+   * Sessions with fork_origin:"btw" are auto-archived after task completion.
+   */
+  fork_origin?: 'btw';
+
+  // ===== Archive State =====
+
+  /**
+   * Whether this session is archived (soft deleted)
+   *
+   * Usually cascaded from branch archive, but can also be manually archived.
+   * Archived sessions are hidden from UI but data preserved for analytics.
+   */
+  archived: boolean;
+
+  /**
+   * Reason for archiving
+   *
+   * - 'branch_archived': Cascaded from parent branch being archived
+   * - 'manual': User manually archived this session
+   * - 'parent_archived': Cascaded from parent session being manually archived
+   * - 'btw_completed': Ephemeral btw fork auto-archived after task completion
+   */
+  archived_reason?: 'branch_archived' | 'manual' | 'parent_archived' | 'btw_completed';
+
+  /**
+   * Durable non-genealogy relationships involving this session.
+   *
+   * These are separate from genealogy.parent_session_id/forked_from_session_id.
+   * For example, a session in branch A can create a remote session in branch B;
+   * branch B keeps its own genealogy shape, while branch A can still render a
+   * muted/surrogate child card for track-record and navigation purposes.
+   */
+  remote_relationships?: {
+    as_source?: SessionRelationship[];
+    as_target?: SessionRelationship[];
+  };
+
+  /**
+   * UI-only marker for a remote-created session rendered as a surrogate in the
+   * source branch tree. The canonical session still lives in `target_branch_id`;
+   * clicking the surrogate should navigate to/open that real session.
+   */
+  remote_surrogate?: {
+    relationship: SessionRelationship;
+    source_session_id: SessionID;
+    source_branch_id: BranchID;
+    target_branch_id: BranchID;
+  };
+}
+
+export const SCHEDULER_INITIALIZATION_STAGES = [
+  'recovery_load',
+  'creator_load',
+  'snapshot',
+  'mcp_attachment',
+  'prompt_admission',
+  'finalization',
+] as const;
+
+export type SchedulerInitializationStage = (typeof SCHEDULER_INITIALIZATION_STAGES)[number];
+
+export const SCHEDULER_INITIALIZATION_FAILURE_CODES = [
+  'initialization_transient',
+  'creator_unavailable',
+  'schedule_identity_unavailable',
+  'schedule_branch_unavailable',
+  'schedule_prompt_unavailable',
+  'schedule_permission_revoked',
+  'mcp_server_not_usable',
+] as const;
+
+export type SchedulerInitializationFailureCode =
+  (typeof SCHEDULER_INITIALIZATION_FAILURE_CODES)[number];
+
+/** Session data accepted before defaults and configuration references are materialized. */
+export type CreateSessionInput = Omit<
+  Partial<Session>,
+  | 'agentic_tool'
+  | 'agentic_tool_preset_id'
+  | 'model_config'
+  | 'sdk_home_scope'
+  | 'usage_summary'
+  | 'tasks_complete'
+  | 'mcp_defaults_skipped'
+> & {
+  agentic_tool?: AgenticToolName;
+  agentic_tool_preset_id?: AgenticToolConfigurationReference | null;
+  model_config?: Partial<NonNullable<Session['model_config']>> | null;
+  /** Strict explicit selection (including []); omit to inherit branch then user defaults. */
+  mcpServerIds?: string[];
+};
+
+/** Session patch semantics: omit/undefined preserves, string sets, null clears. */
+export type SessionUpdate = Omit<
+  Partial<Session>,
+  'sdk_session_id' | 'sdk_home_scope' | 'usage_summary' | 'tasks_complete' | 'mcp_defaults_skipped'
+> & {
+  sdk_session_id?: string | null;
+};
+
+/**
+ * Minimal persisted session state needed to decide whether a new task can
+ * start immediately.
+ *
+ * `ready_for_prompt` is intentionally not equivalent to promptability: the UI
+ * also uses it as an attention/acknowledgement flag (for example timed-out
+ * permission requests can set it true). Use this helper instead of checking
+ * either field directly at task-execution boundaries.
+ */
+export type SessionPromptState = Pick<Session, 'status' | 'ready_for_prompt'>;
+
+export type PromptableSessionState =
+  | { status: typeof SessionStatus.IDLE; ready_for_prompt: boolean }
+  | {
+      status: typeof SessionStatus.FAILED | typeof SessionStatus.TIMED_OUT;
+      ready_for_prompt: true;
+    };
+
+export function sessionCanStartTask(status: Session['status'], readyForPrompt?: boolean): boolean {
+  return (
+    status === SessionStatus.IDLE ||
+    ((status === SessionStatus.FAILED || status === SessionStatus.TIMED_OUT) &&
+      readyForPrompt === true)
+  );
+}
+
+export function isSessionPromptable<T extends SessionPromptState>(
+  session: T
+): session is T & PromptableSessionState {
+  return sessionCanStartTask(session.status, session.ready_for_prompt);
+}
+
+export const EXECUTING_SESSION_STATUSES: ReadonlySet<SessionStatus> = new Set<SessionStatus>([
+  SessionStatus.RUNNING,
+  SessionStatus.STOPPING,
+  SessionStatus.AWAITING_PERMISSION,
+  SessionStatus.AWAITING_INPUT,
+]);
+
+export type SessionExecutionState = Pick<Session, 'status'>;
+
+export function isSessionExecuting(session: SessionExecutionState): boolean {
+  return EXECUTING_SESSION_STATUSES.has(session.status);
+}
+
+export type SessionRelationshipType = 'remote_create';
+
+/**
+ * Durable links between sessions that are not necessarily canonical
+ * branch-local genealogy. Cross-branch delegation uses this instead of
+ * genealogy.parent_session_id so the local session tree, recursive delete,
+ * and fork/spawn semantics remain branch-local.
+ */
+export interface SessionRelationship {
+  relationship_id: SessionRelationshipID;
+  source_session_id: SessionID;
+  target_session_id: SessionID;
+  relationship_type: SessionRelationshipType;
+  created_by: UserID;
+  created_at: string;
+  updated_at?: string | null;
+  callback_enabled: boolean;
+  callback_session_id?: SessionID | null;
+  data?: Record<string, unknown> | null;
+}
+
+/**
+ * Gateway source metadata denormalized into session.custom_context.gateway_source
+ *
+ * Present on sessions created via messaging platform integrations (Slack, Discord, GitHub).
+ * Stamped at creation time and immutable — avoids N+1 lookups on the gatewayChannels table.
+ */
+export interface GatewaySource {
+  channel_id: string;
+  channel_name: string;
+  channel_type: ChannelType;
+  thread_id: string;
+  /** GitHub-specific: "owner/repo" format */
+  github_repo?: string;
+  /** GitHub-specific: PR/issue number */
+  github_issue_number?: number;
+  /** GitHub-specific: only post last message */
+  last_message_only?: boolean;
+  /** Slack-specific provenance */
+  slack_team_id?: string;
+  slack_channel_id?: string;
+  slack_channel_name?: string;
+  slack_root_ts?: string;
+  slack_trigger_ts?: string;
+}
+
+/**
+ * Check if a session is a gateway session (created via Slack, Discord, GitHub, etc.)
+ *
+ * Gateway sessions have `custom_context.gateway_source` set at creation time.
+ */
+export function isGatewaySession(session: Pick<Session, 'custom_context'>): boolean {
+  const ctx = session.custom_context as Record<string, unknown> | undefined;
+  return !!ctx?.gateway_source;
+}
+
+/**
+ * Get the gateway source from a session, or null if not a gateway session.
+ */
+export function getGatewaySource(session: Pick<Session, 'custom_context'>): GatewaySource | null {
+  const ctx = session.custom_context as Record<string, unknown> | undefined;
+  const source = ctx?.gateway_source;
+  if (!source || typeof source !== 'object') return null;
+  const s = source as Record<string, unknown>;
+  if (!s.channel_id || !s.channel_name || !s.channel_type || !s.thread_id) return null;
+  return source as GatewaySource;
+}
+
+/**
+ * Bulky, single-session `custom_context` keys that a lean session list omits.
+ *
+ * `scheduled_run` (the scheduler's run snapshot) and the SDK-reported
+ * `slash_commands` / `skills` inventories are read only for one open session,
+ * yet they make up most of every session row. `sessions.find({ lean: true })`
+ * drops them from each row; `sessions.get` always returns them. Everything
+ * else in `custom_context` (e.g. `gateway_source`, user template fields) stays.
+ */
+export const LEAN_SESSION_LIST_OMITTED_CONTEXT_KEYS = [
+  'scheduled_run',
+  'slash_commands',
+  'skills',
+] as const;
+
+export type LeanSessionListOmittedContextKey =
+  (typeof LEAN_SESSION_LIST_OMITTED_CONTEXT_KEYS)[number];
+
+/** `read_shape` stamped on every row of `sessions.find({ lean: true })`. */
+export const SESSION_LIST_ROW_SHAPE = 'session-list-v1';
+
+/**
+ * A row from `sessions.find({ lean: true })`: a session summary whose
+ * `custom_context` has the `LEAN_SESSION_LIST_OMITTED_CONTEXT_KEYS` withheld.
+ *
+ * Every lean row carries `read_shape` — also when the stored context never had
+ * those keys — so a consumer can tell "withheld" from "absent". Full rows
+ * (`sessions.get`, a find without `lean`, realtime events) never carry it.
+ * Read withheld keys only after `hasFullSessionDetails`, or from `sessions.get`.
+ */
+export type SessionListRow = Omit<Session, 'custom_context'> & {
+  custom_context?: Record<string, unknown> & {
+    gateway_source?: GatewaySource;
+  } & { [K in LeanSessionListOmittedContextKey]?: never };
+  readonly read_shape: typeof SESSION_LIST_ROW_SHAPE;
+};
+
+/** True when `row` is a lean list row (its withheld context keys are unknown). */
+export function isSessionListRow(row: Session | SessionListRow): row is SessionListRow {
+  return (row as { read_shape?: unknown }).read_shape === SESSION_LIST_ROW_SHAPE;
+}
+
+/**
+ * True when `row` is a full session record, so a missing withheld
+ * `custom_context` key (e.g. `scheduled_run`) really is absent.
+ */
+export function hasFullSessionDetails(row: Session | SessionListRow): boolean {
+  return !isSessionListRow(row);
+}
+
+/**
+ * Project a session row for a lean list: a copy with the withheld
+ * `custom_context` keys removed and the enumerable, read-only `read_shape`
+ * marker set. The copy keeps every own property descriptor, including
+ * non-enumerable ones such as the hidden `tenant_id` the daemon's tenant
+ * after-hook checks. The withheld keys are always removed, whatever
+ * `read_shape` the input claims, so a forged marker cannot carry them through.
+ */
+export function toLeanSessionListRow(session: Session | SessionListRow): SessionListRow {
+  const { read_shape: _claimed, ...descriptors } = Object.getOwnPropertyDescriptors(
+    session
+  ) as PropertyDescriptorMap;
+  const copy = Object.create(Object.getPrototypeOf(session), descriptors) as Record<
+    string,
+    unknown
+  >;
+  const context = session.custom_context;
+  if (context && LEAN_SESSION_LIST_OMITTED_CONTEXT_KEYS.some((key) => key in context)) {
+    const lean: Record<string, unknown> = { ...context };
+    for (const key of LEAN_SESSION_LIST_OMITTED_CONTEXT_KEYS) delete lean[key];
+    copy.custom_context = lean;
+  }
+  Object.defineProperty(copy, 'read_shape', {
+    value: SESSION_LIST_ROW_SHAPE,
+    enumerable: true,
+    writable: false,
+    configurable: false,
+  });
+  return copy as unknown as SessionListRow;
+}
+
+/**
+ * Session type categories matching UI rendering in BranchCard
+ */
+export type SessionType = 'gateway' | 'scheduled' | 'agent';
+
+/**
+ * Determine the session type category.
+ */
+export function getSessionType(
+  session: Pick<Session, 'custom_context' | 'scheduled_from_branch'>
+): SessionType {
+  if (isGatewaySession(session)) return 'gateway';
+  if (session.scheduled_from_branch) return 'scheduled';
+  return 'agent';
+}
+
+/**
+ * Metadata for sessions created by the scheduler
+ *
+ * Stored in session.custom_context.scheduled_run
+ */
+export interface ScheduledRunMetadata {
+  /**
+   * Rendered prompt after Handlebars template substitution
+   *
+   * Example:
+   * Template: "Check PR {{branch.pull_request_url}}"
+   * Rendered: "Check PR https://github.com/org/repo/pull/42"
+   */
+  rendered_prompt: string;
+
+  /**
+   * Run number for this schedule (1st, 2nd, 3rd, ...)
+   *
+   * Increments with each run. Useful for tracking execution history.
+   */
+  run_index: number;
+
+  /**
+   * Stable identity of the occurrence's initial task. The scheduler persists
+   * this with the session before creating the task so recovery can reconcile
+   * the same prompt after a daemon crash without creating a second task.
+   */
+  initial_task_id?: TaskID;
+
+  /**
+   * Whether this run was triggered manually via execute-now (vs. cron tick).
+   */
+  triggered_manually?: boolean;
+
+  /**
+   * User ID that manually triggered this run. Only set when
+   * `triggered_manually` is true.
+   */
+  triggered_by?: string;
+
+  /**
+   * Snapshot of schedule config at execution time.
+   *
+   * Preserves configuration even if the schedule is later modified or
+   * deleted. Useful for debugging and understanding past runs.
+   *
+   * `schedule_id` was added when schedules became first-class — it lets
+   * "open the schedule" links resolve even after the live schedule has
+   * been deleted (the FK on `sessions.schedule_id` is SET NULL on
+   * delete, but the snapshot still carries the ID for forensics).
+   */
+  schedule_config_snapshot?: {
+    /** Optional first-class schedule ID; nullable for pre-#1253 rows. */
+    schedule_id?: string;
+    /** Cron expression that triggered this run */
+    cron: string;
+    /** Timezone for cron evaluation */
+    timezone: string;
+    /** Retention policy at run time */
+    retention: number;
+    /** Concurrency policy at run time (applies to both cron and manual paths) */
+    allow_concurrent_runs?: boolean;
+    /** Effective MCP attachment snapshot used by crash recovery. */
+    mcp_server_ids?: string[];
+  };
+}
+
+/**
+ * Configuration for spawning a child session
+ *
+ * Provides fine-grained control over spawned session settings,
+ * overriding defaults from parent session or user preferences.
+ */
+export interface SpawnConfig {
+  /** Prompt for the spawned session (required) */
+  prompt: string;
+
+  /** Optional title for the spawned session */
+  title?: string;
+
+  /** Agentic tool to use (defaults to parent's tool) */
+  agent?: AgenticToolName;
+
+  /** Configuration source. Same-tool children inherit the parent's preset by default. */
+  presetId?: AgenticToolConfigurationReference;
+
+  /** Permission mode override (defaults based on config preset) */
+  permissionMode?: PermissionMode;
+
+  /** Model configuration override */
+  modelConfig?: {
+    mode?: 'alias' | 'exact';
+    model?: string;
+    effort?: EffortLevel;
+    /** Claude Code advisor model (e.g., 'opus', 'sonnet', 'fable'); ignored for non-Claude tools. */
+    advisorModel?: string;
+    /**
+     * Provider ID (OpenCode only, e.g. 'anthropic', 'openai', 'opencode').
+     * Persisted on session.model_config.provider. Ignored for non-OpenCode tools.
+     */
+    provider?: string;
+  };
+
+  /** Codex sandbox mode (codex only) */
+  codexSandboxMode?: CodexSandboxMode;
+
+  /** Codex approval policy (codex only) */
+  codexApprovalPolicy?: CodexApprovalPolicy;
+
+  /** Codex network access (codex only) */
+  codexNetworkAccess?: boolean;
+  codexIncludePlugins?: boolean;
+
+  /** MCP server IDs to attach to spawned session */
+  mcpServerIds?: string[];
+
+  /** Enable callback to parent on completion (default: true) */
+  enableCallback?: boolean;
+
+  /** Callback mode: "once" (default) fires once then auto-disables, "persistent" fires every time */
+  callbackMode?: 'once' | 'persistent';
+
+  /** Include child's final result in callback (default: true) */
+  includeLastMessage?: boolean;
+
+  /** Include original spawn prompt in callback (default: false) */
+  includeOriginalPrompt?: boolean;
+
+  /** Extra instructions appended to spawn prompt */
+  extraInstructions?: string;
+
+  /** Task ID to link as spawn point */
+  task_id?: string;
+
+  /**
+   * Session-scope env var names (from the spawner / session creator) to
+   * expose in the spawned session's executor process. Only the session's
+   * creator or an admin/superadmin can set this — otherwise it is ignored.
+   */
+  envVarNames?: string[];
+}

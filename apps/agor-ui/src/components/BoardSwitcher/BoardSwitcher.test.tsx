@@ -1,0 +1,296 @@
+import type { AgorClient, Board, User } from '@agor-live/client';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest';
+import { setRealtimeAuthorityScope } from '../../store/realtimeBatch';
+import { OPEN_BOARD_SWITCHER_EVENT, requestShellPicker } from '../../utils/shellEvents';
+import { BoardSwitcher } from './BoardSwitcher';
+
+const modalProps = vi.hoisted(() => ({ current: null as Record<string, unknown> | null }));
+vi.mock('../BoardEditModal', () => ({
+  BoardEditModal: (props: Record<string, unknown>) => {
+    modalProps.current = props;
+    return props.open ? <div role="dialog">board editor</div> : null;
+  },
+}));
+
+const adversarialBoardName = `Board-${'unbroken-name-'.repeat(30)}終`;
+const board = {
+  board_id: 'board-1',
+  name: adversarialBoardName,
+  created_by: 'owner-1',
+  primary_owner_user_id: 'owner-1',
+  created_at: '',
+  last_updated: '',
+} as Board;
+const owner = { user_id: 'owner-1', role: 'member' } as User;
+
+function clientFor({ reject, findResult }: { reject?: unknown; findResult?: unknown } = {}) {
+  return {
+    service: () => ({
+      find: vi
+        .fn()
+        .mockImplementation(() =>
+          reject ? Promise.reject(reject) : Promise.resolve(findResult ?? [])
+        ),
+      findAll: vi.fn().mockResolvedValue([]),
+    }),
+  } as unknown as AgorClient;
+}
+
+function countsClient(branchCount: number) {
+  return {
+    service: (name: string) => ({
+      find: vi.fn(async () =>
+        name === 'branch-counts' ? [{ board_id: board.board_id, branch_count: branchCount }] : []
+      ),
+      on: vi.fn(),
+      off: vi.fn(),
+    }),
+  } as unknown as AgorClient;
+}
+
+function renderSwitcher(client = clientFor(), user: User = owner, boards: Board[] = [board]) {
+  const onBoardChange = vi.fn();
+  const view = render(
+    <BoardSwitcher
+      boards={boards}
+      currentBoardId={board.board_id}
+      onBoardChange={onBoardChange}
+      branchById={new Map()}
+      client={client}
+      currentUser={user}
+      onUpdateBoard={vi.fn()}
+    />
+  );
+  return { ...view, onBoardChange };
+}
+
+describe('BoardSwitcher long-name layout', () => {
+  afterEach(() => setRealtimeAuthorityScope(null));
+
+  it('constrains every generated wrapper while keeping the name flexible and badge fixed', async () => {
+    setRealtimeAuthorityScope('owner-1:member:1');
+    const { container } = renderSwitcher(countsClient(3));
+    const trigger = container.querySelector<HTMLButtonElement>('button.ant-dropdown-trigger');
+    expect(trigger).not.toBeNull();
+
+    const currentName = trigger?.querySelector<HTMLElement>('[data-current-board-name]');
+    expect(currentName?.parentElement).toHaveStyle({ flex: '1', minWidth: '0' });
+    expect(currentName?.parentElement?.style.overflow).toBe('');
+    expect(currentName).toHaveStyle({ flex: '1', minWidth: '0' });
+    expect(trigger?.querySelector('.anticon-down')).toHaveStyle({ flexShrink: '0' });
+
+    fireEvent.click(trigger as HTMLButtonElement);
+
+    const item = await screen.findByRole('menuitem');
+    await waitFor(() => expect(item.querySelector('.ant-badge-count')).not.toBeNull());
+    const itemContent = item.querySelector<HTMLElement>('.ant-dropdown-menu-title-content');
+    const name = item.querySelector<HTMLElement>('[data-board-name]');
+    const badgeRoot = item.querySelector<HTMLElement>('.ant-badge');
+    const badgeIndicator = item.querySelector<HTMLElement>('.ant-badge-count');
+    const popup = screen.getByTestId('board-switcher-popup');
+
+    // jsdom has no layout engine: assert the durable semantic/style contracts,
+    // not pixel ellipsis behavior (which is covered in browser E2E).
+    expect(itemContent).toHaveStyle({ minWidth: '0' });
+    expect(name).toHaveClass('ant-typography-ellipsis');
+    expect(name).toHaveStyle({ flex: '1', minWidth: '0' });
+    expect(name).toHaveTextContent(adversarialBoardName);
+    expect(badgeRoot).toHaveStyle({ flexShrink: '0' });
+    expect(badgeRoot?.style.backgroundColor).toBe('');
+    expect(badgeIndicator?.style.flexShrink).toBe('');
+    expect(badgeIndicator?.style.backgroundColor).not.toBe('');
+    expect(popup).toHaveStyle({ width: '320px', maxWidth: 'calc(100vw - 48px)' });
+  });
+
+  it('reveals a clipped name when its menu item receives keyboard focus', async () => {
+    const { container } = renderSwitcher();
+    const trigger = container.querySelector<HTMLButtonElement>('button.ant-dropdown-trigger');
+    fireEvent.click(trigger as HTMLButtonElement);
+
+    const item = await screen.findByRole('menuitem');
+    const name = item.querySelector<HTMLElement>('[data-board-name]');
+    const popup = screen.getByTestId('board-switcher-popup');
+    const menu = screen.getByRole('menu');
+    expect(name).not.toBeNull();
+    Object.defineProperties(name as HTMLElement, {
+      clientWidth: { configurable: true, value: 120 },
+      scrollWidth: { configurable: true, value: 800 },
+    });
+
+    act(() => popup.focus());
+    expect(popup).toHaveAttribute('tabindex', '-1');
+    expect(menu).toHaveFocus();
+
+    act(() => item.focus());
+
+    expect(item).toHaveFocus();
+    expect(name).not.toHaveAttribute('tabindex');
+    expect(await screen.findByRole('tooltip')).toHaveTextContent(adversarialBoardName);
+  });
+});
+
+describe('BoardSwitcher current-board edit shortcut', () => {
+  it('opens its board list on the shell event', async () => {
+    renderSwitcher();
+    expect(screen.queryByRole('menu')).not.toBeInTheDocument();
+    act(() => {
+      requestShellPicker(OPEN_BOARD_SWITCHER_EVENT);
+    });
+    expect(await screen.findByRole('menu')).toBeInTheDocument();
+  });
+
+  it('allows the primary owner without consulting a legacy owners route', async () => {
+    renderSwitcher(clientFor({ reject: { code: 500 } }));
+    expect(await screen.findByRole('button', { name: /Edit current board:/ })).toBeVisible();
+  });
+
+  it('passes only the current board to the canonical editor and does not navigate', async () => {
+    const { onBoardChange } = renderSwitcher();
+    const edit = await screen.findByRole('button', { name: /Edit current board:/ });
+
+    fireEvent.click(edit);
+
+    expect(onBoardChange).not.toHaveBeenCalled();
+    expect(screen.getByRole('dialog')).toHaveTextContent('board editor');
+    expect(modalProps.current?.board).toBe(board);
+  });
+
+  it.each(['fallback-board', null])(
+    'keeps the open editor target when access loss navigates to %s',
+    async (fallbackId) => {
+      const client = clientFor();
+      const fallback = { ...board, board_id: 'fallback-board', name: 'Another board' } as Board;
+      const props = {
+        onBoardChange: vi.fn(),
+        branchById: new Map(),
+        client,
+        currentUser: owner,
+      };
+      const { rerender } = render(
+        <BoardSwitcher {...props} boards={[board, fallback]} currentBoardId={board.board_id} />
+      );
+      fireEvent.click(await screen.findByRole('button', { name: /Edit current board:/ }));
+
+      // A private-board transfer removes the old owner's board and may select
+      // a fallback before the command's response/Done interaction completes.
+      rerender(<BoardSwitcher {...props} boards={[fallback]} currentBoardId={fallbackId} />);
+      expect(screen.getByRole('dialog')).toBeVisible();
+      expect(modalProps.current?.board).toBe(board);
+
+      const onClose = modalProps.current?.onClose as () => void;
+      act(onClose);
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+      expect(modalProps.current?.board).toBeNull();
+    }
+  );
+
+  it('overlays the edit action without reserving trigger width', async () => {
+    renderSwitcher();
+    const edit = await screen.findByRole('button', { name: /Edit current board:/ });
+    const trigger = edit.closest('div')?.querySelector('button.ant-dropdown-trigger');
+
+    expect(trigger).toHaveStyle({ padding: '8px 12px' });
+    expect(edit.closest('span[style*="position: absolute"]')).toHaveStyle({ right: '28px' });
+  });
+
+  it('reserves room in the name row so a long name never underlaps the edit action', async () => {
+    renderSwitcher();
+    const edit = await screen.findByRole('button', { name: /Edit current board:/ });
+    const trigger = edit.closest('div')?.querySelector('button.ant-dropdown-trigger');
+    // controlHeightSM (24) + paddingSM (12) with the default antd seed token.
+    expect(trigger?.querySelector('.ant-flex')).toHaveStyle({ marginRight: '36px' });
+  });
+
+  it('keeps the action keyboard reachable and reveals it on focus-within', async () => {
+    renderSwitcher();
+    const edit = await screen.findByRole('button', { name: /Edit current board:/ });
+    act(() => edit.focus());
+    expect(edit).toHaveFocus();
+    await waitFor(() =>
+      expect(edit.closest('span[style*="opacity"]')).toHaveStyle({
+        opacity: '1',
+        pointerEvents: 'auto',
+      })
+    );
+  });
+
+  it('hides the action when normalized policy resolution denies management', async () => {
+    renderSwitcher(clientFor({ findResult: { capabilities: ['board.view'] } }), {
+      user_id: 'member-2',
+      role: 'member',
+    } as User);
+    await waitFor(() =>
+      expect(screen.queryByRole('button', { name: /Edit current board:/ })).not.toBeInTheDocument()
+    );
+  });
+
+  it('keeps the action visible without hover on small/touch layouts', async () => {
+    renderSwitcher();
+    const edit = await screen.findByRole('button', { name: /Edit current board:/ });
+    expect(edit).toBeVisible();
+  });
+});
+
+describe('BoardSwitcher branch-count badges (Step 3)', () => {
+  afterEach(() => setRealtimeAuthorityScope(null));
+
+  it('reads each board count from the branch-counts aggregate with the store empty', async () => {
+    setRealtimeAuthorityScope('owner-1:member:1');
+    const { container } = renderSwitcher(countsClient(7));
+    fireEvent.click(container.querySelector('button.ant-dropdown-trigger') as HTMLButtonElement);
+    const item = await screen.findByRole('menuitem');
+    await waitFor(() => expect(item.querySelector('.ant-badge-count')).toHaveTextContent('7'));
+  });
+
+  it('shows no zero count before any count has loaded', async () => {
+    const { container } = renderSwitcher();
+    fireEvent.click(container.querySelector('button.ant-dropdown-trigger') as HTMLButtonElement);
+    const item = await screen.findByRole('menuitem');
+    expect(item.querySelector('.ant-badge-count')).toBeNull();
+  });
+});
+
+describe('BoardSwitcher empty states', () => {
+  const manyBoards = Array.from(
+    { length: 8 },
+    (_, index) => ({ ...board, board_id: `board-${index}`, name: `Board ${index}` }) as Board
+  );
+
+  it.each([
+    { boards: [], filter: null, text: 'No boards yet.' },
+    { boards: manyBoards, filter: 'zebra', text: 'No boards match “zebra”.' },
+  ])('says "$text"', async ({ boards, filter, text }) => {
+    const { container } = renderSwitcher(clientFor(), owner, boards);
+    fireEvent.click(container.querySelector('button.ant-dropdown-trigger') as HTMLButtonElement);
+    if (filter) {
+      fireEvent.change(await screen.findByRole('textbox', { name: 'Filter boards' }), {
+        target: { value: filter },
+      });
+    }
+    expect(await screen.findByText(text)).toBeInTheDocument();
+  });
+});
+
+describe('BoardSwitcher outside tap', () => {
+  const popupHidden = () =>
+    screen
+      .getByTestId('board-switcher-popup')
+      .closest('.ant-dropdown')
+      ?.className.includes('hidden');
+
+  // iOS Safari fires pointerdown, but no mousedown, for a tap on a non-clickable element.
+  it('closes on a pointerdown outside without a mousedown, and stays open for one inside', async () => {
+    const { container } = renderSwitcher();
+    const outside = document.body.appendChild(document.createElement('div'));
+    onTestFinished(() => outside.remove());
+    fireEvent.click(container.querySelector('button.ant-dropdown-trigger') as HTMLButtonElement);
+    await screen.findByRole('menu');
+
+    fireEvent.pointerDown(screen.getByTestId('board-switcher-popup'));
+    expect(popupHidden()).toBe(false);
+
+    fireEvent.pointerDown(outside);
+    await waitFor(() => expect(popupHidden()).toBe(true));
+  });
+});

@@ -1,0 +1,1391 @@
+# Changelog
+
+This project follows [Keep a Changelog](https://keepachangelog.com/) conventions.
+Version numbers track `packages/agor-live` releases. Each entry links to its PR.
+
+## Style
+
+Section labels:
+
+- **Features** — user-visible new capabilities
+- **Fixes** — bug fixes
+- **Security** — security-relevant changes (called out separately to make audit easier)
+- **Breaking** — backwards-incompatible changes (call out migration steps)
+- **Chores** — build, deps, infra, refactors (only when user-visible or substantial)
+
+Entry pattern:
+
+```
+- **Short headline** — one to two sentences of context ([#NNNN](https://github.com/preset-io/agor/pull/NNNN))
+```
+
+If an entry needs more than two sentences, break it into sub-bullets rather than a wall of text:
+
+```
+- **Headline** — high-level summary ([#NNNN](https://github.com/preset-io/agor/pull/NNNN))
+  - Detail 1
+  - Detail 2
+```
+
+The reader's first pass is the headline only; sub-bullets are for the curious. Keep headlines crisp; skip dependabot/CI churn unless user-visible. Use the full `[#NNNN](https://github.com/preset-io/agor/pull/NNNN)` form rather than a bare `#NNNN` reference — GitHub does not auto-link `#NNNN` when rendering markdown files (only in issue/PR/commit comments).
+
+Every release-version bump PR must include its finalized changelog section; a version bump without release notes is incomplete. Starting with 0.25.1, release automation creates and validates the corresponding tag. Historical 0.23/0.24 headings link to the reconstructed release-boundary commit because tags were not consistently created; do not create retroactive tags solely to backfill this file.
+
+## Unreleased
+
+### Features
+
+- **Claude Haiku 5.5** — adds `claude-haiku-5-5` (native 1M context) to the Claude model picker and the OpenCode Anthropic catalog, and bundles Claude Agent SDK 0.3.293, the first release whose runtime knows the model. Haiku 4.5 is unchanged and stays selectable. ([#3130](https://github.com/preset-io/agor/pull/3130))
+
+### Security
+
+- **Operator-pinned private outbound destinations** — `security.private_outbound_destinations` lets the daemon reach specific internal HTTPS hosts that the outbound private-address guard would otherwise block. Each listed host must resolve only to IPv4 addresses inside its configured private or CGNAT CIDRs, and unlisted hosts are unchanged. ([#3091](https://github.com/preset-io/agor/pull/3091))
+
+## 0.27.0 (2026-10-13)
+
+Release preparation covers merged changes from `v0.26.10` (`cdb77a0a`) through `77515f80`, plus the bundle-size work in this release: [compare merged changes](https://github.com/preset-io/agor/compare/v0.26.10...77515f802e126fb3fa3130ffaa2065552a52ccbb). This entry does not imply publication or deployment.
+
+### Features
+
+- **Discord forum channels** — forum channels can be allowlisted and @mentions inside forum posts work, with each post's opening message reaching the agent. A per-forum response mode can answer the first message of each new post, or every message, without a mention. Discord session notices now work like Slack's: one "View session" link when the session is created, and no routing notice on every follow-up. ([#3017](https://github.com/preset-io/agor/pull/3017), [#3032](https://github.com/preset-io/agor/pull/3032), [#3038](https://github.com/preset-io/agor/pull/3038))
+- **Slack emoji reactions reach sessions** — an opt-in, per-channel `inbound_reactions` flag sends a reaction (or its removal) on a mapped Slack thread to that thread's session as a short prompt. It is off by default; with the flag off, reactions are ignored as before. ([#2898](https://github.com/preset-io/agor/pull/2898))
+- **Knowledge document archive and restore** — documents can be archived and restored without losing content, history, permissions or links. Lists, search, MCP and CLI show active documents by default, with `active`, `archived` and `all` filters. ([#3031](https://github.com/preset-io/agor/pull/3031))
+- **Customer-owned MCP OAuth apps** — customers can save their own provider OAuth app credentials, and each user consents separately. In Agor Cloud these apps get a stable callback; direct, self-hosted, dynamic-registration and personal-access-token connections are still supported. ([#2799](https://github.com/preset-io/agor/pull/2799))
+- **Create menu replaces the tabbed create dialog** — a "+" in the navbar on every page, including Home, opens one menu for Teammate, Branch, Board and Repository (Repository is admin-only). Each choice opens its own focused modal, on desktop and mobile. ([#2652](https://github.com/preset-io/agor/pull/2652))
+- **Native mobile tab shell** — `/m` gets a full-width bottom tab bar with badges, a More sheet that uses the shared create menu, and board tabs. iOS Safari no longer scrolls the page and lifts the bar. ([#2801](https://github.com/preset-io/agor/pull/2801))
+- **Clearer error and status messages** — turn-outcome banners become one compact line that says what happened and offers Resume, Try again or Open settings only when that would work. Board cards, the left panel, branch settings and mobile show plain-language status, with the raw error under Details. Failed actions across the app now say plainly what failed and keep the user's input. ([#2977](https://github.com/preset-io/agor/pull/2977), [#3062](https://github.com/preset-io/agor/pull/3062), [#3063](https://github.com/preset-io/agor/pull/3063), [#2992](https://github.com/preset-io/agor/pull/2992), [#3055](https://github.com/preset-io/agor/pull/3055))
+- **Prompt provenance for agent-sent prompts** — prompts delivered through MCP session tools and zone triggers carry a server-stamped `<agor_prompt_provenance>` block, also recorded on the task. The tag is reserved and escaped out of all other prompt text. ([#2893](https://github.com/preset-io/agor/pull/2893))
+- **Primary coding agent for MCP-created sessions** — when a calling agent leaves out `agenticTool` in `agor_sessions_create`, the authenticated caller's saved **Primary coding agent** is used. Creation fails if no preference is set, and an explicit choice still wins. ([#3057](https://github.com/preset-io/agor/pull/3057))
+- **Persistent callback mode in Session Settings** — Session Settings → Callbacks can now switch a session's callback between Persistent and Once, with an explanation of how one-hop callbacks are relayed. Existing defaults are unchanged. ([#2564](https://github.com/preset-io/agor/pull/2564))
+- **External launcher integration** — an optional trusted cleanup command (`execution.executor_cleanup_command_template`) recovers interrupted tasks with bounded cleanup and an explicit **Retry cleanup**. It can also report an out-of-memory kill, so the turn says the agent went over its memory limit. ([#3006](https://github.com/preset-io/agor/pull/3006), [#3064](https://github.com/preset-io/agor/pull/3064), [#3019](https://github.com/preset-io/agor/pull/3019), [#3024](https://github.com/preset-io/agor/pull/3024))
+  - Executor commands carry an `agent`/`utility` admission class, and a refused launch shows a readable reason.
+  - The prompt payload includes the session's configured model as an informational field.
+
+### Fixes
+
+- **Resumable partial Knowledge transfers** — transfers retain successful per-document work and continue after independent document failures, with bounded sanitized summaries and receipt-backed resume; systemic and safety failures still stop the run. ([#3018](https://github.com/preset-io/agor/pull/3018))
+- **Faster, more reliable startup and reconnects** — the UI loads the current user's data first and each board's data when it is opened, instead of the whole workspace in the background. This fixes empty Home "My work"/"Needs you" lists and missing recent boards. Secondary reads wait until after first paint. Slow or lost connections reconnect with jittered backoff and keep already-loaded state. ([#2952](https://github.com/preset-io/agor/pull/2952), [#2755](https://github.com/preset-io/agor/pull/2755), [#2978](https://github.com/preset-io/agor/pull/2978), [#3002](https://github.com/preset-io/agor/pull/3002))
+- **Session status no longer sticks on running** — completed, failed, stopped and timed-out tasks now update their session in the same write. A permission timeout no longer leaves the session spinning in `awaiting_permission`, and timed-out sessions stay promptable. ([#2620](https://github.com/preset-io/agor/pull/2620))
+- **Branch archive and delete recover** — branch rows that failed or were already cleaned up no longer block maintenance on another branch with the same path. A failed materialization no longer leaves an empty directory behind. Archive/delete now shows a steady in-progress state on the card, and dismissed workspace notifications stay dismissed for everyone. ([#2795](https://github.com/preset-io/agor/pull/2795), [#3054](https://github.com/preset-io/agor/pull/3054))
+- **Branch creation from the remote default** — when no source ref is given, `agor_branches_create` and `agor branch add` resolve the default from the registered remote, as teammates already did, and retries reuse that resolution. If the readiness wait fails after `agor_branches_create` has created the branch, the call still returns the created branch and marks it as not safe to retry. ([#2986](https://github.com/preset-io/agor/pull/2986), [#2985](https://github.com/preset-io/agor/pull/2985))
+- **Gateway replies reach the right thread** — outbound replies are routed by the task's own gateway thread rather than by the session, so a session mapped to several threads answers where each prompt came from. Discord messages with unreadable attachments are no longer dropped silently; the agent is told which files it couldn't read. ([#2892](https://github.com/preset-io/agor/pull/2892), [#3043](https://github.com/preset-io/agor/pull/3043))
+- **Cloud avatars and Slack sync** — a new `identity.avatar_authority` setting lets Agor own avatars while Cloud keeps owning account lifecycle, so manual and Slack avatars survive later Cloud logins. Leaving it unset keeps the existing behavior. ([#3052](https://github.com/preset-io/agor/pull/3052))
+- **Expired but refreshable Claude logins stay usable** — with backend-owned Claude OAuth, an idle grant whose access token has expired no longer shows the sign-in banner, because the next task refreshes it. ([#3048](https://github.com/preset-io/agor/pull/3048))
+- **Blank teammates on private forks** — blank teammates on a private framework fork start from the public template and no longer need a Git token. A missing Git credential is now reported as an authentication failure. ([#3003](https://github.com/preset-io/agor/pull/3003))
+- **Artifact publish fails fast** — binary and oversized artifact payloads are rejected with a clear error instead of dropping the connection with `socket has been disconnected`. ([#2720](https://github.com/preset-io/agor/pull/2720))
+- **Stale UI after deploys** — when a lazy chunk from a previous deploy is gone, the app reloads once instead of showing the crash screen. ([#3053](https://github.com/preset-io/agor/pull/3053))
+- **Composer and layout fixes** — a prompt that was sent is now cleared even if typing continued while it was being sent. The session composer, its overflow menu and the Home ask box are tidied on phones and desktop. The transcript no longer scrolls the drawer body and exposes blank space. ([#3075](https://github.com/preset-io/agor/pull/3075), [#2995](https://github.com/preset-io/agor/pull/2995), [#2994](https://github.com/preset-io/agor/pull/2994), [#3039](https://github.com/preset-io/agor/pull/3039), [#3004](https://github.com/preset-io/agor/pull/3004))
+- **Clerk hidden from the MCP Marketplace** — Clerk's hosted MCP server now requires OAuth with account-management scopes, which no longer matches its read-only docs listing. The entry is hidden until it is re-curated; existing connections are not removed. ([#3084](https://github.com/preset-io/agor/pull/3084))
+- **Smaller fixes** — viewers see Create AI teammate disabled instead of a button that always fails. The banner dismiss tooltip no longer causes scrollbar flicker. The Teammate Knowledge tab's "Open in Knowledge" link works under `/ui`. ([#3078](https://github.com/preset-io/agor/pull/3078), [#3047](https://github.com/preset-io/agor/pull/3047), [#3037](https://github.com/preset-io/agor/pull/3037))
+
+### Security
+
+- **Handlebars 4.7.10** — fixes two critical JavaScript-injection advisories in Handlebars through 4.7.9 (GHSA-8r5x-fm3f-whwj, GHSA-p8wg-vrv2-v86f). The daemon and `agor-live` now require `^4.7.10`. ([#3044](https://github.com/preset-io/agor/pull/3044))
+- **Server-owned callback principal** — client-supplied `callback_created_by` values are discarded. Any change to where a completion callback is delivered binds it to the authenticated caller, who must be allowed to prompt the new target. Spawned children's callbacks run as the caller rather than the parent's creator. ([#3023](https://github.com/preset-io/agor/pull/3023))
+- **Private teammate memory by default** — new daily teammate memory documents are created private and owner-editable instead of public and editable by anyone. A teammate can opt in to other defaults with `kb.memory_visibility` and `kb.memory_edit_policy`. ([#2890](https://github.com/preset-io/agor/pull/2890))
+
+### Breaking
+
+- **Git-friendly Knowledge repositories (format v2)** — exports now use readable folders, per-document YAML headers, a sorted `manifest.yaml` and relative internal links; `agor kb validate` checks repositories offline. V1 bundles are not imported or converted in place: keep them intact and export to a fresh directory; edited v2 repositories still require a new destination namespace rather than overwriting existing Knowledge. ([#3018](https://github.com/preset-io/agor/pull/3018))
+
+### Chores
+
+- **Smaller `agor-live` package** — the published package drops from 126 MiB to 42 MiB unpacked, and from 28 MiB to 14 MiB packed. Configuration and behavior are unchanged; installs are smaller and faster. ([#3084](https://github.com/preset-io/agor/pull/3084))
+  - The daemon bundle no longer inlines zod, about 711 KB that was duplicated into 36 daemon entry files.
+  - The daemon and `@agor/core` builds use code splitting, so shared code is loaded once from shared chunks instead of copied into each entry file. Modules shared across entry points are now a single instance, which removes a duplicate-module hazard that core previously worked around for tenant scope.
+  - The internal bundled packages (`@agor/core`, `@agor/git`, `@agor/agentic-tools`, `@agor/agentic-tool-opencode`) ship ESM only; the CommonJS builds were dropped.
+  - The 0.26.10-era build was over the package-content budget. The budget is now tightened to 55 MiB unpacked, 18 MiB packed and 3400 files.
+- **agor.live site updates** — privacy policy, terms of use and cookie consent, plus home page, hero and footer updates and a Turbopack build. These are marketing-site changes, not product changes. ([#3016](https://github.com/preset-io/agor/pull/3016), [#3015](https://github.com/preset-io/agor/pull/3015), [#3026](https://github.com/preset-io/agor/pull/3026), [#3028](https://github.com/preset-io/agor/pull/3028), [#3029](https://github.com/preset-io/agor/pull/3029), [#3030](https://github.com/preset-io/agor/pull/3030), [#3056](https://github.com/preset-io/agor/pull/3056))
+
+### Upgrade
+
+SDK pins and model defaults are unchanged, and this release adds no database migrations. After publication and verification of all eight npm packages, packaged installations should drain active tasks, install `agor-live@0.27.0`, run `agor install --sync` and `agor doctor`, then restart according to [PUBLISH.md](PUBLISH.md). Existing v1 Knowledge bundles must be re-exported to a fresh directory before they can be imported (see Breaking). Agor Cloud rollout is a separate operator action, not a consequence of npm publication.
+
+## 0.26.10 (2026-10-06)
+
+Release preparation covers merged changes from `v0.26.9` (`a59bc310`) through `ba19f73b`, plus the API-key authentication and Knowledge transfer fixes in this release: [compare merged changes](https://github.com/preset-io/agor/compare/v0.26.9...ba19f73bdf182e420dacfdaf46de71c21679686e). This entry does not imply publication or deployment.
+
+### Features
+
+- **Shared hosted OpenCode sessions** — eligible branch-home sessions now follow branch sharing permissions, with sealed checkpoints shared through the branch SDK home and each turn using the prompting user's own provider key. Execution-home sessions remain owner-only. ([#2969](https://github.com/preset-io/agor/pull/2969))
+- **Opt-in native Codex plugins** — sessions can explicitly enable native plugin support rather than inheriting it implicitly. ([#2966](https://github.com/preset-io/agor/pull/2966))
+
+### Fixes
+
+- **API-key Knowledge imports** — isolates the authentication user lookup so its validator no longer removes `namespace`, `bundle` or pagination fields from the caller's request. Fixes `Invalid Knowledge transfer request` during destination inventory, including resume and dry-run; transfer validation, tenant checks and conflict no-overwrite behavior remain intact. ([#3014](https://github.com/preset-io/agor/pull/3014))
+- **Actionable Knowledge transfer errors** — reports sanitized stage, HTTP method/route, status and invalid-field reasons without exposing credentials or document content. Failed planning no longer unconditionally recommends `--resume --apply`; resolve the error and review a `--resume --dry-run` plan first. ([#3014](https://github.com/preset-io/agor/pull/3014))
+- **Repository setup can recover in place** — retries interrupted bootstrap without deleting existing work and keeps onboarding readiness and progress aligned with repository state. ([#2979](https://github.com/preset-io/agor/pull/2979))
+- **Bounded conversation memory** — adds a byte budget for retained transcript detail, bounds Codex rollout usage reads and drops duplicate tool payloads. ([#2963](https://github.com/preset-io/agor/pull/2963), [#2962](https://github.com/preset-io/agor/pull/2962))
+- **Reliable environment and board updates** — clarifies environment log sources, makes Railway cleanup resumable, and emits board creation events only after the transaction commits. ([#2971](https://github.com/preset-io/agor/pull/2971), [#2972](https://github.com/preset-io/agor/pull/2972))
+- **Gemini task scratch stays ephemeral** — delegated launchers can keep per-task temporary files on launcher-owned scratch rather than a persistent SDK home; invalid scratch configuration fails closed. ([#2960](https://github.com/preset-io/agor/pull/2960))
+
+### Upgrade
+
+SDK pins and model defaults are unchanged. After publication and verification of all eight npm packages, packaged installations should drain active tasks, install `agor-live@0.26.10`, run `agor install --sync` and `agor doctor`, then restart according to [PUBLISH.md](PUBLISH.md). The API-key import fix requires the **destination daemon** to be updated; upgrading only the CLI adds diagnostics but cannot fix the old server. Agor Cloud rollout is a separate operator action, not a consequence of npm publication.
+
+## 0.26.9 (2026-10-02)
+
+Release preparation covers merged changes from `v0.26.8` (`c67b7ba5`) through `d7a676f8`, plus the SDK updates below: [compare merged changes](https://github.com/preset-io/agor/compare/v0.26.8...d7a676f8cee62cd4418a561de71965723f9b19fd). This entry does not imply publication or deployment.
+
+### Features
+
+- **Home and teammate directory** — Home brings together Needs you, My work, recent boards, and an ask box; a shared teammate directory adds caller-scoped navigation. The creation gallery now leads with Start blank. ([#2901](https://github.com/preset-io/agor/pull/2901), [#2907](https://github.com/preset-io/agor/pull/2907), [#2959](https://github.com/preset-io/agor/pull/2959))
+- **OpenCode in hosted workspaces** — eligible deployments can run owner-only OpenCode sessions with per-user provider keys and checkpointed conversation state. Provider failures surface bounded, sanitized errors instead of leaving turns retrying indefinitely; unsupported deployments report the missing prerequisites. ([#2935](https://github.com/preset-io/agor/pull/2935))
+- **Branch-local Railway previews** — an opt-in launcher provisions previews from pushed public source, reuses branch-owned resources, retains data on Stop, and removes it on Nuke. ([#2927](https://github.com/preset-io/agor/pull/2927))
+- **Workspace identity in the header** — verified launches can supply a tenant-specific display label; a configurable external app link lives in the settings menu while the logo returns Home. ([#2945](https://github.com/preset-io/agor/pull/2945), [#2951](https://github.com/preset-io/agor/pull/2951), [#2961](https://github.com/preset-io/agor/pull/2961))
+
+### Fixes
+
+- **Claude and Codex runtime reliability** — updates Claude Agent SDK from 0.3.284 to 0.3.288 (Claude Code 2.1.288), including upstream fixes for streaming timeouts, resume/compaction, headless termination, and duplicate MCP calls; updates Codex SDK and CLI from 0.159.0 to 0.160.0 for startup and provider-catalog fixes. Model lists and defaults stay unchanged, including Claude Sonnet 5.5 and GPT-6 Astra; after publication and npm verification, packaged installations must drain active tasks, upgrade Agor, run `agor install --sync` and `agor doctor`, then restart. ([#2967](https://github.com/preset-io/agor/pull/2967))
+- **Faster session loading** — prioritizes the opened conversation, defers global hydration, and reduces session-list payloads. WebSocket compression supports Firefox and has an operator-controlled off switch; session settings and zone triggers show Retry rather than using incomplete context when full details cannot load. ([#2887](https://github.com/preset-io/agor/pull/2887), [#2947](https://github.com/preset-io/agor/pull/2947), [#2948](https://github.com/preset-io/agor/pull/2948))
+- **Bounded memory during long sessions** — limits retained transcript detail and realtime access-cache entries, releases completed thinking payloads and obsolete search callbacks, and settles pending socket requests on disconnect. Home selectors and shared branch-card styles also reduce repeated work. ([#2950](https://github.com/preset-io/agor/pull/2950), [#2949](https://github.com/preset-io/agor/pull/2949), [#2930](https://github.com/preset-io/agor/pull/2930), [#2908](https://github.com/preset-io/agor/pull/2908), [#2932](https://github.com/preset-io/agor/pull/2932), [#2905](https://github.com/preset-io/agor/pull/2905), [#2953](https://github.com/preset-io/agor/pull/2953))
+- **Teammate setup recovers from missed clone events** — rechecks repository readiness, provides teammate creation from an empty board tab, and resolves implicit template defaults from the registered remote. ([#2942](https://github.com/preset-io/agor/pull/2942), [#2924](https://github.com/preset-io/agor/pull/2924))
+- **Database upgrades preserve ownership boundaries** — repairs upgrade guards and same-tenant owner recovery. If ownership still cannot be attributed, migration stops with guidance to preserve the data and assign a real owner in the same tenant before retrying. ([#2955](https://github.com/preset-io/agor/pull/2955))
+- **Conversation layout and activity cues** — adds footer spacing and a persistent activity spinner, and finishes the compact header sizing in session drawers and board panels. ([#2944](https://github.com/preset-io/agor/pull/2944), [#2929](https://github.com/preset-io/agor/pull/2929))
+
+### Security
+
+- **Tenant-confined repository operations** — hosted repositories accept network Git remotes only, keep local paths server-owned, and reject origin realignment outside the caller's tenant repository root. ([#2934](https://github.com/preset-io/agor/pull/2934))
+- **Contained delegated branch deletion** — validates mounted storage roots and the exact branch SDK-home target, runs as the requesting Manager, and refuses unsupported executor setups before deletion begins. Shared execution homes remain outside the deletion targets. ([#2943](https://github.com/preset-io/agor/pull/2943))
+
+### Chores
+
+- **Release and deployment diagnostics** — adds the canonical `PUBLISH.md` preparation, approval, recovery, and upgrade runbook, plus trusted deployment provenance for analytics. ([#2925](https://github.com/preset-io/agor/pull/2925), [#2923](https://github.com/preset-io/agor/pull/2923))
+
+## 0.26.8 (2026-09-29)
+
+Release preparation includes merged changes from `v0.26.7` (`fb272b8d`) through `504c7ec7`, plus the Claude and Codex model and runtime updates below: [compare merged changes](https://github.com/preset-io/agor/compare/v0.26.7...504c7ec7608d45bbc069791196e620db9d606d38). This entry does not imply publication or deployment.
+
+### Features
+
+- **Claude Sonnet 5.5 is the new Claude default** — adds `claude-sonnet-5-5` with its native 1M context and uses it for new Claude sessions with no configured model. The pinned Claude Agent SDK moves to 0.3.284 (Claude Code 2.1.284); older runtimes cap the model at 200k context. Packaged installations must upgrade Agor and synchronize their managed integrations with `agor install --sync` before restarting. ([#2915](https://github.com/preset-io/agor/pull/2915))
+- **GPT-6.1 Sol for Codex** — adds `gpt-6.1-sol` with its 1.05M context and pricing, listed ahead of GPT-6 Sol; the Codex default stays GPT-6 Astra. The pinned Codex SDK and bundled CLI move to 0.159.0, because 0.156.1 rejects the model under ChatGPT sign-in. Packaged installations need their Codex integration synchronized with `agor install --sync` before restarting. ([#2915](https://github.com/preset-io/agor/pull/2915))
+- **Private and shared MCP installs** — Catalog installs are private by default, even for admins. Admins and members with CRUD authority can share a server's configuration for session-scoped use; the installer's credentials are never shared. ([#2913](https://github.com/preset-io/agor/pull/2913))
+- **Agents can read Discord channel history** — an opt-in `agent_tools.channel_history` capability for Discord gateway channels, with a bounded MCP tool limited to allowlisted channels and their public threads. ([#2872](https://github.com/preset-io/agor/pull/2872))
+- **Two-way Discord direct messages** — an opt-in, per-channel switch lets allowlisted server members message a gateway privately, with one session per person, and lets agents send proactive messages to current members. Disabled by default. ([#2885](https://github.com/preset-io/agor/pull/2885))
+- **A calmer interface** — borderless agent replies and grouped avatars in the transcript, compact board and session panel headers, table-first settings lists for MCP servers, teammates, gateways, and artifacts, and a single-row MCP Catalog filter bar. ([#2815](https://github.com/preset-io/agor/pull/2815), [#2904](https://github.com/preset-io/agor/pull/2904), [#2889](https://github.com/preset-io/agor/pull/2889), [#2900](https://github.com/preset-io/agor/pull/2900))
+
+### Fixes
+
+- **Gemini coding works again** — restores edits, follow-up turns, visible tool results, and usage accounting on the pinned Gemini SDK (0.61.0). Gemini is now marked Beta, and Manual permission mode is steered away from because it is unsupported. Packaged installations need their Gemini integration synchronized with `agor install --sync`. ([#2886](https://github.com/preset-io/agor/pull/2886))
+- **`AGOR_HOME` is honored** — every Agor-owned path now follows `AGOR_HOME`, so a test daemon no longer reads or writes the default deployment's configuration and database. ([#2891](https://github.com/preset-io/agor/pull/2891))
+- **Branch deletion recovers safely** — retryable deletion failures can be retried without treating executor exit or timeouts as proof that cleanup finished, and records with many unrelated references no longer block permanent deletion. ([#2902](https://github.com/preset-io/agor/pull/2902), [#2912](https://github.com/preset-io/agor/pull/2912))
+- **MCP choices match what you can attach** — the session picker lists only servers the caller may attach, and removing a Catalog server confirms the full attachment count before detaching it. Missing inherited MCP defaults are skipped with a visible warning instead of blocking session creation; explicit selections stay strict. ([#2899](https://github.com/preset-io/agor/pull/2899), [#2869](https://github.com/preset-io/agor/pull/2869))
+- **Branch commands work with per-user sandbox homes** — `.agor.yml` import/export, Knowledge branch commands, and Slack file uploads resolve the caller's sandbox mounts, and `.agor.yml` import no longer holds a database transaction while the executor runs. ([#2883](https://github.com/preset-io/agor/pull/2883), [#2894](https://github.com/preset-io/agor/pull/2894))
+- **Archiving keeps session trees intact** — remote-created child sessions no longer reappear as root sessions after their creator is archived. ([#2881](https://github.com/preset-io/agor/pull/2881))
+- **Internal Claude Code events stay out of conversations** — signals such as `vcs_state_changed` after a `git push` are dropped instead of rendering as raw SDK event rows. ([#2882](https://github.com/preset-io/agor/pull/2882))
+- **Managed environments tolerate cold starts** — launcher admission allows 30s and executor startup 180s, so autoscaling and image pulls no longer fail healthy launches. ([#2897](https://github.com/preset-io/agor/pull/2897))
+- **Knowledge export and import work on macOS** — `agor kb export` and `agor kb import` no longer require Linux; Windows reports a clear WSL requirement. ([#2880](https://github.com/preset-io/agor/pull/2880))
+- **Streaming code uses bounded memory** — completed syntax highlights are kept in a small shared cache instead of accumulating for the life of the page. ([#2909](https://github.com/preset-io/agor/pull/2909))
+- **Smaller fixes** — removes the primary teammate replace/clear controls from the board drawer and adds safe, bounded Codex failure diagnostics. ([#2903](https://github.com/preset-io/agor/pull/2903), [#2871](https://github.com/preset-io/agor/pull/2871))
+
+### Chores
+
+- **Docs refresh** — a Compose-first Environments quick start, implementation notes removed from user guides, and a contact page on the docs site. ([#2878](https://github.com/preset-io/agor/pull/2878), [#2875](https://github.com/preset-io/agor/pull/2875), [#2873](https://github.com/preset-io/agor/pull/2873))
+
+## 0.26.7 (2026-09-25)
+
+Release preparation covers merged changes from `v0.26.6` (`d5ef6a03`) through `4d7c3320`: [compare changes](https://github.com/preset-io/agor/compare/v0.26.6...4d7c3320fc5bb6b3927de7191322c6a16b74edd3). This entry does not imply publication or deployment.
+
+### Features
+
+- **CLI sign-in for hosted workspaces** — adds browser-assisted sign-in with an explicitly created, pasted CLI key, plus `agor login --api-key` for existing personal keys. CLI-created keys are managed per machine and normally revoked on logout; hosted use requires trusted workspace-host routing and an edge that forwards CLI REST requests to the daemon. ([#2847](https://github.com/preset-io/agor/pull/2847))
+- **Git changes in the Files tab** — shows staged and working-tree status separately, with status colors, badges, and File/Changes previews, including deleted files. Large diff previews are bounded rather than freezing the browser. ([#2621](https://github.com/preset-io/agor/pull/2621))
+- **Manage pending work without interrupting active tasks** — authorized agents can atomically cancel selected queued tasks or reorder a complete queue snapshot; stale queues are rejected. A conditional Stop workflow guards against stopping a different task after the observed task changes. ([#2800](https://github.com/preset-io/agor/pull/2800))
+- **Connect MCP accounts from the conversation** — agents can request a browser OAuth Connect card, including delivery into supported Slack threads. Credentials remain with the prompting user, and session attachment follows verified sign-in and attachment permissions, not merely a button click. ([#2774](https://github.com/preset-io/agor/pull/2774))
+- **More attachment options** — session uploads accept any file type within existing size/count limits, while only raster images and PDFs are eligible for inline viewing and other types download instead. Discord gateway messages gain image attachments; gateway ingestion retains its own narrower file policy. ([#2844](https://github.com/preset-io/agor/pull/2844), [#2773](https://github.com/preset-io/agor/pull/2773))
+- **Clearer session lists** — unifies rows across panels, board cards, and the Sessions tab, with roomier spacing, clearer failure and selection states, faster tree toggles, and title tooltips only for truncated titles. ([#2820](https://github.com/preset-io/agor/pull/2820), [#2837](https://github.com/preset-io/agor/pull/2837), [#2848](https://github.com/preset-io/agor/pull/2848), [#2855](https://github.com/preset-io/agor/pull/2855))
+
+### Fixes
+
+- **Conversation content stays intact** — preserves Claude thinking content before persistence and keeps confirmed prompt bubbles stable as messages arrive. ([#2833](https://github.com/preset-io/agor/pull/2833), [#2858](https://github.com/preset-io/agor/pull/2858))
+- **Concurrent Codex launches preserve authentication mounts** — keeps branch credential mountpoints stable across concurrent sandbox launches. ([#2851](https://github.com/preset-io/agor/pull/2851))
+- **Uploads recover from stale access tokens** — refreshes authentication after an upload 401 and retries rather than leaving a stale-token failure. ([#2838](https://github.com/preset-io/agor/pull/2838))
+- **Board imports tolerate unavailable objects** — imports boards containing artifact or app objects, retaining only artifact references accessible in the importing workspace; malformed or unavailable objects are skipped with a summary rather than failing the whole import. ([#2845](https://github.com/preset-io/agor/pull/2845))
+- **Knowledge lists respect pagination** — applies read permissions, sorting, limits, offsets, and totals in SQL instead of loading the full document corpus. API consumers should follow the returned pages rather than assume one request returns every document. ([#2843](https://github.com/preset-io/agor/pull/2843))
+- **Gateway activity and delegated cleanup recover** — restores Slack channel activity status and permits contained branch deletion in delegated execution mode without relaxing path containment. ([#2850](https://github.com/preset-io/agor/pull/2850), [#2841](https://github.com/preset-io/agor/pull/2841))
+- **More useful failure diagnostics** — distinguishes executor interruption causes, records safe credential-write failures, and adds bounded MCP authentication-rejection logs with safe client hints. Caller-supplied Stop reasons stay out of operational logs. ([#2835](https://github.com/preset-io/agor/pull/2835), [#2840](https://github.com/preset-io/agor/pull/2840), [#2857](https://github.com/preset-io/agor/pull/2857))
+
+## 0.26.6 (2026-09-23)
+
+Release preparation includes merged changes from `v0.26.5` through `0c9ad63a`, plus the Claude and Codex runtime updates below: [compare merged changes](https://github.com/preset-io/agor/compare/v0.26.5...0c9ad63adfaae859f65993f66d05939b137c9bcd).
+
+### Fixes
+
+- **Opus 5.5 uses a compatible Claude runtime** — upgrades the pinned Claude Agent SDK to 0.3.280, which bundles Claude Code 2.1.280, resolving the older-runtime model rejection. Packaged installations must upgrade Agor and synchronize their managed integrations with `agor install --sync` before restarting; updating a global `claude` executable does not update Agor's runtime. ([#2830](https://github.com/preset-io/agor/pull/2830))
+- **Codex runtime recognizes GPT-6 Sol and Luna** — includes the Luna compatibility fix and updates the pinned Codex SDK and bundled CLI to stable 0.156.1, including upstream Sol/Luna model-catalog support. Packaged installations need their version-aligned Codex integration synchronized before restart. ([#2827](https://github.com/preset-io/agor/pull/2827), [#2830](https://github.com/preset-io/agor/pull/2830))
+- **Older conversation text expands again** — restores **See more** for historical messages, bounds previews by characters or source lines, and stabilizes initial history hydration and explicit bottom scrolling. ([#2828](https://github.com/preset-io/agor/pull/2828))
+- **Session and board inventories do less work** — reuses configuration grant sets, enforces session recency, and skips optional inventory counts when they are not requested. ([#2829](https://github.com/preset-io/agor/pull/2829))
+
+### Chores
+
+- **Release verification tolerates registry propagation** — bounds npm visibility verification by an elapsed deadline rather than a misleading retry budget. ([#2826](https://github.com/preset-io/agor/pull/2826))
+
+## 0.26.5 (2026-09-23)
+
+Release preparation covers merged changes from `v0.26.4` (`15c779d5`) through `e4a88198`: [compare changes](https://github.com/preset-io/agor/compare/v0.26.4...e4a88198ab2090c563c2a239be0cb464cd5c43ed).
+
+### Breaking
+
+- **Recorded tool counts replace the legacy counter** — API clients must replace `tool_use_count` with nullable `recorded_tool_count`; custom callback templates must replace `toolUseCount` with `recordedToolCount`. Missing counts mean unknown, not zero; use `{{#if recordedToolCount includeZero=true}}` to include a verified zero in a template. ([#2806](https://github.com/preset-io/agor/pull/2806))
+
+### Features
+
+- **Move Knowledge namespaces with a plan-first CLI** — `agor kb export` and `agor kb import` support dry runs, hash-verified incremental copying, resumable transfers, and reference reconciliation; read-only namespace and document discovery helps inspect the source and destination. Import requires `--apply` and creates a new private, caller-owned namespace rather than copying source permissions. ([#2821](https://github.com/preset-io/agor/pull/2821))
+  - The directory adapter requires Linux. Transfers cover current Markdown documents, not a full backup: history, archived documents, asset bytes, manually authored graph edges, and credentials are excluded. Export requires workspace-admin access; review imported links and content before sharing.
+- **Lighter, paged conversations** — sessions initially load the latest ten turns, with older history and recorded tool details loaded on demand. Batched transcript reads and on-demand usage accounting reduce redundant work; search covers loaded history and expanded tool details only. ([#2806](https://github.com/preset-io/agor/pull/2806), [#2808](https://github.com/preset-io/agor/pull/2808))
+- **New model choices** — adds Claude Opus 5.5, including its 1M-context choice, and GPT-6 Sol and Luna to the supported model selectors. ([#2816](https://github.com/preset-io/agor/pull/2816))
+
+### Security
+
+- **Prompt failures do not expose database details** — database errors return sanitized messages while retaining bounded operator diagnostics; completion fanout runs after prompt locks are released. ([#2807](https://github.com/preset-io/agor/pull/2807))
+- **Tenant links use verified launch routing** — generated links and HA identity-picker redirects use trusted tenant origins, including packaged runtime paths, rather than accepting unconfigured destinations. ([#2789](https://github.com/preset-io/agor/pull/2789))
+
+### Fixes
+
+- **Branch sources no longer assume an `origin` remote** — branch creation and restoration resolve source refs while preserving source provenance and remote tracking, including repositories with differently named remotes. ([#2622](https://github.com/preset-io/agor/pull/2622))
+- **Streaming tool activity stays together** — live tool activity remains in one contiguous disclosure without duplicate ownership, routine tool errors stay out of activity summaries, and AgentChain text and reasoning blocks are extracted safely. ([#2818](https://github.com/preset-io/agor/pull/2818), [#2813](https://github.com/preset-io/agor/pull/2813))
+- **Reconnects tolerate partial board data** — comments and user initials render safely while missing content or identity fields are still being rehydrated, avoiding a session-panel crash. ([#2812](https://github.com/preset-io/agor/pull/2812))
+- **Session navigation and scrolling stay stable** — repairs mobile session exit, primary-teammate navigation, and board-switcher scrolling; preserves resize guards across consecutive frames and aligns session-tree hover surfaces and collapse controls. ([#2796](https://github.com/preset-io/agor/pull/2796), [#2797](https://github.com/preset-io/agor/pull/2797), [#2793](https://github.com/preset-io/agor/pull/2793))
+- **Archived teammate descendants reconcile correctly** — confirmed archive results refresh descendant sessions without overwriting newer state, with bounded refresh work and warnings when reconciliation cannot complete. ([#2786](https://github.com/preset-io/agor/pull/2786))
+- **Credential reminders respect multiple tools and dismissals** — onboarding handles multi-tool credential states and remembers explicit opt-outs; integrations reminders retain their separate snooze behavior. ([#2628](https://github.com/preset-io/agor/pull/2628), [#2796](https://github.com/preset-io/agor/pull/2796))
+
+## 0.26.4 (2026-09-20)
+
+### Breaking
+
+- **OAuth upgrades require an offline cutover** — MCP OAuth and Claude authentication now use fenced, durable authority in PostgreSQL deployments. Stop every daemon and quiesce OAuth activity, back up the database and shared workspace volume, then run `agor db migrate --yes --offline-cutover` before starting only the new cohort; do not mix old and new daemons. ([#2647](https://github.com/preset-io/agor/pull/2647), [#2752](https://github.com/preset-io/agor/pull/2752))
+  - Follow the [HA rollout and rollback checklist](https://agor.live/guide/daemon-ha#rollout-and-rollback-checklist), including capability checks and reconnecting grants where required. Rolling back below the new migration watermark requires a tested backup restore or coordinated schema-and-ledger rollback, not simply older binaries.
+- **Archive cleanup is explicit and disabled by default** — repository administrators must enable cleanup before managers can request it; unavailable cleanup defaults to leaving files untouched. The supported built-in command removes ignored files only, while custom commands remain blocked and branch protection does not prevent full deletion. ([#2742](https://github.com/preset-io/agor/pull/2742))
+
+### Features
+
+- **A touch-oriented mobile workspace** — narrow viewports gain bottom-tab navigation, board switching, and the shared session composer with model, permission, attachment, and task controls. Follow-up fixes guard session creation by identity and preserve environment-variable edits. ([#2747](https://github.com/preset-io/agor/pull/2747), [#2777](https://github.com/preset-io/agor/pull/2777))
+- **Transfer board and branch ownership explicitly** — authorized owners can hand off ownership through dedicated actions rather than editing permission entries to imply a transfer. ([#2787](https://github.com/preset-io/agor/pull/2787))
+- **Recover failed branch provisioning** — explicit retry actions in the API, MCP, and UI recover failed creation or restoration with generation fencing, preventing stale executor results from overwriting a newer attempt. ([#2118](https://github.com/preset-io/agor/pull/2118))
+- **Permanent branch deletion is executor-owned** — deletion tracks storage removal and database cleanup as a recoverable lifecycle, retaining failure details instead of claiming completion before owned files are removed. ([#2743](https://github.com/preset-io/agor/pull/2743))
+- **More hosted tools in the MCP Marketplace** — expands the curated catalog and restores GitHub through its documented fine-grained-PAT route, verifying credentials against the pinned endpoint before storage rather than promising unsupported OAuth registration. ([#2646](https://github.com/preset-io/agor/pull/2646))
+- **Connect and try tools without losing your place** — the unified Catalog management experience supports in-context onboarding, staged teammate tryouts, and editable starter drafts; onboarding also prefers existing Slack gateways. ([#2565](https://github.com/preset-io/agor/pull/2565), [#2715](https://github.com/preset-io/agor/pull/2715), [#2651](https://github.com/preset-io/agor/pull/2651))
+- **Recover MCP authentication during active work** — supported runtimes can reacquire task-scoped MCP projections without replaying tool calls, with Slack-thread authentication recovery and actionable policy diagnostics. ([#2566](https://github.com/preset-io/agor/pull/2566), [#2716](https://github.com/preset-io/agor/pull/2716))
+- **Onboarding offers supported authentication choices** — Claude OAuth appears only when deployment capabilities permit it, and Codex is recommended alongside Claude. ([#2663](https://github.com/preset-io/agor/pull/2663), [#2780](https://github.com/preset-io/agor/pull/2780))
+- **Operator observability improves** — passive daemon load metrics and measured MCP operations complement operator-supplied analytics metadata and environment-backed HTTP authentication. Segment tracking uses the consistent `agor_event` event name. ([#2772](https://github.com/preset-io/agor/pull/2772), [#2723](https://github.com/preset-io/agor/pull/2723), [#2710](https://github.com/preset-io/agor/pull/2710), [#2711](https://github.com/preset-io/agor/pull/2711))
+
+### Security
+
+- **Claude refresh credentials remain daemon-owned** — supported sandbox routes mask canonical refreshable credentials and deliver only short-lived task tokens; refresh, logout, and replacement login are fenced against stale writers. This does not claim equivalent canonical-file containment for Codex. ([#2752](https://github.com/preset-io/agor/pull/2752))
+- **MCP authorization and grant retirement fail closed** — caller resolution consistently rejects external requests without an authenticated user, and deleting a consenting account retires its shared OAuth grants. ([#2696](https://github.com/preset-io/agor/pull/2696), [#2717](https://github.com/preset-io/agor/pull/2717))
+- **Harden upload and YAML handling** — updates Multer, cleans up interrupted uploads, and bounds YAML merge work across consumers. ([#2763](https://github.com/preset-io/agor/pull/2763), [#2764](https://github.com/preset-io/agor/pull/2764))
+
+### Fixes
+
+- **Claude completion reflects actual terminal evidence** — SDK error flags and missing terminal responses no longer become false successful completions. Codex runtime notices are distinguished from MCP failures, and complete tool transcript writes are bounded. ([#2788](https://github.com/preset-io/agor/pull/2788), [#2705](https://github.com/preset-io/agor/pull/2705), [#2749](https://github.com/preset-io/agor/pull/2749))
+- **Session lifecycle actions stay consistent** — fork/resume callbacks use refreshed runtime identity, branch-local archival includes descendant coverage, and Stop remains pending until a remote executor connects rather than claiming premature completion. ([#2690](https://github.com/preset-io/agor/pull/2690), [#2678](https://github.com/preset-io/agor/pull/2678), [#2737](https://github.com/preset-io/agor/pull/2737))
+- **MCP discovery and reconnect are more reliable** — saved discovery accepts bounded multiline descriptions with clearer failure diagnostics, expired grants refresh before discovery, and Google grants retain refreshability. ([#2650](https://github.com/preset-io/agor/pull/2650), [#2718](https://github.com/preset-io/agor/pull/2718), [#2576](https://github.com/preset-io/agor/pull/2576))
+- **MCP selections stay editable and synchronized** — disabled servers can be removed from selected chips, picker popups stay anchored, and newly created sessions retain the selected attachments. ([#2701](https://github.com/preset-io/agor/pull/2701), [#2756](https://github.com/preset-io/agor/pull/2756))
+- **Connection and upload failures are actionable** — attachment errors retain diagnostic details and searchable references, Slack connection tests use newly entered tokens, and daemon connection errors no longer assume a particular deployment. ([#2679](https://github.com/preset-io/agor/pull/2679), [#2396](https://github.com/preset-io/agor/pull/2396), [#2776](https://github.com/preset-io/agor/pull/2776))
+- **Boards and archive controls honor current authority** — authorized inherited branches can move boards, zone placement reconciles with server state, saving a prompt template preserves its zone name, and Archive actions use the current workspace authority projection. ([#2736](https://github.com/preset-io/agor/pull/2736), [#2648](https://github.com/preset-io/agor/pull/2648), [#2724](https://github.com/preset-io/agor/pull/2724), [#2753](https://github.com/preset-io/agor/pull/2753))
+- **Long session lists and queues remain usable** — teammate trees size to their panel, board session lists and overflowing branch trees scroll correctly, and the task queue stays bounded and resizable. Preview scrolling and persisted stream reconciliation are also corrected. ([#2702](https://github.com/preset-io/agor/pull/2702), [#1814](https://github.com/preset-io/agor/pull/1814), [#2779](https://github.com/preset-io/agor/pull/2779), [#2775](https://github.com/preset-io/agor/pull/2775), [#2767](https://github.com/preset-io/agor/pull/2767))
+- **Large workspaces do less redundant work** — board and group-permission reads are streamlined, credential hydration yields instead of blocking the daemon, idle OAuth polling stops, and session deep links no longer wait on unrelated work. ([#2707](https://github.com/preset-io/agor/pull/2707), [#2709](https://github.com/preset-io/agor/pull/2709), [#2712](https://github.com/preset-io/agor/pull/2712), [#2713](https://github.com/preset-io/agor/pull/2713), [#2719](https://github.com/preset-io/agor/pull/2719), [#2722](https://github.com/preset-io/agor/pull/2722), [#2727](https://github.com/preset-io/agor/pull/2727))
+- **Default teammate homes are local-first** — creating a teammate no longer assumes a remote repository for its default home. OpenCode model discovery is decoupled from its runtime binary and rejects malformed selections. ([#2758](https://github.com/preset-io/agor/pull/2758), [#2700](https://github.com/preset-io/agor/pull/2700))
+
+### Chores
+
+- **Managed runtimes stay aligned and scriptless** — Claude Agent SDK moves to 0.3.272 and Codex SDK to 0.154.0 while preserving scriptless managed-runtime installation checks. ([#2769](https://github.com/preset-io/agor/pull/2769))
+- **Native Windows support is explicit** — npm rejects unsupported native Windows runtime installs; remote browser access and the portable client remain available. ([#2754](https://github.com/preset-io/agor/pull/2754))
+
+## 0.26.3 (2026-09-08)
+
+### Security
+
+- **Memory append preserves private Knowledge visibility** — appending teammate memory no longer republishes private documents. ([#2615](https://github.com/preset-io/agor/pull/2615))
+
+### Features
+
+- **Environment commands use bounded asynchronous execution** — command execution and instance guidance expose a bounded workflow rather than requiring an unbounded request. ([#2682](https://github.com/preset-io/agor/pull/2682))
+
+### Fixes
+
+- **Workspace navigation and inventories recover correctly** — bounds worktree session lists, corrects MCP pagination, validates board presence, and reduces session visibility work to branch-level checks. ([#2687](https://github.com/preset-io/agor/pull/2687), [#2688](https://github.com/preset-io/agor/pull/2688), [#2689](https://github.com/preset-io/agor/pull/2689))
+- **Canvas and application navigation stay responsive** — session-tree gestures preserve canvas zoom and panning, Home navigation no longer wedges the shell, and profile edits refresh the authentication snapshot. ([#2692](https://github.com/preset-io/agor/pull/2692), [#2693](https://github.com/preset-io/agor/pull/2693), [#2606](https://github.com/preset-io/agor/pull/2606), [#2655](https://github.com/preset-io/agor/pull/2655))
+- **Gateway and tool diagnostics retain their meaning** — mapped threads keep routing after proactive messages, remote capability descriptions are safely bounded, clone failures preserve safe diagnostics, and Sandpack compilation is distinguished from provider lifecycle. ([#2673](https://github.com/preset-io/agor/pull/2673), [#2691](https://github.com/preset-io/agor/pull/2691), [#2686](https://github.com/preset-io/agor/pull/2686), [#2694](https://github.com/preset-io/agor/pull/2694))
+
+## 0.26.2 (2026-09-07)
+
+### Breaking
+
+- **Board and branch RBAC is always enabled** — authentication was already mandatory; Agor now has one normalized authorization contract across REST, MCP, realtime, files, terminals, and the UI. Omit `execution.branch_rbac` and `AGOR_RBAC_ENABLED`; `true` is accepted temporarily as a deprecated no-op, while false or malformed values fail startup. ([#2669](https://github.com/preset-io/agor/pull/2669))
+  - Single-user owners keep Manager/write access. Before upgrading an installation that intentionally ran with RBAC off, back up the database, stop the whole daemon cohort, and review normalized private/shared policies; the upgrade never auto-widens them to reproduce open access.
+  - Do not mix old and new daemons. To roll back, stop the new cohort and explicitly set RBAC true for the old release before restarting it against a supported database version.
+
+### Security
+
+- **The authenticated-member open-access fallback is removed** — Board/Branch visibility, Session and Task authority, direct MCP queries and egress, filesystem projection, and realtime audiences now always enforce current normalized policy. ([#2669](https://github.com/preset-io/agor/pull/2669))
+
+### Features
+
+- **GPT-6 Astra is available** — adds the model to supported selections. The MCP Marketplace also adds the Preset gateway. ([#2676](https://github.com/preset-io/agor/pull/2676), [#2638](https://github.com/preset-io/agor/pull/2638))
+
+### Fixes
+
+- **Tenant-scoped operations retain their authority** — repairs tenant context for gateway probes, artifact routes, upload authorization, and child-session admission. ([#2675](https://github.com/preset-io/agor/pull/2675), [#2674](https://github.com/preset-io/agor/pull/2674), [#2680](https://github.com/preset-io/agor/pull/2680), [#2683](https://github.com/preset-io/agor/pull/2683))
+- **Board and session presentation is restored** — primary owners can edit board metadata, SDK task lists render correctly, and on-board card descriptions render Markdown. ([#2684](https://github.com/preset-io/agor/pull/2684), [#2681](https://github.com/preset-io/agor/pull/2681), [#2656](https://github.com/preset-io/agor/pull/2656))
+
+## 0.26.1 (2026-09-03)
+
+### Fixes
+
+- **Claude and Codex integrations track current SDK contracts** — upgrades the managed runtimes to Claude Agent SDK 0.3.259 and Codex SDK 0.153.0, including cumulative Claude result accounting, background-task snapshots, prompt provenance, and Codex cache-write usage. Adds the verified `claude-fable-5-1` alias with native 1M context while deliberately retaining OpenCode 1.14.33 pending a dedicated event/API migration. ([#2667](https://github.com/preset-io/agor/pull/2667))
+
+### Chores
+
+- **Align the 0.26.1 release train** — `agor-live`, the CLI, client, and version-aligned agentic-tool packages now share the release version. ([#2667](https://github.com/preset-io/agor/pull/2667))
+
+## 0.26.0 (2026-08-30)
+
+### Breaking
+
+- **Board and branch permissions use a normalized capability model** — the upgrade is a coordinated offline, big-bang migration; old daemons cannot run against the migrated authority model. Legacy rules are mapped conservatively, so some access may become more restrictive. ([#2555](https://github.com/preset-io/agor/pull/2555))
+  - Before upgrading, inspect `agor db status --json`, drain work, stop every daemon connected to the database, and take and test a complete database backup. Install 0.26.0 without starting its daemon.
+  - From 0.26.0, run `agor db migrate --offline-cutover --yes` once. If primary-owner attribution fails, resolve the listed board or branch IDs and retry; do not assign an arbitrary owner merely to pass migration.
+  - Start only 0.26.0 daemons, then review important board and branch permission screens, especially materialized overrides and legacy cross-user prompt access. To roll back, stop the new cohort and restore the complete pre-migration database backup; do not run an old daemon against the migrated policy schema.
+- **Socket clients authenticate only at the namespace handshake** — `createClient` requires `socketAuthentication` for protected services and no longer exposes Feathers' post-connect `authenticate`, `reAuthenticate`, or `logout` methods. Use `createRestClient` for credential exchange/refresh and let reconnect present the latest access token. ([#2520](https://github.com/preset-io/agor/pull/2520))
+
+### Security
+
+- **Board visibility, branch capabilities, file mounts, and personal session sharing are explicit** — immutable primary owners, normalized person/group entries, unmatched-member fallback, whole-package branch inheritance, and owner-authored sharing replace implicit branch-derived board access and foreign-session prompt tiers. Shared prompts preserve the owner's native home but use the actual caller's task attribution, managed credentials, MCP visibility, and branch filesystem projection. ([#2555](https://github.com/preset-io/agor/pull/2555))
+- **Tenant authority and realtime delivery are fail-closed end to end** — Socket.IO establishes one immutable server-owned principal/tenant projection per connection; tenant-qualified rooms, Feathers/Redis publication, executor and terminal capabilities, distributed revocation, and custom realtime handlers derive from that authenticated authority and re-authorize at replica boundaries. ([#2520](https://github.com/preset-io/agor/pull/2520))
+
+### Fixes
+
+- **Local CLI inspection no longer requires login** — `agor open` and `agor version` now target the local deployment by default, retain `--local` as a compatibility alias, and use the connected deployment only with `--remote`. ([#2468](https://github.com/preset-io/agor/pull/2468))
+- **Curated marketplace OAuth works across reviewed provider variations** — marketplace installs use a bounded interoperability profile while preserving PKCE S256 and issuer/resource binding; explicit strict and legacy policies remain available. Compatibility is re-evaluated against the current curated endpoint and auth policy, so imported, removed, or edited installs fail closed. ([#2377](https://github.com/preset-io/agor/pull/2377))
+  - GitHub, MongoDB, Box, HubSpot, Slack, Prisma, PagerDuty, and Kagi are no longer advertised because the read-only OAuth audit could not reach a safely bound client-registration boundary. Existing saved rows are not deleted.
+  - Existing strict grants retain their binding. Moving an install into or out of marketplace compatibility invalidates the old grant and requires authorization again.
+  - Standalone SQLite callbacks now bind the saved server through provider exchange, and Settings shows catalog-managed Marketplace policy instead of labeling it Strict.
+
+### Chores
+
+- **Align the 0.26.0 release train** — `agor-live`, the CLI, client, and version-aligned agentic-tool packages now share the release version. Agent SDK versions remain unchanged after a conservative compatibility review. ([#2623](https://github.com/preset-io/agor/pull/2623))
+
+## 0.25.2 (2026-08-18)
+
+### Breaking
+
+- **CLI commands now have one explicit deployment context** — root help separates local administration from commands targeting the connected deployment. `repo add-local` moves to `local add-repo`, `user create-admin` moves to `local create-admin`, and the obsolete `branch cd`, `auth …`, and `whoami` commands are removed. `open` and `version` target the current login by default and accept `--local` only as an explicit override. ([#2391](https://github.com/preset-io/agor/pull/2391))
+
+### Fixes
+
+- **Remote user listing honors the active login** — `agor user list` now uses the shared authenticated daemon client instead of opening the local database. CLI architecture regressions prevent connection commands from bypassing that client boundary. ([#2391](https://github.com/preset-io/agor/pull/2391))
+- **Deployment targeting stays isolated** — an explicit `agor login --url` no longer depends on the presence or validity of unrelated local configuration, while daemon-backed local operations require authentication to the matching local deployment. Root help grouping and execution policy now derive from one command metadata model to prevent context drift. ([#2391](https://github.com/preset-io/agor/pull/2391))
+
+### Chores
+
+- **Align the 0.25.2 release train** — `agor-live`, the CLI, client, and version-aligned agentic-tool packages now share the release version.
+
+## 0.25.1 (2026-08-18)
+
+> [!WARNING]
+> This is a breaking upgrade for deployments using `execution.unix_user_mode: strict` or `insulated`. Read [Why Agor is leaving Unix impersonation behind](https://agor.live/blog/why-agor-is-leaving-unix-impersonation-behind) and the migration notes below before upgrading. Take tested database, configuration, and storage backups; drain work; and stop every Agor daemon before changing ownership or running migrations.
+
+### Breaking
+
+- **Unix impersonation is removed** — `strict` and `insulated` no longer start; Agor no longer creates host users/groups, changes passwords, manages sudoers or ACLs, or launches executors through `sudo`. Use `simple` for trusted single-user hosts, `sandbox` for fail-closed Linux filesystem isolation, or `delegated` for an operator-owned external execution substrate. ([#2362](https://github.com/preset-io/agor/pull/2362), [#2375](https://github.com/preset-io/agor/pull/2375))
+  - There is no published 0.24 bridge release. From 0.24.7, keep the old daemon stopped, install the 0.25.1 software, run the 0.25.1 database migrations, then use the 0.25.1 migration scripts before starting the new daemon.
+  - Review the [operator runbook](context/guides/migrate-strict-to-sandbox.md), run [`sandbox-home-migration-preflight.sh`](scripts/sandbox-home-migration-preflight.sh), and run [`strict-to-sandbox-migration.sh`](scripts/strict-to-sandbox-migration.sh) without `--apply` first. The scripts are Linux/GNU-specific reference tooling, not a one-command upgrade or rollback mechanism.
+  - The ownership conversion makes the daemon user the owner while preserving groups, modes, and ACLs. It is mount-bounded and does not traverse nested mount points; inventory and migrate those separately. The generated ownership manifest is recovery evidence, not an automatic rollback tool.
+  - The script only detects an active configured systemd service. Administrators must independently verify that no foreground, alternate-service, or otherwise unmanaged daemon is running.
+  - Keep host users, groups, sudoers, and recovery artifacts through a production soak; do not use `--teardown` during the initial migration. The safest full rollback is to stop 0.25.1 and restore the complete pre-upgrade database, configuration, and storage backup.
+- **Every daemon now has a deployment identity** — `daemon.deployment_id` is a required UUID used to bind daemon health, CLI lifecycle ownership, and login credentials to the intended deployment. New installs generate it; interactive `agor daemon start`/`restart` can back up and update a legacy config, while non-interactive starts refuse and print a ready-to-paste UUID snippet. Existing CLI logins must authenticate again. ([#2379](https://github.com/preset-io/agor/pull/2379))
+- **CLI targeting is explicitly local or remote** — one stored login targets one deployment. Local administration is refused while logged into a different deployment, preventing commands from combining local filesystem state with an unrelated remote API. `agor login` requires an explicit target (or confirmation of the detected local deployment). ([#2379](https://github.com/preset-io/agor/pull/2379))
+
+### Features
+
+- **Fail-closed filesystem sandboxing** — Linux shared-host deployments can isolate per-user homes, branch access, sibling worktrees, and daemon secrets with bubblewrap while deriving mounts from application RBAC. ([#2362](https://github.com/preset-io/agor/pull/2362))
+- **Curated MCP marketplace catalog** — ships a checked-in catalog with validated connection probing and a single shared search implementation. ([#2344](https://github.com/preset-io/agor/pull/2344))
+- **Machine-readable database migration status** — exposes migration readiness and blocks daemon starts with actionable guidance when required migrations are pending. ([#2363](https://github.com/preset-io/agor/pull/2363))
+- **MCP settings organization** — separates installed servers from member policy in dedicated settings tabs. ([#2342](https://github.com/preset-io/agor/pull/2342))
+
+### Fixes
+
+- **Safe daemon lifecycle and re-initialization** — daemon start/stop/status/restart and init now share canonical effective-config URL resolution, distinguish Agor from unrelated port listeners, retain a narrow confirmed stop path for legacy managed daemons, and avoid treating successful oclif exits as failures. Re-init checks for a live daemon before prompting and offers an atomic timestamped backup of the entire install directory before starting fresh. ([#2379](https://github.com/preset-io/agor/pull/2379))
+- **Reliable local development CLI entrypoints** — package-local and workspace-root dev commands resolve source exports consistently, and CLI/daemon package versions are released together. ([#2379](https://github.com/preset-io/agor/pull/2379))
+- **Masked configuration diagnostics** — config inspection reports sandbox-masked paths without leaking secrets. ([#2367](https://github.com/preset-io/agor/pull/2367))
+- **Reliable shallow-clone refs** — branch creation and remote alignment handle shallow repository refs correctly. ([#2365](https://github.com/preset-io/agor/pull/2365))
+- **OAuth confidential-client support** — MCP OAuth connections can use confidential clients where required. ([#2364](https://github.com/preset-io/agor/pull/2364))
+- **Task and authorization convergence** — bounds Claude context-usage collection so tasks always settle and decouples historical Unix identity checks from branch RBAC. ([#2286](https://github.com/preset-io/agor/pull/2286), [#2338](https://github.com/preset-io/agor/pull/2338))
+
+### Chores
+
+- **Align the 0.25.1 release train** — `agor-live`, the CLI, client, and version-aligned agentic-tool packages now share the release version.
+
+Need help with a `strict`/`insulated` deployment? Bring the dry-run output and your deployment layout to [Discord](https://discord.gg/Qh4TrFQZpd) before applying filesystem changes.
+
+## 0.25.0 (skipped)
+
+0.25.0 was prepared internally but never published to npm or Homebrew. Do not install or target it: 0.25.1 is the first published release containing the 0.25 changes, and upgrades should go directly from the latest published 0.24 release to 0.25.1 using the migration guidance above.
+
+## 0.24.8 (skipped)
+
+0.24.8 was used as an internal development version but was not published to npm. Its daemon lifecycle and re-initialization changes ship in 0.25.1.
+
+## [0.24.7](https://github.com/preset-io/agor/commit/90a0a6f0c084) (2026-08-15)
+
+### Fixes
+
+- **Reliable package publishing and installation** — adds trusted-publisher preflight, handles unpublished versions, makes retries safer, and hardens fresh installs and daemon startup. ([#2354](https://github.com/preset-io/agor/pull/2354), [#2355](https://github.com/preset-io/agor/pull/2355), [#2356](https://github.com/preset-io/agor/pull/2356), [#2358](https://github.com/preset-io/agor/pull/2358), [#2359](https://github.com/preset-io/agor/pull/2359), [#2361](https://github.com/preset-io/agor/pull/2361))
+- **Scalable message and MCP OAuth handling** — paginates SQL message queries and persists edited MCP server configuration before beginning OAuth. ([#2330](https://github.com/preset-io/agor/pull/2330), [#2339](https://github.com/preset-io/agor/pull/2339))
+
+## [0.24.6](https://github.com/preset-io/agor/commit/b31e38c04a58) (2026-08-15)
+
+### Features
+
+- **Member-owned MCP marketplace** — members can browse the curated catalog, install private MCP servers, manage policy, and see ownership throughout the UI. ([#2240](https://github.com/preset-io/agor/pull/2240), [#2265](https://github.com/preset-io/agor/pull/2265), [#2291](https://github.com/preset-io/agor/pull/2291))
+- **Scriptless install and release packaging** — simplifies the `agor-live` package lifecycle and removes install-time release scripts. ([#2310](https://github.com/preset-io/agor/pull/2310))
+
+### Fixes
+
+- **Authorization and tenant-scope hardening** — gates previously unprotected update verbs, scopes MCP catalog/attachment access and Knowledge realtime events, preserves database tenant scope for long operations, and allows viewer login. ([#2239](https://github.com/preset-io/agor/pull/2239), [#2254](https://github.com/preset-io/agor/pull/2254), [#2268](https://github.com/preset-io/agor/pull/2268), [#2314](https://github.com/preset-io/agor/pull/2314), [#2322](https://github.com/preset-io/agor/pull/2322))
+- **Execution and lifecycle reliability** — unifies effective configuration during strict-mode bootstrap, makes Stop converge in production, defines owner-local HA terminal behavior, and routes Codex MCP headers correctly. ([#2260](https://github.com/preset-io/agor/pull/2260), [#2281](https://github.com/preset-io/agor/pull/2281), [#2321](https://github.com/preset-io/agor/pull/2321), [#2326](https://github.com/preset-io/agor/pull/2326))
+- **Collision-safe Unix group identifiers** — replaces truncation-prone group names with stable collision-safe IDs. ([#2334](https://github.com/preset-io/agor/pull/2334))
+- **MCP and onboarding recovery** — improves dynamic-registration diagnostics, OAuth cache isolation, remote-session callback visibility, onboarding feedback, and provider-credit recovery. ([#2296](https://github.com/preset-io/agor/pull/2296), [#2306](https://github.com/preset-io/agor/pull/2306), [#2307](https://github.com/preset-io/agor/pull/2307), [#2318](https://github.com/preset-io/agor/pull/2318), [#2319](https://github.com/preset-io/agor/pull/2319), [#2336](https://github.com/preset-io/agor/pull/2336))
+
+## [0.24.5](https://github.com/preset-io/agor/commit/405c7f245853) (2026-08-12)
+
+### Features
+
+- **MCP marketplace data foundation** — introduces the curated server catalog layer used by the marketplace. ([#2081](https://github.com/preset-io/agor/pull/2081))
+- **OpenCode reasoning variants** — adds reasoning-effort choices and consistently supplies the Agor system prompt. ([#2214](https://github.com/preset-io/agor/pull/2214))
+
+### Security
+
+- **Pinned MCP OAuth connections** — connects OAuth requests to the validated network address and restores safe dynamic client registration. ([#2266](https://github.com/preset-io/agor/pull/2266), [#2274](https://github.com/preset-io/agor/pull/2274))
+- **Enforced executor MCP permissions** — checks configured tool permissions at the actual tool-call boundary. ([#2080](https://github.com/preset-io/agor/pull/2080))
+
+### Fixes
+
+- **HA-safe OAuth, GitHub, gateway, and environment state** — persists shared coordination state, supervises gateway retries, and makes environment startup permission-safe. ([#2234](https://github.com/preset-io/agor/pull/2234), [#2235](https://github.com/preset-io/agor/pull/2235), [#2247](https://github.com/preset-io/agor/pull/2247), [#2250](https://github.com/preset-io/agor/pull/2250))
+- **Durable executor results** — flushes large and one-shot results before exit, sanitizes invalid JSON Unicode, and improves queue recovery behavior. ([#2222](https://github.com/preset-io/agor/pull/2222), [#2251](https://github.com/preset-io/agor/pull/2251), [#2252](https://github.com/preset-io/agor/pull/2252), [#2253](https://github.com/preset-io/agor/pull/2253), [#2256](https://github.com/preset-io/agor/pull/2256), [#2259](https://github.com/preset-io/agor/pull/2259))
+- **Fresh-install diagnostics** — repairs agentic-tool onboarding and reports missing Git clone prerequisites directly. ([#2279](https://github.com/preset-io/agor/pull/2279), [#2280](https://github.com/preset-io/agor/pull/2280))
+
+## [0.24.4](https://github.com/preset-io/agor/commit/8c974a77e7ff) (2026-08-10)
+
+### Features
+
+- **Redis-backed high-availability foundation** — adds shared daemon coordination and shared-nothing gateway listeners. ([#2225](https://github.com/preset-io/agor/pull/2225), [#2230](https://github.com/preset-io/agor/pull/2230))
+- **Modern and stateless legacy MCP protocols** — serves both supported MCP transport generations without server-local session affinity. ([#2232](https://github.com/preset-io/agor/pull/2232))
+- **All-branches teammate view** — adds an aggregate branch tab to the board teammate panel. ([#2058](https://github.com/preset-io/agor/pull/2058))
+
+## [0.24.3](https://github.com/preset-io/agor/commit/c681734bd38b) (2026-08-09)
+
+### Features
+
+- **Agentic-tool install and upgrade UX** — adds guided CLI management for optional version-aligned tool runtimes. ([#2228](https://github.com/preset-io/agor/pull/2228))
+- **PostgreSQL executor token authority** — supports database-backed executor authentication for multi-daemon deployments. ([#2203](https://github.com/preset-io/agor/pull/2203))
+- **Board background redesign** — introduces quieter defaults and a redesigned background editor. ([#2227](https://github.com/preset-io/agor/pull/2227))
+
+### Fixes
+
+- **Production dependency repair** — repairs the grouped dependency update used by packaged installations. ([#2226](https://github.com/preset-io/agor/pull/2226))
+
+## [0.24.2](https://github.com/preset-io/agor/commit/a81ff70cda3e) (2026-08-08)
+
+### Breaking
+
+- **`config.yaml` becomes operator-owned and immutable at runtime** — configuration overrides are processed in memory rather than rewritten by daemon and upgrade flows. ([#2224](https://github.com/preset-io/agor/pull/2224))
+
+### Fixes
+
+- **HA-safe Knowledge indexing** — coordinates embedding indexing across daemon replicas. ([#2202](https://github.com/preset-io/agor/pull/2202))
+- **Sensitive and high-volume logging cleanup** — redacts database and gateway fields and reduces repetitive Slack and Socket.IO logs. ([#2190](https://github.com/preset-io/agor/pull/2190), [#2191](https://github.com/preset-io/agor/pull/2191), [#2210](https://github.com/preset-io/agor/pull/2210), [#2212](https://github.com/preset-io/agor/pull/2212))
+
+## [0.24.1](https://github.com/preset-io/agor/commit/0d7f69646017) (2026-08-08)
+
+### Fixes
+
+- **Published managed agentic-tool runtimes** — moves wrappers under the public `@agor-live` scope and passes the selected managed runtime into executor sessions. ([#2219](https://github.com/preset-io/agor/pull/2219), [#2221](https://github.com/preset-io/agor/pull/2221))
+- **Session model-chip layout** — keeps the selected model label inside its visual boundary. ([#2216](https://github.com/preset-io/agor/pull/2216))
+
+## [0.24.0](https://github.com/preset-io/agor/commit/38a8c2cce62c) (2026-08-08)
+
+### Breaking
+
+- **Runtime and filesystem ownership boundaries are reworked** — removes the legacy Claude CLI integration and serialized SDK-session store, moves repository/filesystem access into the executor, and adds `delegated` execution for operator-owned substrates. ([#2053](https://github.com/preset-io/agor/pull/2053), [#2054](https://github.com/preset-io/agor/pull/2054), [#2069](https://github.com/preset-io/agor/pull/2069), [#2070](https://github.com/preset-io/agor/pull/2070), [#2087](https://github.com/preset-io/agor/pull/2087), [#2122](https://github.com/preset-io/agor/pull/2122), [#2127](https://github.com/preset-io/agor/pull/2127))
+- **Configured HTTP proxy support is removed** — deployments relying on the retired proxy configuration must move proxying outside Agor. ([#2009](https://github.com/preset-io/agor/pull/2009))
+
+### Features
+
+- **Tenant filesystem boundary and data portability** — scopes persisted files and uploads by tenant and adds audited tenant inspect/export/import/verify/delete workflows. ([#2019](https://github.com/preset-io/agor/pull/2019), [#2043](https://github.com/preset-io/agor/pull/2043), [#2044](https://github.com/preset-io/agor/pull/2044), [#2096](https://github.com/preset-io/agor/pull/2096), [#2102](https://github.com/preset-io/agor/pull/2102), [#2073](https://github.com/preset-io/agor/pull/2073), [#2123](https://github.com/preset-io/agor/pull/2123))
+- **Multi-daemon task and schedule coordination** — makes task queues, runtime reconciliation, callbacks, and scheduled occurrence recovery safe across daemon replicas. ([#2174](https://github.com/preset-io/agor/pull/2174), [#2175](https://github.com/preset-io/agor/pull/2175), [#2180](https://github.com/preset-io/agor/pull/2180), [#2184](https://github.com/preset-io/agor/pull/2184))
+- **Managed OpenCode integration** — adds a packaged runtime with configuration parity. ([#2161](https://github.com/preset-io/agor/pull/2161), [#2162](https://github.com/preset-io/agor/pull/2162), [#2163](https://github.com/preset-io/agor/pull/2163))
+- **Session model and launch controls** — adds Codex reasoning effort, Claude Opus 5, richer model selection, compact permissions, and host-bound launch authentication. ([#1923](https://github.com/preset-io/agor/pull/1923), [#1985](https://github.com/preset-io/agor/pull/1985), [#2025](https://github.com/preset-io/agor/pull/2025), [#2034](https://github.com/preset-io/agor/pull/2034))
+- **MCP and executor resilience** — probes misleading MCP authentication, bounds collection output, and adds live-socket reauthentication. ([#1938](https://github.com/preset-io/agor/pull/1938), [#1947](https://github.com/preset-io/agor/pull/1947), [#2194](https://github.com/preset-io/agor/pull/2194))
+
+### Security
+
+- **Tenant context and secret handling hardening** — closes daemon/runtime filesystem authority, keeps tenant identity out of public payloads, scopes API-key and delegated-identity resolution, and redacts database values and prompt content from logs. ([#2088](https://github.com/preset-io/agor/pull/2088), [#2091](https://github.com/preset-io/agor/pull/2091), [#2101](https://github.com/preset-io/agor/pull/2101), [#2123](https://github.com/preset-io/agor/pull/2123), [#2144](https://github.com/preset-io/agor/pull/2144), [#2156](https://github.com/preset-io/agor/pull/2156))
+
+### Fixes
+
+- **Reliable session and executor lifecycle** — fixes task-scoped Stop delivery, early/background completion, Codex reconnect progress, title creation, and realtime message races. ([#1979](https://github.com/preset-io/agor/pull/1979), [#1989](https://github.com/preset-io/agor/pull/1989), [#2004](https://github.com/preset-io/agor/pull/2004), [#2057](https://github.com/preset-io/agor/pull/2057), [#2072](https://github.com/preset-io/agor/pull/2072), [#2196](https://github.com/preset-io/agor/pull/2196))
+- **Lean, cold-cache global installation** — removes bundled agent runtimes from the base package, publishes optional aligned integrations, and adds package-content installation checks. ([#2201](https://github.com/preset-io/agor/pull/2201))
+
+## 0.23.4 (skipped)
+
+0.23.4 was used as an internal development version but was not published to npm. Its changes shipped in 0.24.0.
+
+## [0.23.3](https://github.com/preset-io/agor/commit/74b99e2887f5) (2026-07-22)
+
+### Features
+
+- **Teammates and guided onboarding** — renames Assistants to Teammates, adds a five-step first-run wizard, simplifies new-session creation, and supports importing Codex ChatGPT credentials. ([#1609](https://github.com/preset-io/agor/pull/1609), [#1801](https://github.com/preset-io/agor/pull/1801), [#1835](https://github.com/preset-io/agor/pull/1835), [#1954](https://github.com/preset-io/agor/pull/1954))
+- **Slack gateway capabilities and attachments** — adds capability-gated history, reactions, replies, uploads, and inbound text/image attachment handling. ([#1718](https://github.com/preset-io/agor/pull/1718), [#1847](https://github.com/preset-io/agor/pull/1847), [#1848](https://github.com/preset-io/agor/pull/1848), [#1851](https://github.com/preset-io/agor/pull/1851), [#1883](https://github.com/preset-io/agor/pull/1883), [#1886](https://github.com/preset-io/agor/pull/1886))
+- **Daemon health and centralized executor lifecycle** — adds liveness/readiness/database probes and consolidates runtime supervision. ([#1825](https://github.com/preset-io/agor/pull/1825), [#1964](https://github.com/preset-io/agor/pull/1964))
+- **Tenant agentic-tool governance** — lets operators control which tool integrations are available per tenant. ([#1890](https://github.com/preset-io/agor/pull/1890))
+- **Terminal performance and reconnection** — coalesces PTY output, enables accelerated rendering, and repairs attach/reconnect behavior. ([#1919](https://github.com/preset-io/agor/pull/1919), [#1920](https://github.com/preset-io/agor/pull/1920), [#1921](https://github.com/preset-io/agor/pull/1921))
+
+### Security
+
+- **Gateway, MCP, and realtime tenant isolation** — hardens tenant-scoped manual events, task governance, Slack channel restrictions, and gateway/MCP authorization. ([#1872](https://github.com/preset-io/agor/pull/1872), [#1884](https://github.com/preset-io/agor/pull/1884), [#1904](https://github.com/preset-io/agor/pull/1904), [#1942](https://github.com/preset-io/agor/pull/1942))
+
+### Fixes
+
+- **Session, environment, and UI stability** — cascades session archival, reduces health/realtime patch churn, repairs schedule defaults, preserves code-block layout, and improves heavy-modal and idle-render performance. ([#1842](https://github.com/preset-io/agor/pull/1842), [#1863](https://github.com/preset-io/agor/pull/1863), [#1864](https://github.com/preset-io/agor/pull/1864), [#1877](https://github.com/preset-io/agor/pull/1877), [#1893](https://github.com/preset-io/agor/pull/1893), [#1895](https://github.com/preset-io/agor/pull/1895), [#1963](https://github.com/preset-io/agor/pull/1963), [#1976](https://github.com/preset-io/agor/pull/1976))
+
+## [0.23.2](https://github.com/preset-io/agor/commit/6f21469a6724) (2026-07-08)
+
+### Features
+
+- **Search, attachments, and board controls** — adds in-session search, paste/drop attachments for new sessions, per-object z-order, and configurable zone-label sizing. ([#1658](https://github.com/preset-io/agor/pull/1658), [#1721](https://github.com/preset-io/agor/pull/1721), [#1744](https://github.com/preset-io/agor/pull/1744))
+- **Slack administration and secure token entry** — adds manifest generation, disabled-channel setup, secure in-chat token collection, branch-bound reads, and outbound actions. ([#1647](https://github.com/preset-io/agor/pull/1647), [#1743](https://github.com/preset-io/agor/pull/1743), [#1745](https://github.com/preset-io/agor/pull/1745), [#1799](https://github.com/preset-io/agor/pull/1799))
+- **Environment branch metadata** — exposes branch base ref and ref type to environment templates. ([#1836](https://github.com/preset-io/agor/pull/1836))
+
+### Fixes
+
+- **MCP OAuth and per-user secret handling** — preserves tenant claims, hydrates OAuth headers, loads authenticated user tools, and keeps redacted auth templates usable. ([#1694](https://github.com/preset-io/agor/pull/1694), [#1728](https://github.com/preset-io/agor/pull/1728), [#1732](https://github.com/preset-io/agor/pull/1732), [#1733](https://github.com/preset-io/agor/pull/1733), [#1779](https://github.com/preset-io/agor/pull/1779))
+- **Large-board and streaming performance** — eliminates broad store subscriptions, quadratic canvas synchronization, repeated node rebuilds, and transcript-wide streaming rerenders. ([#1783](https://github.com/preset-io/agor/pull/1783), [#1789](https://github.com/preset-io/agor/pull/1789), [#1793](https://github.com/preset-io/agor/pull/1793), [#1797](https://github.com/preset-io/agor/pull/1797), [#1798](https://github.com/preset-io/agor/pull/1798), [#1800](https://github.com/preset-io/agor/pull/1800), [#1808](https://github.com/preset-io/agor/pull/1808))
+- **Daemon and executor lifecycle reliability** — keeps executor sockets reconnecting, scopes queued drains and health timers, handles terminal completion, and limits startup recovery to interrupted sessions. ([#1737](https://github.com/preset-io/agor/pull/1737), [#1753](https://github.com/preset-io/agor/pull/1753), [#1767](https://github.com/preset-io/agor/pull/1767), [#1795](https://github.com/preset-io/agor/pull/1795), [#1834](https://github.com/preset-io/agor/pull/1834))
+- **Authentication and UI correctness** — preserves machine-token logins, fixes model defaults, session-tree collapse, editor dependency duplication, and environment live updates. ([#1751](https://github.com/preset-io/agor/pull/1751), [#1773](https://github.com/preset-io/agor/pull/1773), [#1775](https://github.com/preset-io/agor/pull/1775), [#1780](https://github.com/preset-io/agor/pull/1780), [#1781](https://github.com/preset-io/agor/pull/1781), [#1819](https://github.com/preset-io/agor/pull/1819))
+
+## [0.23.1](https://github.com/preset-io/agor/commit/fdcaf0f18c0a) (2026-06-30)
+
+### Features
+
+- **Sessions-first home and composer improvements** — redesigns Home around recent sessions, adds inline file attachments, refines the session footer, and supports resuming after daemon restart. ([#1588](https://github.com/preset-io/agor/pull/1588), [#1591](https://github.com/preset-io/agor/pull/1591), [#1598](https://github.com/preset-io/agor/pull/1598), [#1710](https://github.com/preset-io/agor/pull/1710))
+- **Guided Slack setup** — adds manifest-based setup, connection tests, secure secret handling, and clearer routing documentation. ([#1650](https://github.com/preset-io/agor/pull/1650), [#1653](https://github.com/preset-io/agor/pull/1653), [#1654](https://github.com/preset-io/agor/pull/1654))
+- **Branch RBAC without Unix isolation** — allows trusted deployments to use application authorization independently of host-user isolation. ([#1681](https://github.com/preset-io/agor/pull/1681))
+
+### Security
+
+- **Tenant-scope propagation hardening** — preserves tenant context across nested calls, realtime executor events, schedulers, gateways, health monitors, queued work, and post-commit dispatch. ([#1682](https://github.com/preset-io/agor/pull/1682), [#1683](https://github.com/preset-io/agor/pull/1683), [#1685](https://github.com/preset-io/agor/pull/1685), [#1695](https://github.com/preset-io/agor/pull/1695), [#1696](https://github.com/preset-io/agor/pull/1696), [#1697](https://github.com/preset-io/agor/pull/1697), [#1699](https://github.com/preset-io/agor/pull/1699), [#1700](https://github.com/preset-io/agor/pull/1700), [#1701](https://github.com/preset-io/agor/pull/1701), [#1707](https://github.com/preset-io/agor/pull/1707))
+
+### Fixes
+
+- **Queue, onboarding, and UI reliability** — drains queues after stopped-task patches, reuses onboarding repositories, fixes conversation scrolling and editor dependency duplication, and reduces broad UI rerenders. ([#1655](https://github.com/preset-io/agor/pull/1655), [#1675](https://github.com/preset-io/agor/pull/1675), [#1678](https://github.com/preset-io/agor/pull/1678), [#1679](https://github.com/preset-io/agor/pull/1679), [#1690](https://github.com/preset-io/agor/pull/1690), [#1692](https://github.com/preset-io/agor/pull/1692), [#1712](https://github.com/preset-io/agor/pull/1712))
+
+## 0.23.0 (skipped)
+
+0.23.0 was prepared in the repository but was not published to npm. The first published 0.23 release was 0.23.1.
+
+## 0.22.0 (TBD)
+
+### Chores
+
+- **Prepare the next agor-live minor release** — bumps `agor-live` and `@agor-live/client` to 0.22.0 and keeps the standalone agor-live package lock in sync. ([#1561](https://github.com/preset-io/agor/pull/1561))
+
+## 0.21.2 (TBD)
+
+### Features
+
+- **Home dashboard and faster workspace loading** — adds the Home dashboard while improving initial loading feedback, board-object loading, session-list ergonomics, and settings search. ([#1403](https://github.com/preset-io/agor/pull/1403), [#1419](https://github.com/preset-io/agor/pull/1419), [#1447](https://github.com/preset-io/agor/pull/1447), [#1450](https://github.com/preset-io/agor/pull/1450), [#1454](https://github.com/preset-io/agor/pull/1454))
+- **Knowledge and artifact polish** — improves Knowledge MCP search and outline ergonomics, namespace selection, graph labels, document icons, assistant namespace memory, and artifact publish validation. ([#1397](https://github.com/preset-io/agor/pull/1397), [#1420](https://github.com/preset-io/agor/pull/1420), [#1426](https://github.com/preset-io/agor/pull/1426), [#1427](https://github.com/preset-io/agor/pull/1427), [#1431](https://github.com/preset-io/agor/pull/1431), [#1432](https://github.com/preset-io/agor/pull/1432), [#1451](https://github.com/preset-io/agor/pull/1451))
+- **Board-level RBAC defaults and tighter runtime controls** — adds board-level permission defaults and refines branch/environment runtime controls. ([#1396](https://github.com/preset-io/agor/pull/1396), [#1415](https://github.com/preset-io/agor/pull/1415))
+- **Claude advisor/run settings UX** — supports Claude advisor model configuration and improves the session footer MCP/run settings surface. ([#1423](https://github.com/preset-io/agor/pull/1423), [#1425](https://github.com/preset-io/agor/pull/1425))
+
+### Fixes
+
+- **Session, task, and realtime stability** — fixes session/task state divergence, per-prompt MCP attribution, runtime-scope guard rejection, cold-start races, and realtime event filtering. ([#1391](https://github.com/preset-io/agor/pull/1391), [#1406](https://github.com/preset-io/agor/pull/1406), [#1411](https://github.com/preset-io/agor/pull/1411), [#1418](https://github.com/preset-io/agor/pull/1418), [#1444](https://github.com/preset-io/agor/pull/1444))
+- **Authentication, tokens, and permission fixes** — scopes runtime tokens, restricts config key resolution, authorizes executor API key resolution, persists MCP OAuth refresh endpoints, and fixes group RBAC for environment actions. ([#1389](https://github.com/preset-io/agor/pull/1389), [#1395](https://github.com/preset-io/agor/pull/1395), [#1399](https://github.com/preset-io/agor/pull/1399), [#1410](https://github.com/preset-io/agor/pull/1410), [#1429](https://github.com/preset-io/agor/pull/1429))
+- **Navigation and UI polish** — stabilizes Home navigation, fixes Knowledge route flicker, app loading colors, the All sessions scrollbar, global presence, and branch-card destructive-action visibility. ([#1407](https://github.com/preset-io/agor/pull/1407), [#1413](https://github.com/preset-io/agor/pull/1413), [#1414](https://github.com/preset-io/agor/pull/1414), [#1424](https://github.com/preset-io/agor/pull/1424), [#1438](https://github.com/preset-io/agor/pull/1438), [#1442](https://github.com/preset-io/agor/pull/1442))
+- **Branch, clone, and migration reliability** — validates clone source refs, fixes archived-branch zone queries, exposes migration root causes, and avoids bumping session recency when clearing highlights. ([#1390](https://github.com/preset-io/agor/pull/1390), [#1408](https://github.com/preset-io/agor/pull/1408), [#1417](https://github.com/preset-io/agor/pull/1417), [#1421](https://github.com/preset-io/agor/pull/1421))
+
+### Chores
+
+- **Docs, onboarding, dependencies, and logging** — clarifies CLI auth options, refreshes feature-guide IA, setup defaults, SDK metadata, dependency pins, and trims daemon log noise. ([#1394](https://github.com/preset-io/agor/pull/1394), [#1402](https://github.com/preset-io/agor/pull/1402), [#1416](https://github.com/preset-io/agor/pull/1416), [#1428](https://github.com/preset-io/agor/pull/1428), [#1435](https://github.com/preset-io/agor/pull/1435), [#1436](https://github.com/preset-io/agor/pull/1436), [#1437](https://github.com/preset-io/agor/pull/1437), [#1452](https://github.com/preset-io/agor/pull/1452), [#1453](https://github.com/preset-io/agor/pull/1453))
+
+## 0.21.1 (TBD)
+
+### Features
+
+- **Knowledge base foundation + semantic search** — adds the lightweight Knowledge surface, markdown editing improvements, and RAG indexing/search plumbing for richer project context. ([#1324](https://github.com/preset-io/agor/pull/1324), [#1348](https://github.com/preset-io/agor/pull/1348), [#1352](https://github.com/preset-io/agor/pull/1352), [#1360](https://github.com/preset-io/agor/pull/1360))
+- **User groups for branch RBAC** — branch permissions can now be granted to groups, not just individual users. ([#1349](https://github.com/preset-io/agor/pull/1349))
+- **Managed environment webhook-only mode** — supports environment definitions that are triggered by webhook without a long-running local command. ([#1359](https://github.com/preset-io/agor/pull/1359))
+- **Scheduled session Codex configuration** — scheduled sessions can carry Codex sandbox, approval, and network settings. ([#1328](https://github.com/preset-io/agor/pull/1328))
+- **Session search polish** — scored session search with shared result highlighting. ([#1342](https://github.com/preset-io/agor/pull/1342))
+- **Knowledge publishing, editing, materialization, and search UX** — adds draft/published lifecycle controls, targeted edit operations, branch materialization tools, search polish, embedding reuse telemetry, and namespace RBAC for Knowledge. ([#1369](https://github.com/preset-io/agor/pull/1369), [#1377](https://github.com/preset-io/agor/pull/1377), [#1378](https://github.com/preset-io/agor/pull/1378), [#1379](https://github.com/preset-io/agor/pull/1379), [#1382](https://github.com/preset-io/agor/pull/1382), [#1384](https://github.com/preset-io/agor/pull/1384))
+- **Fullscreen artifact surface** — artifacts can open in a dedicated fullscreen experience. ([#1374](https://github.com/preset-io/agor/pull/1374))
+- **Custom MCP HTTP headers** — external MCP HTTP connections can carry custom headers for services that need them. ([#1387](https://github.com/preset-io/agor/pull/1387))
+- **Assistant onboarding flow improvements** — smooths the assistant setup path for new assistant branches. ([#1381](https://github.com/preset-io/agor/pull/1381))
+
+### Fixes
+
+- **Knowledge semantic-search install safety and markdown chunking** — keeps pgvector optional for required Postgres migrations, reports semantic-search availability clearly when pgvector is unavailable, and preserves markdown table chunks for better Knowledge indexing. ([#1367](https://github.com/preset-io/agor/pull/1367), [#1368](https://github.com/preset-io/agor/pull/1368))
+- **Branch storage config and Knowledge routing fixes** — respects branch storage configuration and stops Knowledge type filters from causing routing loops. ([#1372](https://github.com/preset-io/agor/pull/1372), [#1373](https://github.com/preset-io/agor/pull/1373))
+- **Board and branch card reliability** — fixes missing React Flow zone-parent crashes, zone filtering before pagination, scheduled-only branch cards, stale zone IDs, and branch-card session counts. ([#1331](https://github.com/preset-io/agor/pull/1331), [#1335](https://github.com/preset-io/agor/pull/1335), [#1338](https://github.com/preset-io/agor/pull/1338), [#1339](https://github.com/preset-io/agor/pull/1339), [#1340](https://github.com/preset-io/agor/pull/1340))
+- **Agent and MCP polish** — injects Agor MCP into Claude CLI sessions, corrects model-selector defaults, hides noisy Claude SDK telemetry, improves MCP user-search pagination, and tightens subsession completion callbacks. ([#1320](https://github.com/preset-io/agor/pull/1320), [#1321](https://github.com/preset-io/agor/pull/1321), [#1336](https://github.com/preset-io/agor/pull/1336), [#1337](https://github.com/preset-io/agor/pull/1337), [#1353](https://github.com/preset-io/agor/pull/1353), [#1380](https://github.com/preset-io/agor/pull/1380))
+- **UI/editor fixes** — fixes Codex `edit_files` diffs and labels, backend assistant welcome-note rendering, comment timestamps, permissions-tab visibility, select search, autocomplete edge positioning, panel tab actions, and Knowledge markdown preview refresh. ([#1344](https://github.com/preset-io/agor/pull/1344), [#1345](https://github.com/preset-io/agor/pull/1345), [#1350](https://github.com/preset-io/agor/pull/1350), [#1351](https://github.com/preset-io/agor/pull/1351), [#1354](https://github.com/preset-io/agor/pull/1354), [#1356](https://github.com/preset-io/agor/pull/1356), [#1357](https://github.com/preset-io/agor/pull/1357), [#1358](https://github.com/preset-io/agor/pull/1358))
+
+### Chores
+
+- **Homebrew formula automation** — formula updates are now generated by workflow after an npm release publishes, rather than being hand-edited during the package-version bump. ([#1313](https://github.com/preset-io/agor/pull/1313))
+- **TypeScript 6 buildability and bundled UI serving polish** — keeps the workspace buildable on TS 6 and tunes packaged UI cache/compression behavior. ([#1311](https://github.com/preset-io/agor/pull/1311), [#1312](https://github.com/preset-io/agor/pull/1312))
+
+### Security
+
+- **Harden git remote credential handling and startup repair** — tightens credential-bearing remote handling and repairs unsafe startup state. ([#1370](https://github.com/preset-io/agor/pull/1370))
+
+## 0.21.0 (TBD)
+
+### Breaking
+
+- **Rename `Worktree` → `Branch` across the codebase** — TypeScript types, REST routes, Feathers services, MCP tools, DB columns and tables, and identifier names are all renamed. No backwards-compat shims; the minor bump is the signal. ([#1247](https://github.com/preset-io/agor/pull/1247), [#1250](https://github.com/preset-io/agor/pull/1250))
+  - **REST routes**: `/worktrees/...` → `/branches/...` (e.g. `/worktrees/:id/start` → `/branches/:id/start`). Any external script hitting the daemon's REST surface needs to update its URLs.
+  - **MCP tools**: the legacy `agor_worktrees_*` alias surface is removed — use `agor_branches_*`. Agents referencing the old names will see "tool not found" until they update.
+  - **TypeScript / `@agor-live/client`**: `Worktree`, `WorktreeID`, `WorktreesService`, `Worktree*` types and their interfaces are renamed to `Branch`, `BranchID`, `BranchesService`, etc.
+  - **CLI**: `agor worktree <subcmd>` → `agor branch <subcmd>`. Admin subcommands (`agor admin create-worktree-group`, ...) → `agor admin create-branch-group`, etc. `AGOR_WORKTREE_NAME` / `AGOR_WORKTREE_ID` env vars set by `agor branch cd` → `AGOR_BRANCH_NAME` / `AGOR_BRANCH_ID`.
+  - **Database schema**: `worktrees` table → `branches`, `worktree_owners` → `branch_owners`, every `worktree_id` / `worktree_unique_id` / `target_worktree_id` column → `branch_id` / `branch_unique_id` / `target_branch_id`. Single drizzle migration (`0045_rename_worktree_to_branch` / `0036_rename_worktree_to_branch`) runs O(1) ALTER RENAME statements; daemons restart cleanly. Enum-literal `archived_reason='worktree_archived'` flips to `'branch_archived'`.
+  - **Env-template variables**: canonical name is `{{branch.*}}` (e.g. `{{branch.unique_id}}`, `{{branch.name}}`). The legacy `{{worktree.*}}` shape stays exposed as a backwards-compat alias on the Handlebars context object, so existing `.agor.yml` configs continue to render without edits.
+- **Surviving `worktree` references**: the term is preserved only where it refers to the actual git-worktree primitive (the `storage_mode: 'worktree' | 'clone'` enum literal, `git worktree add/list/remove` shell invocations, the `~/.agor/worktrees/<repo>/<name>` on-disk path, and prose explaining "a branch can be backed by either a native git worktree or an isolated clone"). The on-disk worktree directory keeps its name to avoid a filesystem migration on existing installs.
+
+### Features
+
+- **Schedules as first-class CRUD** — promote branch schedules to a Feathers service with full create/read/update/delete plus a `/schedules` REST surface, replacing the inline branch-config pathway ([#1253](https://github.com/preset-io/agor/pull/1253))
+- **Personal API keys for MCP + sessionless MCP access** — users can issue personal API keys that authenticate the MCP surface without an active session, letting external agents drive Agor MCP tools directly ([#1259](https://github.com/preset-io/agor/pull/1259))
+- **One-time launch-code authentication** — log in via a short-lived, single-use code instead of an interactive password, useful for CLI / browser handoffs ([#1280](https://github.com/preset-io/agor/pull/1280))
+- **Executor heartbeat** — executors emit a periodic heartbeat back to the daemon so stuck/dead executors are detectable without polling tool calls ([#1302](https://github.com/preset-io/agor/pull/1302))
+- **Backend analytics client** — server-side telemetry pipeline (opt-in) for usage analytics ([#1307](https://github.com/preset-io/agor/pull/1307))
+- **Assistant bootstrap session flow** — fresh assistants now run a guided bootstrap session on first launch ([#1272](https://github.com/preset-io/agor/pull/1272))
+- **Boards become assistant-centric** — boards default to organizing branches around assistants rather than ad-hoc layout ([#1300](https://github.com/preset-io/agor/pull/1300))
+- **Self-standing clones at branch create-time** — `storage_mode: 'clone'` available from the new-branch flow, alongside the existing native git-worktree mode ([#1248](https://github.com/preset-io/agor/pull/1248))
+- **Cursor SDK scaffolding (beta)** — analysis + initial scaffolding for a Cursor agentic tool, following the same pattern as Claude Code / Codex / OpenCode / Copilot / Gemini ([#1262](https://github.com/preset-io/agor/pull/1262))
+- **Global search (beta)** — design doc + V1 scaffolding for cross-entity search, plus iter-1 polish: count tags, sectioned recents, close button, highlighting, registry DRY ([#1246](https://github.com/preset-io/agor/pull/1246), [#1254](https://github.com/preset-io/agor/pull/1254))
+- **Homebrew install method** — `brew install agor-live` documented as a first-class install path ([#1279](https://github.com/preset-io/agor/pull/1279))
+- **Active URL-target highlighting on the board** — the active entity referenced by the URL is visually highlighted on the canvas ([#1260](https://github.com/preset-io/agor/pull/1260))
+- **Active-branch highlight on canvas + recenter action** — find your current branch on a busy board, then re-center on it ([#1245](https://github.com/preset-io/agor/pull/1245))
+- **Clearer navbar connection state + user actions** — explicit indicator for daemon connection status, with user/account actions grouped ([#1251](https://github.com/preset-io/agor/pull/1251))
+- **Compact expandable info alert for zone prompt help** — collapsed-by-default help for new zone authors, no longer a tall always-on banner ([#1265](https://github.com/preset-io/agor/pull/1265))
+- **Route daemon-managed git ops through the executor** — daemon stops shelling out directly for git operations; routes via the executor so isolation/RBAC apply uniformly ([#1258](https://github.com/preset-io/agor/pull/1258))
+
+### Fixes
+
+- **Conversation initial auto-scroll on load** — large transcripts now scroll to the bottom on first paint instead of stranding users mid-history ([#1303](https://github.com/preset-io/agor/pull/1303), [#1305](https://github.com/preset-io/agor/pull/1305))
+- **Stop session panel from jumping scroll position during streaming** — anchor the scroll so live token streams don't yank the view ([#1284](https://github.com/preset-io/agor/pull/1284))
+- **Panel width management** — improved sizing/resize behavior for the side panels ([#1301](https://github.com/preset-io/agor/pull/1301))
+- **Dedupe task completion chime** — root-cause two double-emit sources so the chime fires exactly once ([#1281](https://github.com/preset-io/agor/pull/1281))
+- **Canonicalize Slack session links in gateway** — Slack messages no longer link to the local-dev host ([#1283](https://github.com/preset-io/agor/pull/1283))
+- **Strip `/ui` suffix from `baseUrl` in `fullUrl`** — prevents the double-prefix bug in generated URLs ([#1282](https://github.com/preset-io/agor/pull/1282))
+- **Restore non-owner prompt attribution prefix** — collaborator-authored prompts get the right "[user]: …" prefix again ([#1277](https://github.com/preset-io/agor/pull/1277))
+- **Preserve user-selected model on `Task.model` for Codex/Gemini** — executor was overwriting the explicit user choice with the SDK default ([#1275](https://github.com/preset-io/agor/pull/1275))
+- **Correct Codex context-window accounting** — use `last_token_usage`; bumps `@openai/codex-sdk` to 0.133.0 ([#1264](https://github.com/preset-io/agor/pull/1264))
+- **Migration 0036 constraint renames are now idempotent** — every constraint rename in the Worktree → Branch migration re-runs as a no-op cleanly ([#1256](https://github.com/preset-io/agor/pull/1256))
+- **Navigate to newly created branch / assistant / board** — creation flows now route to the new entity instead of leaving the user on the picker ([#1263](https://github.com/preset-io/agor/pull/1263), [#1270](https://github.com/preset-io/agor/pull/1270))
+- **Dedupe `@codemirror/view`** — dark-mode gutter now renders correctly in code blocks ([#1266](https://github.com/preset-io/agor/pull/1266))
+- **Optimize collaborative cursor presence rendering** — fewer re-renders when multiple users are active on the same board ([#1299](https://github.com/preset-io/agor/pull/1299))
+- **Bail out `useAgorData` on no-op socket events** — measurable frame-time win on busy boards ([#1271](https://github.com/preset-io/agor/pull/1271))
+- **Facepile overflow bubble** — smaller counter text, rich user-list tooltip ([#1278](https://github.com/preset-io/agor/pull/1278))
+- **Global-search row layout + widen popover** — keeps long titles readable ([#1249](https://github.com/preset-io/agor/pull/1249))
+- **Include superadmin in user role dropdown** — was silently absent ([#1244](https://github.com/preset-io/agor/pull/1244))
+- **Re-validate Create Assistant form when framework repo arrives** — async-loaded options no longer cause submit to reject ([#1242](https://github.com/preset-io/agor/pull/1242))
+
+### Chores
+
+- **Unify Branch/Assistant modal save into one action + Permissions tab** — collapses two save buttons into one, surfaces permissions in their own tab ([#1273](https://github.com/preset-io/agor/pull/1273))
+- **Drop message-count and tool-count pills from task header** — recovered header real estate for the things people actually look at ([#1276](https://github.com/preset-io/agor/pull/1276))
+- **Simplify Assistants table + description popover** — narrower table, long descriptions move into a popover ([#1243](https://github.com/preset-io/agor/pull/1243))
+- **Refresh Claude Code and Codex dependencies** ([#1286](https://github.com/preset-io/agor/pull/1286))
+- **Promote Agor Cloud invite CTA in docs navbar + swap Join Beta / Book Demo URLs** ([#1285](https://github.com/preset-io/agor/pull/1285), [#1298](https://github.com/preset-io/agor/pull/1298))
+
+### Security
+
+- **Bump `next` to 15.5.18 (security backports)** — pulls security backports without taking the next-major (`next@16`) upgrade in this release ([#1291](https://github.com/preset-io/agor/pull/1291))
+
+## 0.19.1 (2026-05-21)
+
+### Features
+
+- **In-conversation interactive widgets** — primitive for inline forms/buttons rendered in the conversation; first widget exposes `env_vars` editing without flooding the agent context ([#1224](https://github.com/preset-io/agor/pull/1224))
+- **Claude Code CLI as an agentic tool (beta)** — register the Claude Code CLI alongside the Agent SDK ([#1179](https://github.com/preset-io/agor/pull/1179))
+- **Relax Codex/Claude permission defaults for Agor's MCP-heavy model** — fewer per-tool prompts on fresh sessions ([#1215](https://github.com/preset-io/agor/pull/1215))
+- **Paste screenshots from the clipboard into the session input** ([#1223](https://github.com/preset-io/agor/pull/1223))
+- **Render Slack markdown tables as native Block Kit `table` blocks** ([#1225](https://github.com/preset-io/agor/pull/1225))
+- **Compact session info icon in footer + copyable IDs in Settings** ([#1229](https://github.com/preset-io/agor/pull/1229))
+- **Per-resource counts on "Loading workspace…" rows** ([#1214](https://github.com/preset-io/agor/pull/1214))
+
+### Fixes
+
+- **Daemon now actually honors `execution.executor_command_template`** — the config field was silently ignored ([#1230](https://github.com/preset-io/agor/pull/1230))
+- **Mirror `GIT_AUTHOR_*` to `GIT_COMMITTER_*` when committer is not set** — avoids commits with mismatched committer identity ([#1227](https://github.com/preset-io/agor/pull/1227))
+- **Allow revoking personal API keys** ([#1220](https://github.com/preset-io/agor/pull/1220))
+- **Centralize `shortId()` with a collision-safe 24-char canonical form** — replaces ad-hoc short-ID extraction across the codebase ([#1221](https://github.com/preset-io/agor/pull/1221))
+- **Roll back Claude bypass + wire Codex MCP auto-approve + trim onboarding disclaimers** ([#1219](https://github.com/preset-io/agor/pull/1219))
+- **Stop Conversation panel from reopening itself after close** ([#1218](https://github.com/preset-io/agor/pull/1218))
+- **Single source of truth for Codex permission config mapping** ([#1217](https://github.com/preset-io/agor/pull/1217))
+- **Spinner overlay on zone-trigger template render** ([#1216](https://github.com/preset-io/agor/pull/1216))
+- **Require confirmation on "nuke environment" + unify the dialog** ([#1211](https://github.com/preset-io/agor/pull/1211))
+- **Clicking the 'Untrusted' artifact badge now opens the consent modal** ([#1210](https://github.com/preset-io/agor/pull/1210))
+- **Preserve board state and URL through transient socket disconnects** ([#1207](https://github.com/preset-io/agor/pull/1207))
+- **Git SHA pill UX** — replace "(dirty)" jargon with a dot indicator; clearer tooltip ([#1232](https://github.com/preset-io/agor/pull/1232), [#1233](https://github.com/preset-io/agor/pull/1233))
+
+### Chores
+
+- **Bump `ws` 8.17.1 → 8.20.1** ([#1231](https://github.com/preset-io/agor/pull/1231))
+- **Bump `protobufjs` 7.5.5 → 8.3.0** ([#1196](https://github.com/preset-io/agor/pull/1196))
+
+## 0.19.0 (2026-05-14)
+
+### Features
+
+- **Codex session forking** — enable fork/spawn for Codex via the App Server thread/fork API; reaches parity with Claude on session genealogy ([#1188](https://github.com/preset-io/agor/pull/1188))
+- **Friendly global error boundary** — when the UI crashes, show a recoverable screen with a one-click copy-paste crash report ([#1191](https://github.com/preset-io/agor/pull/1191))
+- **Quick callback toggle in footer** — surface the session callback toggle in the session footer; show the active target in settings ([#1187](https://github.com/preset-io/agor/pull/1187))
+- **Onboarding wizard streamlining** — restructure the five-ask flow for clarity and fewer dead-ends ([#1168](https://github.com/preset-io/agor/pull/1168))
+- **Granular loading progress** — parallel spinners with checkmarks during initial load instead of a single opaque spinner ([#1170](https://github.com/preset-io/agor/pull/1170))
+- **In-transcript daemon-restart message** — when the daemon restarts mid-session, inject a system message into the transcript so the gap is visible ([#1166](https://github.com/preset-io/agor/pull/1166))
+
+### Fixes
+
+- **Stop AskUserQuestion from hanging gateway sessions** — disallow `AskUserQuestion`, `ExitPlanMode`, `EnterWorktree`, and `ExitWorktree` at the SDK layer via `disallowedTools` so the model never invokes them in Slack/gateway channels ([#1181](https://github.com/preset-io/agor/pull/1181))
+  - Previously the interactive question widget blocked the executor waiting for a UI response that never arrives in non-UI channels
+  - Removes the `InputRequestService`/`InputRequestManager`/`InputRequestBlock` machinery, the `/sessions/:id/input-response` daemon route, the `input_resolved` Feathers event, and the `execution.input_request_timeout_ms` config option
+  - Disallowed tools are unioned with whatever `~/.claude/settings.json`'s `permissions.deny` already contains
+- **Expand Edit and other diff-bearing tool cards by default** — collapsed-by-default hid the actual change from view ([#1193](https://github.com/preset-io/agor/pull/1193))
+- **Clear stuck error when executor cwd is gone** — detect missing worktree/repo FS paths and surface an actionable repair flow; adds K8s persistence docs ([#1189](https://github.com/preset-io/agor/pull/1189))
+- **Truncate long worktree names + reserve action button space** — long names no longer push action buttons off the card ([#1184](https://github.com/preset-io/agor/pull/1184))
+- **Centralize RBAC gate in git impersonation** — fixes a class of bugs where the gate was only enforced at some call sites (closes [#1143](https://github.com/preset-io/agor/pull/1143)) ([#1180](https://github.com/preset-io/agor/pull/1180))
+- **Inject `created_by` when creating gateway channels** — previously gateway-created channels lacked an owner attribution ([#1178](https://github.com/preset-io/agor/pull/1178))
+- **Suppress `system/task_updated` lifecycle events** — follow-up to [#1116](https://github.com/preset-io/agor/pull/1116) to silence remaining noisy SDK lifecycle chatter ([#1172](https://github.com/preset-io/agor/pull/1172))
+- **Source conditional exports in `@agor/core`** — vite/vitest now resolve `@agor/core` without a prior build ([#1171](https://github.com/preset-io/agor/pull/1171))
+- **Fix `agor-ui` tests resolving `@agor/core/types`** — unblocks UI test suite ([#1162](https://github.com/preset-io/agor/pull/1162))
+- **OpenCode reasoning-only responses** — render reasoning-only outputs as messages instead of dropping them as "thoughts" ([#1163](https://github.com/preset-io/agor/pull/1163))
+- **Always render artifact card header + add delete confirm** — prevents accidental deletes and keeps the header visible during state transitions ([#1167](https://github.com/preset-io/agor/pull/1167))
+
+### Security
+
+- **Harden git config via `GIT_CONFIG_PARAMETERS`** — inject `transfer.credentialsInUrl=die`, block `file://`/`ext::` protocol RCE families, enable HFS/NTFS path-traversal protection on every git invocation; tunable via `security.git_config_parameters` ([#1157](https://github.com/preset-io/agor/pull/1157))
+
+### Breaking
+
+- **Anonymous mode removed** — `agor daemon` now always requires authentication; configs that relied on anonymous access must add a user/API key ([#1154](https://github.com/preset-io/agor/pull/1154))
+
+### Chores / Performance
+
+- **Split `AppEntityDataContext` into Repo/User/Mcp contexts** — cuts re-renders across the UI when any one entity stream updates ([#1186](https://github.com/preset-io/agor/pull/1186))
+- **Cut conversation pane re-renders during active streaming** — large transcripts stream noticeably faster ([#1185](https://github.com/preset-io/agor/pull/1185))
+- **Sweep AntD v6 deprecation warnings** (Space/Alert/Modal) ([#1175](https://github.com/preset-io/agor/pull/1175))
+- **Make `App-Level Token Scope` explicit in gateway docs** ([#1174](https://github.com/preset-io/agor/pull/1174))
+- **Remove assistant-setup step from `agor init`** — handled by the UI onboarding wizard now ([#1169](https://github.com/preset-io/agor/pull/1169))
+
+## 0.18.0 (2026-05-12)
+
+### Features
+
+- **Declarative artifact format + TOFU consent flow** — artifacts now use a versioned declarative schema with a Trust-On-First-Use prompt on first run ([#1147](https://github.com/preset-io/agor/pull/1147))
+  - Replaces ad-hoc artifact JSON with a typed config
+  - Adds a `agor_artifacts_*` review surface before code runs
+- **`POST /tasks/:id/run` REST endpoint** — pure-REST trigger for harnesses that don't want to manage WebSocket lifecycle ([#1145](https://github.com/preset-io/agor/pull/1145))
+- **MCP `agor_environment_set` + `variant` on `agor_worktrees_create`** — agents can now set env command variants from `.agor.yml` and pick variants at worktree creation ([#1146](https://github.com/preset-io/agor/pull/1146))
+- **Modifier-scroll canvas zoom** — Cmd/Ctrl-scroll zooms the board canvas ([#1124](https://github.com/preset-io/agor/pull/1124))
+- **Promote MCP servers to first-class field in NewSessionModal** — pick MCP servers when creating a session, not after ([#1120](https://github.com/preset-io/agor/pull/1120))
+- **Session drawer improvements** — sort, timestamps, repo pill, status column ([#1112](https://github.com/preset-io/agor/pull/1112))
+- **Admin edit shortcut on MCP pill + restructured edit modal** — faster admin path to fix MCP config ([#1123](https://github.com/preset-io/agor/pull/1123))
+- **Copilot model picker** — static + dynamic `listModels`, bumps the `AskUserQuestion` timeout to match ([#1137](https://github.com/preset-io/agor/pull/1137))
+- **`agor_repos_update` MCP tool + surface clone failures** ([#1155](https://github.com/preset-io/agor/pull/1155))
+- **Onboarding wizard "all five asks"** — covers repo, env, MCP, model, and assistant in one pass (precursor to the 0.19 streamlining) ([#1168](https://github.com/preset-io/agor/pull/1168))
+
+### Fixes
+
+- **Stop cross-tool spawn from inheriting parent's model** — spawning Codex from a Claude session no longer attempts to use a Claude model id ([#1142](https://github.com/preset-io/agor/pull/1142))
+- **Skip sudo wrap for git ops in simple/no-RBAC mode** — eliminates sudo prompts when isolation is off (closes [#1140](https://github.com/preset-io/agor/pull/1140)) ([#1144](https://github.com/preset-io/agor/pull/1144))
+- **Pin user-supplied `default_branch` end-to-end** — typed `sourceBranch` no longer reset by incoming WebSocket events ([#1127](https://github.com/preset-io/agor/pull/1127))
+- **Unbreak ChatGPT subscription auth for Codex** — remove per-session `CODEX_HOME` so the SDK can find the existing auth ([#1136](https://github.com/preset-io/agor/pull/1136))
+- **`Session Archived` toast theme + normalize toast patterns** ([#1139](https://github.com/preset-io/agor/pull/1139))
+- **Stop pinned worktrees from piling at origin on board load** ([#1121](https://github.com/preset-io/agor/pull/1121))
+- **Permission mode label in session settings** — formalizes the `iconOnly` prop on the picker ([#1108](https://github.com/preset-io/agor/pull/1108))
+- **Suppress noisy SDK `system/status: requesting` lifecycle messages** ([#1116](https://github.com/preset-io/agor/pull/1116))
+- **`use asUser=undefined` for `repo.clone` and `worktree.add`** — avoid impersonation for executor lifecycle operations that need daemon identity ([#1141](https://github.com/preset-io/agor/pull/1141))
+- **Onboarding: unbreak SSH-configured users + surface clone failures** ([#1165](https://github.com/preset-io/agor/pull/1165))
+- **Quick Start regressions** — fix solo mode and `/ui` mount ([#1153](https://github.com/preset-io/agor/pull/1153))
+- **Stop duplicate "User updated" toast on onboarding skip** ([#1149](https://github.com/preset-io/agor/pull/1149))
+- **MCP test connection** — resolve `user.env` templates before testing ([#1151](https://github.com/preset-io/agor/pull/1151))
+- **Logs modal React #130 crash** — unwrap the `ansi-to-react` double-default ([#1152](https://github.com/preset-io/agor/pull/1152))
+- **Artifacts on Postgres** — persist `files`/`deps` via canonical `t.json<T>` ([#1160](https://github.com/preset-io/agor/pull/1160))
+- **Artifacts on Vite** — use the `REACT_APP_` prefix for sandpack-react's CRA templates ([#1161](https://github.com/preset-io/agor/pull/1161))
+
+### Security
+
+- **Move Handlebars rendering to the daemon, drop `unsafe-eval`** — the UI's CSP no longer needs the `unsafe-eval` escape hatch ([#1115](https://github.com/preset-io/agor/pull/1115))
+
+### Breaking
+
+- **Anonymous mode deprecated** — config warnings now fire when anonymous-mode keys are present (precursor to the 0.19 removal)
+
+### Chores
+
+- **Remove Codespaces / devcontainer support** — unused; reduces surface area ([#1113](https://github.com/preset-io/agor/pull/1113))
+- **Bump Claude Code + Codex SDKs and CLIs to latest** ([#1114](https://github.com/preset-io/agor/pull/1114))
+- **Migrate off deprecated AntD `<List>`** ([#1117](https://github.com/preset-io/agor/pull/1117))
+- **Expand `agor_proxies_list` description** for artifact-authoring agents ([#1110](https://github.com/preset-io/agor/pull/1110))
+- **Dependabot consolidation** — `pnpm/action-setup` 4→6 ([#1130](https://github.com/preset-io/agor/pull/1130)), `actions/checkout` 4→6 ([#1129](https://github.com/preset-io/agor/pull/1129)), `actions/upload-pages-artifact` 3→5 ([#1128](https://github.com/preset-io/agor/pull/1128)), `next` 14→15 ([#959](https://github.com/preset-io/agor/pull/959)), core-runtime group bump ([#1131](https://github.com/preset-io/agor/pull/1131))
+
+## 0.17.4 (2026-05-06)
+
+### Fixes
+
+- **Repair WebSocket reconnect** — fixes a regression where the UI got stuck in a disconnected state after the daemon restarted; adds an `agor-live` publish smoke-test in CI ([#1107](https://github.com/preset-io/agor/pull/1107))
+- **Allow daemon port in CORS localhost allow-list** — fixes browser-iframe CORS for non-default daemon ports (commit `481b19d1`)
+- **MCP server pill stays "connected" after OAuth revocation** — surface revoked state immediately ([#1101](https://github.com/preset-io/agor/pull/1101))
+- **Clear DCR cache on disconnect + optimistic UI token strip** — fixes ghost-authenticated MCP servers ([#1102](https://github.com/preset-io/agor/pull/1102))
+- **Strip `accept-encoding` from proxy** — stops double-handling of gzip when the daemon proxies an upstream ([#1104](https://github.com/preset-io/agor/pull/1104))
+- **Zone trigger dialog renders interpolated template** — was showing raw `{{ }}` placeholders to users ([#1090](https://github.com/preset-io/agor/pull/1090), [#1096](https://github.com/preset-io/agor/pull/1096))
+- **MCP OAuth token expiry resolution cascade** + research doc capturing the bug ([#1092](https://github.com/preset-io/agor/pull/1092))
+- **Register custom client RPC methods on Socket.io proxy** — methods declared on the client SDK now actually reach the daemon ([#1091](https://github.com/preset-io/agor/pull/1091))
+- **Per-user impersonated clone & credential plumbing in strict mode** ([#1088](https://github.com/preset-io/agor/pull/1088))
+- **Refresh MCP auth state in real-time after OAuth re-auth** ([#1086](https://github.com/preset-io/agor/pull/1086))
+
+### Features
+
+- **YAML-driven API proxy for artifacts** — artifacts can declare upstream APIs in `.agor.yml` and call them without CORS hassles ([#1089](https://github.com/preset-io/agor/pull/1089))
+- **Render `{{ agor.token }}` for artifact daemon auth** — artifacts can authenticate to the daemon using a templated token ([#1100](https://github.com/preset-io/agor/pull/1100))
+
+### Security / Internal
+
+- **Replace `credential.helper` with env-var `http.extraheader` for impersonated clone** — avoids writing credentials to disk during cloning ([#1103](https://github.com/preset-io/agor/pull/1103))
+- **Allow simple-git `credential.helper` for impersonated clone** — companion fix for the above transition ([#1099](https://github.com/preset-io/agor/pull/1099))
+- **Use base URL origin for artifact proxy template var** ([#1098](https://github.com/preset-io/agor/pull/1098))
+
+### Chores / Performance
+
+- **Cut board re-renders on socket traffic** ([#1095](https://github.com/preset-io/agor/pull/1095))
+- **Re-enable `@agor/core` tests in CI** ([#1094](https://github.com/preset-io/agor/pull/1094))
+- **Bump vite 7.3.2 → 8.0.10 (and plugin-react 5 → 6)** ([#1105](https://github.com/preset-io/agor/pull/1105))
+- **Bump uuid 11 → 14** ([#1097](https://github.com/preset-io/agor/pull/1097))
+
+## 0.17.3 (2026-05-04)
+
+### Features
+
+- **Per-user custom OpenAI-compatible Codex endpoint** — each user can point Codex at their own OpenAI-compatible endpoint ([#1087](https://github.com/preset-io/agor/pull/1087))
+- **Per-tool credential storage** — UI for storing per-SDK credentials separately, with runtime scoping; lays groundwork for tighter credential isolation ([#1077](https://github.com/preset-io/agor/pull/1077))
+- **MCP OAuth 2.1 full discovery** — `.well-known` discovery + Dynamic Client Registration ([#1078](https://github.com/preset-io/agor/pull/1078))
+- **Disconnected-state UX chokepoint** — single, friendly screen when the daemon socket drops, instead of scattered error states ([#1070](https://github.com/preset-io/agor/pull/1070))
+- **`agor_models_list` MCP tool + accept `model` as string in `sessions.create`** ([#1066](https://github.com/preset-io/agor/pull/1066))
+- **Daemon-owned user-message + task-centric queue** — "never lose a prompt": typed prompts persist server-side and reattach across reconnects ([#1068](https://github.com/preset-io/agor/pull/1068))
+
+### Fixes
+
+- **`fix(scheduler): stop clobbering saved permission_mode on mount`** ([#1085](https://github.com/preset-io/agor/pull/1085))
+- **Correct MCP OAuth status display for expired tokens** ([#1084](https://github.com/preset-io/agor/pull/1084))
+- **Centralize session config defaults so dragged sessions don't hang** (closes [#1064](https://github.com/preset-io/agor/pull/1064)) ([#1082](https://github.com/preset-io/agor/pull/1082))
+- **Restore `AskUserQuestion` widget rendering in chat pane** ([#1073](https://github.com/preset-io/agor/pull/1073)) — later superseded by the 0.19 disable, but kept the widget functional in 0.17.3
+- **Password-change-required redirect flow + dev-env UID/GID pin** ([#1074](https://github.com/preset-io/agor/pull/1074))
+- **Prevent OOM during build** (closes [#932](https://github.com/preset-io/agor/pull/932)) ([#1075](https://github.com/preset-io/agor/pull/1075))
+
+### Chores
+
+- **Support Node 24 LTS / 25** (closes [#278](https://github.com/preset-io/agor/pull/278)) ([#1076](https://github.com/preset-io/agor/pull/1076))
+- **Big-bang deps bump** (consolidates dependabot PRs) ([#1083](https://github.com/preset-io/agor/pull/1083))
+- **Audit and trim stale `context/` docs** ([#1081](https://github.com/preset-io/agor/pull/1081))
+- **Consolidate AntD `ConfigProvider` to single root** ([#1071](https://github.com/preset-io/agor/pull/1071))
+- **Restructure guide IA around features-first navigation** ([#1072](https://github.com/preset-io/agor/pull/1072))
+- **Messaging & positioning doc** ([#1080](https://github.com/preset-io/agor/pull/1080))
+
+## 0.17.2 (2026-04-24)
+
+### Fixes
+
+- **Repair `agor-live@0.17.1` publishing** — rewrite `workspace:*` refs at publish time so the npm-published `agor-live` resolves correctly ([#1067](https://github.com/preset-io/agor/pull/1067))
+- **Harden auth reconnect + token-refresh state machine** — fixes recurring `jwt expired` errors and reconnect deadlocks ([#1065](https://github.com/preset-io/agor/pull/1065))
+- **Onboarding wizard infinite spinner + repo matching bugs** ([#1062](https://github.com/preset-io/agor/pull/1062))
+
+### Chores
+
+- **Drop `pnpm-pack` workspace:\* guard** (commit `a52527ea`) — companion to the publish-time rewrite above
+
+## 0.17.1 (2026-04-23)
+
+### Features
+
+- **Frontend/backend version-sync banner** — warn users when the served UI and daemon disagree on version ([#1060](https://github.com/preset-io/agor/pull/1060))
+- **GPT-5.5 support** — bump Codex CLI + OpenAI SDK + model list ([#1059](https://github.com/preset-io/agor/pull/1059))
+
+### Fixes
+
+- **Audio settings** — minimum duration persists, chimes play again after settings save ([#1061](https://github.com/preset-io/agor/pull/1061))
+- **Recurring `jwt expired` errors** — dynamic refresh + 401 retry on the UI's auth fetch layer ([#1058](https://github.com/preset-io/agor/pull/1058))
+- **Accept `modelConfig` at session create/spawn + surface MCP attach errors** ([#1056](https://github.com/preset-io/agor/pull/1056))
+
+## 0.17.0 (2026-04-23)
+
+### Features
+
+- **Effort level replaces thinking mode + 1M-context models** — exposes Claude's `output_config.effort` (`low`/`medium`/`high`/`max`) and the `[1m]` model suffix that opts into the 1M-token context window ([#985](https://github.com/preset-io/agor/pull/985))
+- **`stateless_fs_mode` for headless k8s deployments** — daemon can run with no persistent FS state for ephemeral container deployments ([#982](https://github.com/preset-io/agor/pull/982))
+- **Env command variants (`.agor.yml` v2)** — define multiple named environment variants per repo and pick one at worktree creation ([#1042](https://github.com/preset-io/agor/pull/1042))
+- **Per-session env-var scope selection** (v0.5 env-var-access model) ([#1032](https://github.com/preset-io/agor/pull/1032))
+- **Configurable CSP + CORS** — with sandpack-friendly defaults; tunable from `security.csp` / `security.cors` in `config.yaml` ([#1031](https://github.com/preset-io/agor/pull/1031))
+- **Scheduler "execute now" trigger + `allow_concurrent_runs`** ([#1030](https://github.com/preset-io/agor/pull/1030), closes [#999](https://github.com/preset-io/agor/pull/999))
+- **Leaderboard model/tool dimensions** — split tokens, time bucketing, per-model breakdown ([#1024](https://github.com/preset-io/agor/pull/1024))
+- **Capture Sandpack bundler/runtime errors in artifact status** — bundler errors surface in the artifact card instead of failing silently ([#1011](https://github.com/preset-io/agor/pull/1011))
+- **Allow members to use the web terminal via config flag** (`execution.allow_web_terminal`) ([#1006](https://github.com/preset-io/agor/pull/1006))
+- **Custom CSS animations support on boards** ([#997](https://github.com/preset-io/agor/pull/997))
+- **MCP `agor_artifacts_update` and `agor_artifacts_land`** ([#1052](https://github.com/preset-io/agor/pull/1052))
+- **OAuth 2.1 MCP token refresh** — just-in-time refresh + UI force-refresh ([#1047](https://github.com/preset-io/agor/pull/1047))
+- **POST `/authentication/impersonate` endpoint** — superadmin impersonation for support workflows ([#983](https://github.com/preset-io/agor/pull/983))
+- **Improved sync-unix admin command** — restore, cleanup, status-fix, plus `--worktree-id` flag ([#993](https://github.com/preset-io/agor/pull/993), [#994](https://github.com/preset-io/agor/pull/994))
+- **Show command in Bash tool header + expanded code block** ([#991](https://github.com/preset-io/agor/pull/991))
+
+### Fixes
+
+- **Inherit `permission_config` and `model_config` in session fork/btw** ([#989](https://github.com/preset-io/agor/pull/989), [#1004](https://github.com/preset-io/agor/pull/1004))
+- **Fail fast on worktree name collisions** — surface clear creation errors ([#998](https://github.com/preset-io/agor/pull/998))
+- **`btw` ephemeral tag** no longer wraps onto multiple lines ([#1003](https://github.com/preset-io/agor/pull/1003))
+- **Worktree directory** — fully remove on archive-delete and recreate on unarchive ([#986](https://github.com/preset-io/agor/pull/986))
+- **Use `realpathSync` in delete-directory safety checks** — follow symlinks ([#988](https://github.com/preset-io/agor/pull/988))
+- **Grant superadmins full worktree access** ([#992](https://github.com/preset-io/agor/pull/992))
+- **Skip user impersonation for worktree lifecycle executor operations** ([#990](https://github.com/preset-io/agor/pull/990))
+- **CSS-in-JS style loss on archive** — eliminate two-phase unmount ([#1007](https://github.com/preset-io/agor/pull/1007))
+- **Custom CSS clearing, specificity, and form state** ([#1002](https://github.com/preset-io/agor/pull/1002), [#995](https://github.com/preset-io/agor/pull/995))
+- **Worktree list filter dropdown** loading forever for `All`/`Archived` ([#996](https://github.com/preset-io/agor/pull/996))
+- **Confirmation modal when archiving session** from hover button ([#1000](https://github.com/preset-io/agor/pull/1000))
+- **Prevent duplicate queued prompts in conversation panel** ([#984](https://github.com/preset-io/agor/pull/984))
+- **Prevent expensive re-renders on prompt input keystrokes** ([#981](https://github.com/preset-io/agor/pull/981))
+- **Prevent CSS breakage when closing the session panel** ([#980](https://github.com/preset-io/agor/pull/980))
+- **Handle archived object state + unarchive board placement recovery** ([#979](https://github.com/preset-io/agor/pull/979))
+- **Add Vertex AI and Bedrock env vars to executor allowlist** ([#1005](https://github.com/preset-io/agor/pull/1005))
+- **Native emoji style so picker works under default CSP** ([#1055](https://github.com/preset-io/agor/pull/1055))
+- **Cramped inline edit in Settings → Env Vars** ([#1054](https://github.com/preset-io/agor/pull/1054))
+- **Bump session/board URL short IDs from 8 to 16 chars** — reduces collision risk for long-running deployments ([#1053](https://github.com/preset-io/agor/pull/1053))
+- **`.agor.yml` import**: replace (not merge) environment to avoid stale leftover keys ([#1051](https://github.com/preset-io/agor/pull/1051))
+- **CodePreviewModal YAML staircase rendering** ([#1050](https://github.com/preset-io/agor/pull/1050))
+- **Preserve typed prompt on fork/spawn failure + surface executor errors** ([#1048](https://github.com/preset-io/agor/pull/1048))
+- **Require public base URL for OAuth callback** — no localhost fallback in production ([#1045](https://github.com/preset-io/agor/pull/1045))
+- **`agor daemon start` fails fast on pending migrations** ([#1044](https://github.com/preset-io/agor/pull/1044))
+- **`@agor-live/client` pack validation false positives** on JSDoc `@agor/core` mentions ([#1043](https://github.com/preset-io/agor/pull/1043))
+- **Show stopped/unknown todo items when parent task is no longer running** ([#1033](https://github.com/preset-io/agor/pull/1033))
+- **Collapse tool bodies by default, keep Write expanded** ([#1028](https://github.com/preset-io/agor/pull/1028))
+- **Bash ToolBlock command overflow** ([#1021](https://github.com/preset-io/agor/pull/1021))
+- **Make all ToolBlocks expanded by default** ([#1013](https://github.com/preset-io/agor/pull/1013))
+- **Upload uses worktree RBAC instead of session ownership** ([#1010](https://github.com/preset-io/agor/pull/1010))
+- **Deterministic sync-unix with repo-root perms and error surfacing** ([#1008](https://github.com/preset-io/agor/pull/1008))
+
+### Security
+
+- **Web-hardening pack** — CORS, CSP, upload limits, JWT, trust-proxy ([#1027](https://github.com/preset-io/agor/pull/1027))
+- **Auth/route hardening** — GitHub setup state-nonce + MCP header-only auth ([#1026](https://github.com/preset-io/agor/pull/1026))
+- **Harden executor/git/unix input validation** ([#1025](https://github.com/preset-io/agor/pull/1025))
+- **Scope `find()` queries by worktree RBAC** ([#1016](https://github.com/preset-io/agor/pull/1016))
+- **Stop leaking secrets via sudo argv and startup logs** ([#1015](https://github.com/preset-io/agor/pull/1015))
+- **Pin transitive CVEs via pnpm.overrides + CI audit gate** ([#1014](https://github.com/preset-io/agor/pull/1014))
+- **Session-identity hardening** — Chain D + `created_by` trust ([#1037](https://github.com/preset-io/agor/pull/1037))
+- **Authenticate `terminal:*` WebSocket events** ([#1036](https://github.com/preset-io/agor/pull/1036))
+- **Internal MCP session tokens** — add `jti` + `exp` ([#1039](https://github.com/preset-io/agor/pull/1039))
+- **Env command hardening** — deny-list, audit log, role gate, shell-mode fix ([#1034](https://github.com/preset-io/agor/pull/1034))
+
+### Chores
+
+- **Bump Claude Code CLI to 2.1.112 / Agent SDK to 0.2.112** ([#1012](https://github.com/preset-io/agor/pull/1012))
+- **Parallelize CI workflow into independent jobs** ([#1009](https://github.com/preset-io/agor/pull/1009))
+- **Un-hide `@agor/core` + `@agor/executor` in CI** and fix pre-existing rot ([#1035](https://github.com/preset-io/agor/pull/1035))
+
+## 0.16.5 (2026-04-12)
+
+### Fixes
+
+- **Correct Codex context-window computation** — was undercounting tokens ([#970](https://github.com/preset-io/agor/pull/970))
+- **Build `@agor-live/client` before CLI** to resolve DTS errors during install ([#971](https://github.com/preset-io/agor/pull/971))
+- **Restore standalone `@agor-live/client` packaging** — fixes a regression in 0.16.4's published artifact ([#972](https://github.com/preset-io/agor/pull/972))
+
+### Chores
+
+- **Bulk-bump core deps + rework dependabot config** ([#973](https://github.com/preset-io/agor/pull/973))
+
+## 0.16.4 (2026-04-12)
+
+### Features
+
+- **Config-aware `agor daemon start` CLI command** — reads `config.yaml` for daemon port/host ([#961](https://github.com/preset-io/agor/pull/961))
+- **Reactive session API dogfooding** in `@agor-live/client` — public API for streaming session state ([#968](https://github.com/preset-io/agor/pull/968))
+
+### Fixes
+
+- **Codex `edit_files` diff** — use per-invocation pre/post snapshots so concurrent edits don't pollute each other ([#965](https://github.com/preset-io/agor/pull/965))
+- **`ERR_STRING_TOO_LONG` in agor daemon logs** — avoid concatenating gigantic strings into the logger ([#967](https://github.com/preset-io/agor/pull/967))
+
+### Chores
+
+- **Migrate `agor-ui` to `@agor-live/client` daemon surface** — UI now consumes the published client package instead of a direct daemon import ([#969](https://github.com/preset-io/agor/pull/969))
+
+## 0.16.3 (2026-04-11)
+
+### Features
+
+- **Codex event visibility + tool telemetry parity** — Codex sessions now surface the same per-tool telemetry events as Claude ([#964](https://github.com/preset-io/agor/pull/964))
+- **API client quick wins** — typed `prompt` helper, `findAll`, auth user typing, UUID input ergonomics ([#962](https://github.com/preset-io/agor/pull/962))
+
+### Fixes
+
+- **Codex `edit_files` diff mapping** — show true before/after instead of cumulative state ([#963](https://github.com/preset-io/agor/pull/963))
+
+## 0.16.2 (2026-04-11)
+
+### Features
+
+- **Decouple artifacts from worktrees + DB serialization** — artifacts become first-class entities, persisted directly to the database rather than tied to a worktree's filesystem ([#918](https://github.com/preset-io/agor/pull/918))
+- **Rich diff viewer for Edit/Write tool results** — Monaco-style diff rendering with collapse/expand ([#917](https://github.com/preset-io/agor/pull/917))
+- **Self-hosted Sandpack bundler** — point artifacts at a private-network bundler for air-gapped deployments ([#914](https://github.com/preset-io/agor/pull/914))
+- **CORS for Sandpack / CodeSandbox artifact origins** ([#926](https://github.com/preset-io/agor/pull/926))
+- **`btw` ephemeral fork mode + fork-while-running + `callbackMode`** — spawn a "by-the-way" exploratory fork without disturbing the parent, with optional callback when it completes ([#953](https://github.com/preset-io/agor/pull/953))
+- **Gateway context injection for Slack and GitHub** — pass channel/issue context into the agent prompt automatically ([#931](https://github.com/preset-io/agor/pull/931))
+- **Environment variables in gateway channel config** — per-channel env vars for gateway-spawned sessions ([#929](https://github.com/preset-io/agor/pull/929))
+- **`session` tier in worktree RBAC `others_can`** — safe default that lets collaborators create their own sessions without impersonating other users' OS identity ([#951](https://github.com/preset-io/agor/pull/951))
+- **Pre-registered OAuth client support** (e.g. Figma) — works with MCP servers that don't do DCR ([#943](https://github.com/preset-io/agor/pull/943))
+- **Four-tier service config + conditional registration + UI gating** — feature flags now drive both daemon service registration and UI affordances ([#958](https://github.com/preset-io/agor/pull/958))
+- **Declarative daemon resources config + sync command** — config-as-code for users, repos, boards, etc. ([#957](https://github.com/preset-io/agor/pull/957))
+- **Tool block UX improvements** — better headers, copy buttons, collapse states ([#919](https://github.com/preset-io/agor/pull/919))
+- **MCP `agor_artifacts_get`** ([#920](https://github.com/preset-io/agor/pull/920))
+- **MCP `agor_sessions_stop`** ([#956](https://github.com/preset-io/agor/pull/956))
+- **Expose RBAC fields in MCP worktree create/update tools** ([#937](https://github.com/preset-io/agor/pull/937))
+
+### Fixes
+
+- **Concurrent tool calls incorrectly shown as timed out** — timeout state was applied to the wrong invocation ([#925](https://github.com/preset-io/agor/pull/925))
+- **Force Sandpack remount on artifact content change** — stale iframe state ([#928](https://github.com/preset-io/agor/pull/928))
+- **Persist artifact position on board after drag** ([#924](https://github.com/preset-io/agor/pull/924))
+- **Artifact delete emits removed event + throttle console reporter** ([#923](https://github.com/preset-io/agor/pull/923))
+- **Artifacts settings table crash on null `worktree_id`** ([#922](https://github.com/preset-io/agor/pull/922))
+- **Expose `use_local_bundler` option on the publish MCP tool** ([#921](https://github.com/preset-io/agor/pull/921))
+- **Sandpack build yarn collision + Parcel asset paths** ([#915](https://github.com/preset-io/agor/pull/915))
+- **Smart default worktree placement** — use median of existing entities instead of a fixed offset ([#916](https://github.com/preset-io/agor/pull/916))
+- **Blockquote syntax for gateway context** — fixes Slack markdown rendering ([#934](https://github.com/preset-io/agor/pull/934))
+- **Thinking-block collapsed preview** — full-content ellipsis instead of mid-word cut ([#935](https://github.com/preset-io/agor/pull/935))
+- **Short-ID prefixes resolved consistently across all MCP tools** ([#944](https://github.com/preset-io/agor/pull/944))
+- **Handle double-serialized arguments in `agor_execute_tool`** — MCP clients that double-encode JSON now work ([#940](https://github.com/preset-io/agor/pull/940))
+- **MCP OAuth: resource metadata** — handle servers that omit `resource_metadata` in `WWW-Authenticate` ([#938](https://github.com/preset-io/agor/pull/938))
+- **MCP OAuth: don't pass resource-metadata scopes for pre-registered clients** ([#945](https://github.com/preset-io/agor/pull/945))
+- **MCP OAuth: remove automatic prompt interception** — explicit user action only ([#942](https://github.com/preset-io/agor/pull/942))
+- **MCP auth status lookup uses exact case-insensitive match** ([#952](https://github.com/preset-io/agor/pull/952))
+- **Perf: optimize attention-glow effect on worktree cards** — measurable frame-time win on busy boards ([#955](https://github.com/preset-io/agor/pull/955))
+
+### Chores
+
+- **Bump Codex to GPT-5.4 and Codex SDK to 0.118.0** ([#941](https://github.com/preset-io/agor/pull/941))
+
+## 0.16.1 (2026-04-04)
+
+### Features
+
+- **User API keys** — personal API keys (`agor_sk_...`) for programmatic authentication via CLI, scripts, and CI pipelines ([#913](https://github.com/preset-io/agor/pull/913))
+  - CRUD management in Settings modal (create, list, revoke)
+  - Supports `Authorization: Bearer` and `X-API-Key` headers
+  - `AGOR_API_KEY` env var for CLI authentication
+  - bcrypt-hashed storage with prefix-based lookup
+
+### Fixes
+
+- Fix API key auth strategy ordering — `api-key` must precede `jwt` to prevent greedy Bearer token matching
+- Add `api-key` to auth service config `authStrategies` list
+- Add Private Network Access preflight header for browser iframe CORS
+
+## 0.16.0 (2026-04-03)
+
+### Features
+
+- **Artifact board primitive** — render sandboxed artifacts on boards with Sandpack ([#888](https://github.com/preset-io/agor/pull/888))
+- **Generic SystemMessage component** — collapsible raw payload display for system messages ([#889](https://github.com/preset-io/agor/pull/889))
+- **MCP context tool** — comprehensive orientation tool for agents to understand their environment ([#875](https://github.com/preset-io/agor/pull/875))
+- **Board archiving** — archive and unarchive boards ([#876](https://github.com/preset-io/agor/pull/876))
+- **Superadmin role** — RBAC bypass role for administrative access ([#867](https://github.com/preset-io/agor/pull/867))
+- **Rate limit visibility** — surface rate limit events and API wait state to users ([#868](https://github.com/preset-io/agor/pull/868))
+- **MCP server inheritance** — worktrees pass MCP server configs down to sessions ([#860](https://github.com/preset-io/agor/pull/860))
+- **Tabbed Create Dialog** — redesigned plus button with tabbed creation flow ([#857](https://github.com/preset-io/agor/pull/857))
+- **Session settings redesign** — progressive disclosure for session configuration ([#848](https://github.com/preset-io/agor/pull/848))
+- **GitHub App integration** — connector, gateway routing, and callback endpoints ([#841](https://github.com/preset-io/agor/pull/841), [#844](https://github.com/preset-io/agor/pull/844))
+- **Session callbacks** — generalized callback system for remote sessions ([#842](https://github.com/preset-io/agor/pull/842))
+- **Gateway session filtering** — filter and bulk archive gateway sessions ([#882](https://github.com/preset-io/agor/pull/882))
+- **MCP assistants tool** — list assistants with description field via MCP ([#883](https://github.com/preset-io/agor/pull/883))
+- **Unified worktree header pill** — consolidated status pill in worktree headers ([#850](https://github.com/preset-io/agor/pull/850))
+- **Ripgrep in Docker** — add ripgrep to all Docker images for better search ([#859](https://github.com/preset-io/agor/pull/859))
+
+### Fixes
+
+- **Security**: block SSRF via health check URLs ([#754](https://github.com/preset-io/agor/pull/754))
+- Add FOR UPDATE lock to prevent lost updates in session patches ([#865](https://github.com/preset-io/agor/pull/865))
+- Use SDK getContextUsage() for accurate context window reporting ([#878](https://github.com/preset-io/agor/pull/878), [#887](https://github.com/preset-io/agor/pull/887))
+- Set task.model from SDK response to show correct model tags ([#884](https://github.com/preset-io/agor/pull/884))
+- Handle flattened arguments in agor_execute_tool MCP proxy ([#886](https://github.com/preset-io/agor/pull/886))
+- Restrict env command editing to admins + centralize role constants ([#879](https://github.com/preset-io/agor/pull/879))
+- Eliminate bad `as any` casts for type safety ([#880](https://github.com/preset-io/agor/pull/880))
+- Filter noisy system/task lifecycle messages from session conversations ([#874](https://github.com/preset-io/agor/pull/874))
+- Suppress noisy rate limit overage messages when request is allowed ([#877](https://github.com/preset-io/agor/pull/877))
+- Render markdown tables as monospace code blocks in Slack ([#873](https://github.com/preset-io/agor/pull/873))
+- Scope collapse header overflow to prevent badge clipping ([#871](https://github.com/preset-io/agor/pull/871))
+- Preserve form field values in collapsed Ant Design panels ([#872](https://github.com/preset-io/agor/pull/872))
+- Suppress error toasts when read-only users click worktree cards ([#866](https://github.com/preset-io/agor/pull/866))
+- Improve onboarding wizard error handling and clone feedback ([#864](https://github.com/preset-io/agor/pull/864))
+- Auto-clone framework repo when creating assistants ([#861](https://github.com/preset-io/agor/pull/861))
+- Sort Select dropdown options alphabetically ([#858](https://github.com/preset-io/agor/pull/858))
+- Fix archived worktree list returning empty data ([#856](https://github.com/preset-io/agor/pull/856))
+- Implement RFC 8414 Section 3 path-aware OAuth metadata discovery ([#854](https://github.com/preset-io/agor/pull/854), [#855](https://github.com/preset-io/agor/pull/855))
+- Support OAuth providers without RFC 8414 metadata discovery ([#851](https://github.com/preset-io/agor/pull/851))
+- Improve worktree creation — error handling, naming UX, validation ([#847](https://github.com/preset-io/agor/pull/847), [#852](https://github.com/preset-io/agor/pull/852))
+- Fix OpenCode directory scoping and MCP reliability ([#839](https://github.com/preset-io/agor/pull/839))
+- Resolve Slack channel type via cache + conversations.info API ([#838](https://github.com/preset-io/agor/pull/838))
+- Restart gateway listener on config change ([#840](https://github.com/preset-io/agor/pull/840))
+- Bump migration journal timestamps to ensure monotonic ordering ([#881](https://github.com/preset-io/agor/pull/881))
+
+### Chores
+
+- Bump Claude Code CLI to 2.1.87 and Agent SDK to 0.2.87 ([#863](https://github.com/preset-io/agor/pull/863))
+
+## 0.15.0 (2026-03-28)
+
+### Features
+
+- **GitHub Copilot SDK integration (beta)** — launch and manage Copilot agent sessions with token-level streaming, permission mapping, and MCP support ([#811](https://github.com/preset-io/agor/pull/811))
+- **Generic Cards & CardTypes system** — create custom card types with configurable fields and display them on boards ([#812](https://github.com/preset-io/agor/pull/812))
+- **MCP SDK migration** — migrate internal MCP server to official `@modelcontextprotocol/sdk` ([#816](https://github.com/preset-io/agor/pull/816))
+- **Inner tool names for MCP proxy calls** — show the actual tool names used inside MCP proxy calls ([#835](https://github.com/preset-io/agor/pull/835))
+
+### Fixes
+
+- Show MCP OAuth status on session pill and fix browser open race ([#836](https://github.com/preset-io/agor/pull/836))
+- Use sudo -u for daemon git state capture to get fresh Unix groups ([#827](https://github.com/preset-io/agor/pull/827))
+- Pass oauth_client_secret from MCP server config to token exchange ([#825](https://github.com/preset-io/agor/pull/825))
+- Handle non-standard OAuth token response formats (e.g. Slack) ([#823](https://github.com/preset-io/agor/pull/823), [#824](https://github.com/preset-io/agor/pull/824))
+- Register OAuth callback as Express route to avoid FeathersJS auth layer ([#820](https://github.com/preset-io/agor/pull/820), [#821](https://github.com/preset-io/agor/pull/821), [#822](https://github.com/preset-io/agor/pull/822))
+- Use OAuth 2.0 discovery before OIDC for MCP server authorization ([#819](https://github.com/preset-io/agor/pull/819))
+- Improve Codex SDK error handling and crash resilience ([#810](https://github.com/preset-io/agor/pull/810))
+- Regenerate agor-live lockfile for cross-platform Copilot SDK support
+
+### Docs
+
+- Add hero image to Cards guide page ([#818](https://github.com/preset-io/agor/pull/818))
+- Reorder guide sidebar to put foundational features first ([#817](https://github.com/preset-io/agor/pull/817))
+
+## 0.14.3 (2026-03-22)
+
+### Features
+
+- **Agent SDK slash commands** — slash command support with autocomplete for Claude Agent SDK sessions
+- **Session archive/unarchive MCP tools** — archive and unarchive sessions via MCP
+- **Board picker search** — search filter and recent boards quick-access in board picker
+- **User context for agents** — pass user context to agents for multi-user sessions
+- **Required env vars config** — block prompts when required user environment variables are missing
+- **Assistant emoji picker** — add emoji picker for assistant configuration
+- **Node.js 22 LTS** — upgrade runtime from Node.js 20 to 22
+
+### Fixes
+
+- Replace md-to-slack with slackify-markdown for better Slack message rendering
+- Handle stale git branches during worktree creation and cleanup on deletion
+- Use public daemon URL for MCP OAuth callback
+- Add explicit user ACL for daemon to prevent stale group issues
+- Scope OAuth auth_required WebSocket event to requesting user only
+- Use ISO strings for leaderboard date params
+- Refresh updated_at on session updates to prevent stale SDK disconnects
+- Sync agor-live simple-git dependency version
+- Prevent board crash from orphaned parentId after worktree archive/delete
+- Persist archived/archived_reason columns in session updates
+- Enable allowUnsafeSshCommand in simple-git for Docker compatibility
+- Sort Settings modal tables alphabetically
+- Fix worktree unix group access for owners and non-owners
+- Prevent 'repo already exists' error toast on page load
+- Simplify spawn subsession UI modal
+
+### Chores
+
+- Rename RELEASES.md to CHANGELOG.md
+- Update biome schema to 2.4.4 and fix all biome warnings
+- Tighten lint script to catch warnings (not just errors)
+
+## 0.14.2 (2026-03-13)
+
+### Features
+
+- **Messages MCP tool** — add `agor_messages_list` for browsing and searching session transcripts
+- **AskUserQuestion support** — full-stack implementation of interactive agent questions
+
+### Fixes
+
+- Prevent `sdk_session_id` from being overwritten after first capture
+- Detect SDK `error_during_execution` and mark task as failed
+- Copy-to-clipboard falls back to `execCommand` when Clipboard API throws
+- **Security**: prevent daemon env vars from leaking to agent sessions
+- Clean up stale zone references when deleting zones
+- Capture and surface actual error output when environment start fails
+- Make zone prompt template and trigger behavior optional
+
+### Chores
+
+- Remove Jenkinsfile and package-lock.json
+
+## 0.14.1 (2026-03-06)
+
+### Features
+
+- **Anthropic API passthrough** — add ANTHROPIC_BASE_URL and ANTHROPIC_AUTH_TOKEN passthrough to sessions for custom API endpoints
+
+### Fixes
+
+- Fix terminal not rendering on first open
+- Fix Settings Assistants tab navigating to Boards instead of Assistants
+
+## 0.14.0 (2026-03-03)
+
+### Features
+
+- **Permission request timeout** — graceful agent notification when permission requests time out
+- **Assistants rebrand** — rename "Persisted Agents" to "Assistants" with updated concept docs
+- **OpenCode MCP & worktree support** — add MCP server and worktree directory support for OpenCode sessions
+- **Assistant worktree cards** — add background tint to assistant worktree cards
+- **SEO improvements** — add LLM files and richer structured data for docs
+
+### Fixes
+
+- Replace WebSocket ACK stop protocol with Unix signals in daemon
+- Prevent messages from bypassing queue when session is busy
+- Resolve React and Ant Design console warnings
+- Ensure all @agor/core subpath exports have proper TypeScript declarations
+- Auto-grant permissions and reduce debug logging for OpenCode
+- Use dialect-agnostic boolean for archived column queries
+- URI-encode PostgreSQL credentials and consolidate duplicate Handlebars template
+- Read database config from config.yaml, fix Handlebars import in SessionPanel
+- Handle JSON string todos input in TodoListRenderer
+- Truncate long URLs in issue/PR pills and use conditional icons
+- Prevent Dependabot PRs for agor-live meta-package
+
+## 0.13.0 (2026-02-28)
+
+### Features
+
+- **Onboarding wizard** — replaced the popover with a multi-step onboarding wizard
+- **Sessions tab in Worktree Modal** — view and archive sessions directly from worktree details
+- **Codex MCP support** — full MCP support for Codex with HTTP transport and Agor self-access
+- **Codex streaming** — emit intermediate text messages during Codex execution
+- **Slack gateway improvements** — user alignment, message source tracking, bidirectional routing, thread queueing, and code block mention filtering
+- **Environment uptime** — track environment start timestamp for uptime monitoring
+- **Board tab titles** — show board emoji and name in browser tab title
+- **Jenkins deployment** — add Jenkins pipeline for Agor sandbox deployments
+
+### Fixes
+
+- Fix permission approval failing on sessions with >100 messages
+- Reduce idle CPU usage from 10-20% to near 0%
+- Prevent duplicate worktree names within a repository
+- Fix MCP OAuth flow — auto-continue sessions, cache clearing, and UI reliability
+- Fix migration status check to match Drizzle's timestamp-based logic
+- Fix chimes default value and allow wider min duration range
+- Use sudo with full path for `chpasswd` in Unix password sync
+
+## 0.12.3 (2026-02-10)
+
+### Features
+
+- Add session URLs to Slack Gateway messages with `BASE_URL` config
+- Add markdown support for worktree notes
+- Add truncate + "See more" to WorktreeCard notes
+
+### Fixes
+
+- Remove trailing slash and add API fallback for short board IDs
+- Allow retry stop requests when session stuck in STOPPING state
+- Pass `refType` parameter through executor for tag worktree creation
+- Fix migration status hash validation
+- Optimize pnpm check performance with Turbo caching (96% faster)
+
+## 0.12.2 (2026-02-09)
+
+### Features
+
+- Add support for custom Anthropic API base URL
+
+### Fixes
+
+- Surface API key decryption failures instead of silently falling through
+- Apply user defaults in MCP session creation and simplify API
+- Add `ON DELETE CASCADE` to `thread_session_map.session_id` FK
+- MCP `set_zone` auto-triggers `always_new` zones and respects `trigger.agent`
+- Set `unix_username` on gateway-created sessions
+- Resolve Ant Design deprecation warnings
+
+## 0.12.1 (2026-02-09)
+
+### Fixes
+
+- Update zod to 4.3.6 to fix missing `json-schema.js`
+
+## 0.12.0 (2026-02-09)
+
+### Features
+
+- **Gateway service** — Slack DM integration for bidirectional agent conversations
+- **MCP zone tools** — zone pinning, trigger support, and zone info in worktree queries
+- **MCP repo tools** — repository creation via MCP
+- **Session activity in MCP** — parameterized session activity in worktree and session MCP responses
+
+### Fixes
+
+- Close conversation panel when switching boards
+- Fix repo deletion deleting all worktrees instead of only its own
+- Fix MCP webform transport field and test connection
+- Fix worktree archive with clean option
+- Task duration shows "00:00" for completed tasks
+- Don't pass `ssl: undefined` to postgres.js, allow URL-based sslmode
+- Fix scheduler sessions stuck with "User not found: anonymous"
+- Populate `unix_username` for scheduled sessions
+- Correct migration 0012 timestamp to enable scheduler task execution
+- Add `-n` flag to all sudo commands to prevent password prompts
+- Convert `sessions.scheduled_run_at` to bigint for PostgreSQL
+- Prevent HOME override in user impersonation to fix Docker permission conflicts
+- Add jitter to worktree zone placement
+- Sync unix passwords independently of RBAC mode
+- Use worktree ownership for archive/unarchive RBAC checks
+- Add timeouts to OAuth browser flow to prevent indefinite hangs
+
+## 0.11.0 (2026-02-03)
+
+### Features
+
+- **OAuth 2.1 for MCP servers** — full OAuth authentication support for MCP server connections
+- **Unix user management** — add `unix_username` and `must_change_password` support
+- **Gemini native permission modes** — use native SDK permission modes and add gemini-3-flash model
+- **Executor settings** — `settings.local.json` support for Claude SDK
+- **Chunk buffering** — prevent small/out-of-order streaming chunks in executor
+
+### Fixes
+
+- Fix file permissions for worktree collaboration
+- Impersonate unix user for git operations
+- Add missing `open` dependency to bundled package
+- Include executor dependencies in bundled package
+- Fix backfill migration numbering and timestamps
+- Await all streaming callbacks to prevent out-of-order chunks
+- Optimize RBAC filtering with SQL JOINs and eliminate all `any` types
+- Handle circular references in Gemini tool responses
+- Fix out-of-order streaming with auth cache and serialization
+- Optimize Docker entrypoint permission fix for fast startup
+- Resolve permission issues and startup hang by aligning container UID/GID
+- Remove deprecated `opportunistic` unix_user_mode
+- Sort boards alphabetically in Settings CRUD view
+- Prevent stop signal from affecting subsequent tasks
+
+## 0.10.0 (2025-12-14)
+
+### Features
+
+- **Worktree scheduling** — cron-based scheduled sessions on worktrees
+- **MCP server management** — configure and connect MCP servers to sessions
+- **Board zones** — spatial zones with triggers for automated session spawning
+- **Worktree archiving** — archive and unarchive worktrees
+- **PostgreSQL support** — run Agor with PostgreSQL in addition to SQLite
+- **RBAC and Unix isolation** — worktree-level permissions with optional Unix group enforcement
+- **Docker support** — production-ready Docker images and devcontainer setup

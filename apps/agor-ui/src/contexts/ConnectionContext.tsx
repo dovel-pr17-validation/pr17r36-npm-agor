@@ -1,0 +1,121 @@
+import { createContext, useContext } from 'react';
+
+/**
+ * ConnectionContext - Global connection state for disabling UI during disconnections
+ *
+ * Prevents queued actions from flooding the daemon when reconnecting.
+ *
+ * `outOfSync`, `capturedSha`, and `currentSha` are populated by
+ * useServerVersion in App.tsx and shared with any consumer that needs the
+ * version-drift signal — the ConnectionStatus tag (banner) and the AboutTab
+ * (debug rows). Provider-side ownership ensures every consumer sees the same
+ * captured baseline; mounting useServerVersion in two places would give each
+ * its own independent (and usually empty) capture.
+ */
+interface ConnectionContextValue {
+  connected: boolean;
+  connecting: boolean;
+  /** Successful socket-auth generation; changes even when the client does not. */
+  authGeneration: number;
+  outOfSync: boolean;
+  capturedSha: string | null;
+  currentSha: string | null;
+}
+
+const DEFAULT_CONNECTION_CONTEXT: ConnectionContextValue = {
+  connected: false,
+  connecting: false,
+  authGeneration: 0,
+  outOfSync: false,
+  capturedSha: null,
+  currentSha: null,
+};
+
+const ConnectionContext = createContext<ConnectionContextValue | null>(null);
+
+export const ConnectionProvider = ConnectionContext.Provider;
+
+/**
+ * Hook to check if UI should be disabled due to disconnection
+ *
+ * Usage:
+ * ```tsx
+ * const disabled = useConnectionDisabled();
+ * <Button disabled={disabled} onClick={...}>Submit</Button>
+ * ```
+ */
+export function useConnectionDisabled(): boolean {
+  return !useMutationGate().canMutate;
+}
+
+/**
+ * Hook to get full connection state
+ */
+export function useConnectionState(): ConnectionContextValue {
+  return useContext(ConnectionContext) ?? DEFAULT_CONNECTION_CONTEXT;
+}
+
+/** Null only for independently-mounted/tested leaf surfaces without App's provider. */
+export function useOptionalConnectionState(): ConnectionContextValue | null {
+  return useContext(ConnectionContext);
+}
+
+/**
+ * Why a mutation is currently blocked. Extend this union as we add new
+ * gates (e.g. RBAC, env-not-running, read-only viewer).
+ */
+export type MutationBlockReason = 'disconnected' | 'reconnecting' | 'out-of-sync';
+
+export const RECONNECTING_MESSAGE = 'Reconnecting to Agor…';
+export const CONNECTION_LOST_MESSAGE = 'Lost connection to Agor.';
+
+/** Shared by the desktop status tag and the mobile banner. */
+export function formatOutOfSyncMessage(capturedSha: string | null, currentSha: string | null) {
+  const versions = capturedSha && currentSha ? ` (${capturedSha} → ${currentSha})` : '';
+  return `Agor was updated since this tab opened. Reload to get the latest version, but anything you haven't saved will be lost.${versions}`;
+}
+
+export interface MutationGate {
+  canMutate: boolean;
+  reason: MutationBlockReason | null;
+  message: string | null;
+}
+
+/**
+ * Single source of truth for "should this mutation site be disabled?"
+ *
+ * Returns a structured reason so UI can show a meaningful tooltip / toast
+ * instead of just `disabled=true`. The boolean shortcut is
+ * `useConnectionDisabled()`, which now delegates here.
+ */
+export function useMutationGate(): MutationGate {
+  const { connected, connecting, outOfSync } =
+    useContext(ConnectionContext) ?? DEFAULT_CONNECTION_CONTEXT;
+
+  if (outOfSync) {
+    return {
+      canMutate: false,
+      reason: 'out-of-sync',
+      message: 'Agor was updated. Reload the page to continue.',
+    };
+  }
+  // `connecting` is set immediately on socket drop, while `connected` stays
+  // true for a ~1.5s grace window in useAgorClient before flipping. We must
+  // close the gate as soon as `connecting` is true, otherwise mutations slip
+  // through during the grace window.
+  if (connecting) {
+    return {
+      canMutate: false,
+      reason: 'reconnecting',
+      message: RECONNECTING_MESSAGE,
+    };
+  }
+  if (!connected) {
+    return {
+      canMutate: false,
+      reason: 'disconnected',
+      message: `${CONNECTION_LOST_MESSAGE} Try again once it's back.`,
+    };
+  }
+  return { canMutate: true, reason: null, message: null };
+}

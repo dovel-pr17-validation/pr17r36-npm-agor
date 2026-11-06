@@ -1,0 +1,107 @@
+import type { BranchID, UserID, UUID } from './id';
+import type { TenantID } from './tenant';
+
+export const BRANCH_DELETION_COMMAND = 'branch.delete';
+export const BRANCH_DELETION_REPORT_SERVICE = 'branch-deletion-steps';
+export const branchDeletionCommandId = (executionId: string) =>
+  `${BRANCH_DELETION_COMMAND}:${executionId}`;
+export interface BranchDeletionReferenceCursor {
+  table: number;
+  after?: string;
+}
+
+/** Internal shared maintenance ownership, persisted only on the branch row. */
+export interface BranchMaintenanceClaim {
+  branch_id: BranchID;
+  operation_id: UUID;
+  generation: number;
+  kind: 'delete' | 'cleanup' | 'workspace_write' | 'metadata_archive';
+  /** Cleared only after the executor owner proves settlement, never on lease expiry. */
+  execution_id?: UUID;
+  /** Dispatch intent and executor claim are separate: duplicate delivery must not execute twice. */
+  execution_requested_at?: string;
+  execution_claimed_at?: string;
+  execution_heartbeat_at?: string;
+  /** Recorded before a local executor receives its payload; absent for templated launches. */
+  execution_process?: BranchMaintenanceExecutionProcess;
+  requested_by?: UserID;
+  storage_verified?: boolean;
+  reference_cursor?: BranchDeletionReferenceCursor;
+  references_done?: boolean;
+  data_done?: boolean;
+}
+
+/**
+ * Host-local identity of a daemon-spawned executor. Local executors are spawned
+ * as process-group leaders, so `pid` is also the PGID. Only a daemon in the same
+ * kernel boot and PID namespace can probe it; anywhere else it proves nothing.
+ */
+export interface BranchMaintenanceExecutionProcess {
+  pid: number;
+  boot_id: string;
+  pid_namespace: string;
+}
+
+/** Sticky branch lifecycle; failure never reopens normal work. */
+export const BRANCH_DELETION_STATUSES = ['deleting', 'deletion_failed'] as const;
+export type BranchDeletionStatus = (typeof BRANCH_DELETION_STATUSES)[number];
+
+/** Bounded diagnostics, never resource contents or raw provider exceptions. */
+export const BRANCH_DELETION_STAGES = ['claim', 'storage', 'data', 'finalize'] as const;
+export type BranchDeletionStage = (typeof BRANCH_DELETION_STAGES)[number];
+
+/** Controlled reason a settled failure may carry; the daemon owns the user-facing text. */
+export const BRANCH_DELETION_FAILURE_REASONS = ['storage_not_writable'] as const;
+export type BranchDeletionFailureReason = (typeof BRANCH_DELETION_FAILURE_REASONS)[number];
+
+/** Shared executor/daemon wire vocabulary; authorization remains daemon-owned. */
+export const BRANCH_DELETION_ACTIONS = [
+  'claim',
+  'heartbeat',
+  'quiesce',
+  'upload',
+  'storage',
+  'data',
+  'finalize',
+  'failed',
+  // Worker-owned storage has stopped; daemon DB-only requests may be unknown.
+  // A distinct action makes old daemons reject this stronger settlement protocol.
+  'settled',
+] as const;
+export type BranchDeletionAction = (typeof BRANCH_DELETION_ACTIONS)[number];
+
+/**
+ * Destructive-effect contract for uncertain RPC outcomes. Database-only work
+ * must remain inside the exact-invocation branch transaction fence. External
+ * IO can outlive that transaction and requires an acknowledged response.
+ * Adding an action requires an explicit classification; unknown effects must
+ * never default to database-only in consumers.
+ */
+export const BRANCH_DELETION_ACTION_EFFECTS = {
+  claim: 'database',
+  heartbeat: 'database',
+  quiesce: 'database',
+  upload: 'external_io',
+  storage: 'database',
+  data: 'database',
+  finalize: 'database',
+  failed: 'database',
+  settled: 'database',
+} as const satisfies Record<BranchDeletionAction, 'database' | 'external_io'>;
+
+export type BranchDeletionExecutionResult =
+  | { outcome: 'deleted' }
+  | { outcome: 'failed' | 'unknown'; stage: BranchDeletionStage; message: string };
+
+/** Review contract; FK actions alone never establish exclusive ownership. */
+export interface BranchDeletionRelationPolicy {
+  disposition: 'delete_owned' | 'clear_reference' | 'retain' | 'classify';
+  reason: string;
+}
+
+/** Identity-only discovery cursor; never carries branch contents across tenants. */
+export interface BranchMaintenanceRoutingRef {
+  tenant_id: TenantID;
+  branch_id: BranchID;
+}
+export const BRANCH_MAINTENANCE_DISCOVERY_PAGE_SIZE = 25;

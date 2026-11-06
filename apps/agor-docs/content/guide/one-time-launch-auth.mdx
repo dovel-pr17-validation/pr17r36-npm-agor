@@ -1,0 +1,342 @@
+# One-time launch-code authentication
+
+Agor can accept a generic external launch handoff when another trusted app has
+already authenticated the user. The browser carries only an opaque, short-lived
+`launch_code`; the daemon exchanges that code over a server-to-server
+backchannel, verifies the returned assertion, maps a local user, and issues the
+same runtime access and refresh tokens used by normal login.
+
+## Flow
+
+1. The external launch provider opens the runtime UI with
+   `/ui/?launch_code=<opaque-code>`.
+2. The UI calls `POST /auth/launch` once with `{ "launchCode": "..." }`.
+3. The daemon posts the code to the configured exchange endpoint with its
+   runtime audience, instance ID, and optional service credential.
+4. The exchange endpoint returns a signed assertion for the authenticated
+   subject.
+5. The daemon verifies issuer, audience, expiration, subject, and the configured
+   instance ID; then it maps or creates a local user by `(provider, issuer,
+   subject)`.
+6. The daemon returns normal runtime auth tokens. The UI stores those tokens and
+   removes `launch_code` from the URL with `replaceState`.
+
+## Configuration
+
+```yaml
+external_launch:
+  enabled: true
+  exchange_url: https://launch.example.com/runtime/exchange
+  issuer: https://launch.example.com
+  audience: agor-runtime:my-instance
+  instance_id: my-instance
+
+  # Production: configure exactly one assertion verification method.
+  jwks_url: https://launch.example.com/.well-known/jwks.json
+
+  # Optional daemon-to-provider bearer credential. Prefer env vars for secrets.
+  service_credential_env: AGOR_EXTERNAL_LAUNCH_SERVICE_TOKEN
+
+  # Optional: allow role claims above member. Defaults to false.
+  allow_admin_roles: false
+
+  # Optional backchannel timeout, 1-120000 ms. Defaults to 10000.
+  request_timeout_ms: 10000
+
+  # Optional non-empty allow-list. HS* is symmetric-only; RS*/PS*/ES* is
+  # asymmetric-only. Defaults to HS256 for a dev secret and RS256 otherwise.
+  algorithms: [RS256]
+
+  # Optional: primary action shown when launch sign-in cannot continue.
+  # Must be http:// or https://.
+  login_redirect_url: https://workspace.example.com/open
+
+  # Optional host-bound launch for a single daemon that serves several hosts.
+  # When enabled, the daemon forwards the normalized inbound browser Host to the
+  # exchange endpoint as an opaque `request_host`, letting the issuer bind a code
+  # to the exact route the browser entered.
+  forward_request_host: false
+  # Header the daemon reads the browser Host from. The trusted proxy / edge owns
+  # host normalization and must overwrite it. Default: host.
+  trusted_host_header: host
+  # Query param appended to login_redirect_url carrying the current host as an
+  # opaque return context for direct-host entry. Default: return_host.
+  return_host_param: return_host
+```
+
+### External user and role authority
+
+External launch authentication does not disable Agor user administration by
+itself. A deployment whose launch provider is also authoritative for user
+lifecycle, profile fields, and roles must opt into the identity contract:
+
+```yaml
+identity:
+  user_lifecycle: external
+  role_authority: claims
+  local_auth: disabled
+  external:
+    provider: external_launch
+    provisioning: jit
+```
+
+With this profile, verified launches may still create a missing local user and
+synchronize JWT-owned email, name, avatar, execution-home key, and role. Those
+fields update when the next external launch succeeds; the daemon does not call
+the provider on every request. User and administrator calls through REST,
+Socket.IO, CLI, and MCP cannot create or delete users or edit those fields.
+Agor-owned preferences, onboarding state, AI-provider credentials and defaults,
+environment variables, personal API keys, and MCP selections/OAuth grants stay
+editable.
+
+Avatar ownership can be configured independently with
+`identity.avatar_authority: internal | external`. When omitted, it follows
+`user_lifecycle`: the external profile above keeps provider-owned avatars and
+disables Agor avatar writes and Slack sync. This restriction is independent of
+HA and multi-tenant mode.
+
+If the launch provider owns accounts but Agor should own avatars, use:
+
+```yaml
+identity:
+  user_lifecycle: external
+  avatar_authority: internal
+  role_authority: claims
+  local_auth: disabled
+  external:
+    provider: external_launch
+    provisioning: jit
+```
+
+With `avatar_authority: internal`, users can edit their own avatars and admins
+can manage Slack avatar settings, subject to normal user-management permissions.
+Email, name, execution-home keys, account lifecycle, and roles remain externally
+managed. Launch `avatar` and `picture` claims are ignored, including on first
+login, so later logins cannot overwrite manual or Slack avatars or repopulate
+an avatar that was cleared. This setting permits Slack sync; it does not enable
+it or run a sync during login. Admins still select a Slack gateway and enable
+sync in the Avatars tab. Existing avatars are retained when changing this
+setting. Selecting `external` resumes provider projection on subsequent launches
+and requires the external account profile.
+
+The public health identity contract is version 2 and reports `avatarAuthority`,
+`capabilities.users.avatarWrite`, and `capabilities.users.avatarSettingsWrite`.
+Upgrade the UI and all daemon replicas together before enabling the new setting;
+clients reject unsupported contract versions rather than guessing permissions.
+A Cloud deployment must set `avatar_authority: internal` in its generated daemon
+configuration to opt in. Do not change `user_lifecycle` to enable avatars.
+
+The trusted `(tenant, provider, issuer, subject)` binding is stored in a
+tenant-owned relation with database uniqueness enforcement. PostgreSQL JIT
+projection is one tenant-scoped transaction and serializes the same subject
+across replicas. Execution-home keys are also unique per tenant, preventing two
+users from sharing one delegated credential context.
+
+The role claim is required and exact in this mode. Administrative claims still
+require `external_launch.allow_admin_roles`; a `superadmin` claim also requires
+`execution.allow_superadmin`. A disabled role fails authentication rather than
+being silently downgraded.
+
+Omitting `identity` preserves normal local user, role, and password authority.
+The current contract does not synchronize external deactivation or revoke
+already-issued Agor credentials: the external provider can prevent a new
+launch, while cleanup and revocation remain a separate lifecycle concern.
+
+Before enabling this profile, apply the external-identity migration and upgrade
+every daemon replica. The migration fails closed if legacy external bindings or
+non-null execution-home keys conflict. New daemons can bind a legacy JSON link
+on the next successful launch, but old daemons do not maintain the new binding
+relation.
+
+For local development only, a symmetric assertion secret can be used:
+
+```yaml
+external_launch:
+  enabled: true
+  exchange_url: http://localhost:4000/exchange
+  issuer: http://localhost:4000
+  audience: agor-runtime:dev
+  dev_shared_secret_env: AGOR_EXTERNAL_LAUNCH_SHARED_SECRET
+```
+
+## Failure behavior and login redirects
+
+When a launch code is missing, expired, already used, invalid, or cannot be
+exchanged because of a non-transient authentication failure, the UI removes the
+one-time code from the URL and shows a clear failure message.
+
+If `external_launch.login_redirect_url` is configured, the unauthenticated
+screen makes **Return to workspace** the primary action so the user can open a
+fresh launch link from the external workspace. The button appends a `return_to`
+query parameter containing the current Agor path, allowing the launcher to
+preserve deep links such as `/ui/s/<session>/` when it issues a fresh
+`launch_code`. Local username/password login is still available as a secondary
+fallback unless external identity authority disables it.
+
+If `login_redirect_url` is omitted, the normal local login screen is unchanged.
+
+### Direct-host entry
+
+A browser can also navigate straight to a workspace host. If a valid session
+already exists for that host it opens immediately with no new code. Runtime
+sessions are stored in origin-scoped `localStorage` — never a `Domain`-wide
+cookie — so a session on one host is never sent to another. If there is no
+host-local session, the unauthenticated screen sends the browser to
+`login_redirect_url` with `return_to` (the current relative Agor route) and, when
+`return_host_param` is configured, the current host. The issuer allow-lists that
+host, mints a fresh code and returns to the same host for the normal exchange.
+Agor only ever redirects to the operator-configured URL, so it adds no open
+redirect.
+
+## Exchange contract
+
+The daemon sends a JSON `POST` to `exchange_url`:
+
+```json
+{
+  "launch_code": "opaque-one-time-code",
+  "audience": "agor-runtime:my-instance",
+  "instance_id": "my-instance",
+  "request_host": "primary.workspace.example.com"
+}
+```
+
+`request_host` is included only when `forward_request_host` is enabled; it is the
+normalized inbound Host read from the trusted `trusted_host_header` (default
+`Host`), never a client-supplied body field or arbitrary forwarded header.
+`audience` and `instance_id` are compatibility echoes — a correct issuer derives
+authority from its own records and the authenticated exchange credential.
+
+If `service_credential` or `service_credential_env` is configured, the daemon
+also sends `Authorization: Bearer <credential>`. This server-to-server exchange
+credential is never returned to the browser, exposed in the public `/health`
+settings, or written to logs.
+
+Production verification fails closed: the `none` algorithm is always rejected;
+`jwks_url` verification defaults to an `RS256` allow-list, while a static
+`public_key` derives a compatible default from its key type and EC curve. An
+explicit allow-list must match that key. A missing issuer, audience, `exp`,
+`sub`, or required tenant claim creates no session.
+
+The exchange endpoint should consume the launch code exactly once and return:
+
+```json
+{
+  "assertion": "<signed JWT>"
+}
+```
+
+Required assertion claims:
+
+- `iss`: expected issuer
+- `sub`: stable subject at that issuer
+- `aud`: expected runtime audience
+- `exp`: short expiration time
+
+Optional claims:
+
+- `email`, `name`, `avatar` or `picture`
+- `role`: `viewer` or `member` by default; `admin`/`superadmin` only when
+  `allow_admin_roles` is explicitly enabled
+- `provider`: stable provider label used in local identity mapping
+- `jti` or `nonce`: accepted for audit/correlation; one-time replay prevention
+  remains the exchange endpoint's responsibility
+- `public_base_url`: the tenant's canonical browser base URL from the issuer's
+  trusted workspace routing record, never from request headers. When present,
+  `iat` must also be a nonnegative integer NumericDate. The URL must be absolute
+  HTTP(S), at most 2048 characters, without credentials, whitespace, backslashes,
+  query or fragment. This claim is origin-only: a trailing `/` is accepted, but
+  path prefixes and entity paths are rejected. Static configured base paths are
+  unaffected.
+- `workspace_display_name`: an optional tenant display label for the header
+  badge. See [Tenant display label](#tenant-display-label).
+
+Required when `external_launch.instance_id` is configured:
+
+- `instance_id` or `runtime_instance_id`: must match configured `instance_id`
+
+### Tenant public links
+
+In `multi_tenancy.mode: required_from_auth`, session, branch, board, Knowledge,
+and artifact links use the tenant's `public_base_url`. Agor validates and stores
+the claim in reserved tenant-scoped `app_variables` routing metadata, in the same
+transaction as verified launch user projection. It is not a user preference.
+One successful **Open Agor** launch initializes links for the whole tenant,
+including other users, background work, and all daemon replicas. Reads use the
+database, not a per-process URL cache or browser headers.
+The stored observation retains its original tenant binding; importing variables
+into a different tenant cannot reuse the source tenant's public URL.
+
+Later launches refresh routing only when their signed `iat` is newer than the
+stored observation. Older observations and equal-`iat` conflicts do not overwrite
+it; a fresh launch in a later second can refresh a changed route. This orders
+launch observations, not Cloud routing revisions: the issuer must resolve the
+URL from authoritative workspace metadata when issuing the assertion. Omitting
+the claim is backward-compatible and does not erase an existing value.
+
+Until a hosted tenant receives this metadata, generated public links are omitted
+rather than substituting a cell-wide hostname. Existing logged-in sessions and
+scheduled work do not populate it on their own; someone must launch through the
+updated issuer. There is no automatic backfill, routing-change push, or rewrite
+of URLs already embedded in historical content.
+
+Static/single-tenant installations retain their configured `AGOR_BASE_URL`,
+`ui.base_url`, `daemon.base_url`, and local fallback behavior. In hosted mode,
+new direct MCP OAuth flows use `<public_base_url>/mcp-servers/oauth-callback`
+as their redirect URI; a tenant without this metadata keeps the
+deployment-wide callback. Existing grants keep the redirect URI they were issued
+with, and the deployment-wide callback keeps accepting their flows. Internal
+executor endpoints and the hosted callback relay are not changed by this claim. Knowledge reader links need no `mode=edit` query; both
+`/ui/kb/...` and `/ui/knowledge/...` are supported routes.
+
+### Tenant display label
+
+A verified launch can carry `workspace_display_name`, which Agor stores per
+tenant (reserved `app_variables` metadata, same transaction, tenant binding, and
+`iat` ordering as `public_base_url`) and shows as the header badge to
+authenticated users of that tenant. Precedence is the tenant label, then
+`daemon.instanceLabel`, then no badge. The public pre-login `GET /health` keeps
+returning only `daemon.instanceLabel`, so the tenant label is never disclosed
+before sign-in.
+
+The value is trimmed with JavaScript `String.prototype.trim()` and must then be
+1–80 UTF-16 code units long (JavaScript string length, so a character outside
+the Basic Multilingual Plane, such as an emoji, counts as 2) with no control
+characters. The label also requires `iat` to be a nonnegative integer
+NumericDate, independently of whether `public_base_url` is present.
+Because it is cosmetic, an invalid value or a missing/invalid `iat` does not
+fail the launch: Agor drops the label and logs only the warning code
+`launch_workspace_display_name_invalid`, never the value. A malformed stored label reads as absent and is replaced by the next
+valid launch. Omitting the claim keeps the last stored label; the badge updates
+on the next launch and page load.
+
+## Compatibility and upgrade notes
+
+- **Non-RS256 JWKS signing must be declared before upgrading.** `jwks_url`
+  verification defaults to an `RS256`-only allow-list and refuses HS\*
+  algorithms. Static `public_key` verification instead derives `RS256` for RSA
+  or the matching ES algorithm for a supported EC curve; an explicit
+  `algorithms` list must be compatible with the key. If a JWKS issuer signs with
+  another asymmetric algorithm (`RS384`, `ES256`, `PS256`, …), set
+  `algorithms` explicitly **before** upgrading.
+- **`login_redirect_url` deployments begin receiving a return-host parameter.**
+  When `login_redirect_url` is enabled, direct-host entry appends the configured
+  `return_host_param` (default `return_host`) to that URL. Existing deployments
+  are therefore not unchanged: the issuer's launch-init endpoint will start
+  receiving this query parameter and should tolerate and/or consume it. Leave
+  `login_redirect_url` unset if the issuer should not receive it.
+
+## Security notes
+
+- Put only an opaque, short-lived, one-time code in the browser URL.
+- Do not put runtime bearer tokens or external provider tokens in URLs.
+- The daemon-to-provider exchange should require HTTPS and an authenticated
+  backchannel in production.
+- `login_redirect_url` must be an HTTP(S) URL; malformed URLs and schemes such
+  as `javascript:` are rejected during config loading.
+- Assertions should be audience-bound to the runtime, instance-bound when
+  `instance_id` is configured, and expire quickly.
+- Configure exactly one assertion verification method (`jwks_url`, `public_key`,
+  or dev-only `dev_shared_secret`).
+- Local users are mapped by stable external identity `(provider, issuer,
+  subject)`. A matching email alone never merges identities.

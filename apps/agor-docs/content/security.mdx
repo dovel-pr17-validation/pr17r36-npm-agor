@@ -1,0 +1,170 @@
+---
+title: Security
+description: How to operate Agor safely, covering authorization, execution isolation, and deployment trust boundaries.
+heroImage: '/security_audit.png'
+---
+
+# Security
+
+Agor coordinates agents that can read, write, and execute code. Choose an execution boundary that matches the people who can access the daemon.
+
+<img src="/security_audit.png" alt="Security audit conducted using Agor itself" width="400" />
+
+## Pick an execution mode
+
+Agor 0.25 supports three execution modes:
+
+| Mode        | Local process                 | Filesystem boundary                  | Intended use                           |
+| ----------- | ----------------------------- | ------------------------------------ | -------------------------------------- |
+| `simple`    | daemon user                   | none                                 | One trusted user or fully trusted team |
+| `sandbox`   | daemon user inside bubblewrap | RBAC-derived mounts and private home | Shared Linux installations             |
+| `delegated` | external launcher             | supplied by the external substrate   | Containers, pods, hosted execution     |
+
+### Simple
+
+```yaml
+execution:
+  unix_user_mode: simple
+```
+
+Every local executor and terminal runs as the daemon user. Application RBAC can still restrict API operations, but it does not protect daemon-readable files from shell or agent code.
+
+### Sandbox (recommended for local multi-user installations)
+
+```yaml
+execution:
+  unix_user_mode: sandbox
+```
+
+Sandbox mode adds a fail-closed Linux bubblewrap filesystem policy to Agor's always-on RBAC. Executors still run as the daemon uid; isolation comes from mount visibility, not host accounts, groups, ACLs, or sudo impersonation. There is no fallback to `simple` when bubblewrap is unavailable.
+
+### Delegated
+
+```yaml
+execution:
+  unix_user_mode: delegated
+  executor_command_template: >-
+    launcher --tenant {tenant_id} --user {user_id}
+```
+
+The external launcher is responsible for identity, credentials, storage, containment, cancellation, and tenant isolation. `{tenant_id}` and `{user_id}` are the preferred stable identity inputs. The compatibility `{unix_user}` value is an opaque home key, not a host account.
+
+The launcher command receives a curated minimal process environment. The authenticated executor payload (including the task's resolved user environment) is delivered over stdin, not argv. Give the launcher its own workload identity in the delegated substrate; do not depend on inheriting daemon database, JWT, master-key, or provider credentials.
+
+> `strict` and `insulated` were removed in 0.25. Use the documented [offline 0.24.7 → 0.25.1 cutover](/guide/multiplayer-unix-isolation#migrating-from-024) for legacy installations; there is no published 0.24 bridge release.
+
+## Board and branch permissions (RBAC)
+
+Board and branch RBAC is always enabled. Every board and branch has one primary owner plus normalized user, group, and **Others** rules. The primary owner cannot be reassigned. A direct user rule takes precedence over groups; otherwise matching group rules combine. Others is only the fallback for an active same-workspace member with no direct or group match.
+
+Board access and branch access are separate. A board has one policy for who can see or manage its canvas and one complete default package for its branches. A branch either inherits that package or overrides all of it.
+
+| Branch role  | What it allows                                                                             |
+| ------------ | ------------------------------------------------------------------------------------------ |
+| Viewer       | Read the branch and its sessions                                                           |
+| Collaborator | Viewer access plus create and prompt the user's own sessions                               |
+| Manager      | Collaborator access plus branch, session-lifecycle, environment, and permission management |
+
+Filesystem access is configured separately as `none`, `read`, or `write`. Terminal access requires Collaborator or Manager plus filesystem access. Manager does not grant access to another person's sessions, home, or credentials.
+
+### Shared session prompting
+
+Shared session prompting starts off at two levels. A workspace admin must enable it in **Settings → Workspace → Preferences**, then a Board or Branch Manager can enable **Allow shared session prompting** in branch defaults or an individual branch override. Only Collaborators and Managers can use it.
+
+Only branch-home Sessions are shareable. Historical or explicitly opted-out Sessions that use their creator's execution home remain private and fail closed. An admitted shared prompt continues the same conversation and branch SDK state, but records the actual caller on the task and uses that caller's execution home, Agor-managed variables, provider and connector credentials, private MCP visibility, and branch filesystem projection. It never borrows the Session creator's home.
+
+People who can prompt a Session can read its conversation and influence its future context. Disabling the workspace preference also clears every board and branch opt-in so re-enabling cannot reopen stale permissions.
+
+---
+
+## What's Enforced Today
+
+Independent of mode:
+
+- ✅ **Authentication on every call.** REST and Socket.IO require a JWT, API key, or valid session token. There is no anonymous / unauthenticated path.
+- ✅ **Role-based authorization.** `viewer` / `member` / `admin` / `owner` gate privileged endpoints (terminals, env controls, config, user management).
+- ✅ **Encrypted credentials at rest.** Passwords with bcrypt (12 rounds), API keys and per-user env vars with AES-256-GCM under `AGOR_MASTER_SECRET`.
+- ✅ **Path traversal guards.** File browsing is restricted to `context/` within each branch with traversal protection.
+- ✅ **MCP token security.** Short-lived (24h default) JWTs in `Authorization: Bearer` header. Query-string tokens are rejected.
+- ✅ **Request size limits.** 10MB body cap to prevent oversized-payload DoS.
+- ✅ **Executor isolation.** SDKs run in separate processes; no direct DB access; just-in-time API keys via IPC. See [Architecture](/guide/architecture#current-architecture-executor-isolation).
+
+---
+
+## Things to Know Before You Go Multi-User
+
+### The Master Secret (`AGOR_MASTER_SECRET`)
+
+Agor encrypts stored credentials with a master secret. **Set it before starting the daemon** in any environment that handles real keys:
+
+```bash
+export AGOR_MASTER_SECRET="$(openssl rand -hex 32)"
+agor daemon start
+```
+
+The daemon fails startup when no master secret can be resolved. First-run setup may generate one in the local config, but production operators should provision and back up a stable high-entropy value explicitly. Do not change or lose it: Agor does not currently provide an online master-key rotation or bulk re-encryption workflow, and ciphertext written under the old key cannot be opened with a replacement key.
+
+### Web Terminal Trust Boundary
+
+The browser terminal is enabled by default for `member+` users. **In `unix_user_mode: simple` — and in `delegated` without an executor command template — the terminal runs as the daemon user.** That means a member-tier user can shell out and read `~/.agor/config.yaml`, `agor.db`, the JWT secret, and every API key the daemon knows about.
+
+Ways to handle this:
+
+1. **`unix_user_mode: sandbox`** applies the branch-aware filesystem sandbox.
+2. **`unix_user_mode: delegated` with an executor command template** routes the terminal into the execution substrate. This is safe only when that substrate enforces the declared identity and storage boundary.
+3. **`execution.allow_web_terminal: false`** disables the terminal entirely.
+
+The daemon prints a startup warning when an unsafe combination is active.
+
+### Message Gateway is High-Trust
+
+Anyone who can DM the Slack bot (or `@agor`-mention on a wired GitHub repo) can prompt an agent to read, write, and execute code in the configured branch. Treat enabling the [Message Gateway](/guide/message-gateway) as **giving message senders SSH access to that branch**.
+
+Mitigations: dedicated branches, restricted bot distribution, supervised permission mode, and sandbox or reviewed delegated execution.
+
+### Custom Config Path Is Half-Wired
+
+`--config` and `AGOR_CONFIG_PATH` set the config file location, but not every code path threads through it (notably `getDatabaseUrl`). If you rely on an alternate config location and hit weird DB resolution issues, [file an issue](https://github.com/preset-io/agor/issues).
+
+### Per-User Secrets Still Live on the Daemon
+
+Per-user API keys and env vars are encrypted at rest and only decrypted when needed. User/admin API reads expose names, scope, and presence metadata—not ciphertext or plaintext. Admins can replace or delete another lower-role user's stored value where user-management policy permits, but there is no browser, user-token, or admin-token reveal operation. Exact executor commands may resolve the minimum credential DTO they need for their authenticated user. **The daemon still hosts the secrets.** A malicious administrator with code/config/host control, or a compromised daemon account, can recover them. Invite administrators you trust with tool credentials.
+
+Agor distinguishes two environment sources:
+
+- **Daemon process environment:** executors inherit only explicit runtime metadata (`PATH`/home/identity, temp, locale/terminal, log/daemon routing, managed-tool paths, and the daemon-resolved Git safety policy). Ambient provider keys, proxy URLs, Git identity, XDG paths, and arbitrary variables exported by the account that started the daemon are excluded.
+- **User settings:** the authenticated user's configured mapping flows to that user's executor after structural name, NUL, and 10 KiB value checks. There is no semantic deny-list for this source; terminal access already lets that user export the same names. Narrow consumers such as managed Git use a typed subset rather than the generic map.
+
+For a shared session, each task uses the **prompter's global** managed variables and credentials. It does not implicitly use the Session creator's secrets or another person's session-scoped variables. A guest can save a requested widget value globally to their own profile.
+
+This process-environment rule does not suppress filesystem startup files. An interactive shell may still read the dotfiles present in its projected `HOME`; in `simple` mode that is part of the documented daemon-account trust boundary.
+
+### Admins Have Wide Reach
+
+Users with the `admin` role can manage other users, configure MCP servers, view system health, and (in `simple` mode) effectively reach everything on disk via terminal. Limit admin assignments and use `sandbox` or a reviewed delegated substrate for shared environments.
+
+---
+
+## Deployment Guidance
+
+- **Keep the daemon behind a firewall, VPN, or private network.** Pair with a reverse proxy if you need SSO or IP allowlists.
+- **Patch the host like any shared dev box.** Monitor logs, rotate credentials, audit users.
+- **Prefer scoped or temporary API credentials.** `OPENAI_API_KEY` for an artifact session shouldn't be your team's master key.
+- **Keep the deployment master secret stable and recoverable.** Online rotation/re-encryption is not implemented; rotate provider credentials independently after suspected exposure.
+- **Audit daemon and external-launcher logs.** Correlate tenant, user, session, task, and runtime identifiers.
+- **Pilot before scaling.** Run the first weeks of multi-user use with logs open.
+
+---
+
+## Reporting a Vulnerability
+
+Please email `security@preset.io` (or open a [private security advisory](https://github.com/preset-io/agor/security/advisories) on GitHub) before filing a public issue. We'll respond promptly.
+
+---
+
+## Related
+
+- [Multiplayer Execution Isolation](/guide/multiplayer-unix-isolation) (RBAC, sandbox, and delegated execution setup)
+- [Architecture](/guide/architecture#current-architecture-executor-isolation) (executor isolation deep dive)
+- [Containerized Execution](/guide/containerized-execution) (running Agor in Docker)
+- [Agor MCP Server](/guide/internal-mcp) (MCP token model and access gating)

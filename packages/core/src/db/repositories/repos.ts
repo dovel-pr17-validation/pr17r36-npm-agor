@@ -1,0 +1,605 @@
+/**
+ * Repo Repository
+ *
+ * Type-safe CRUD operations for git repositories with short ID support.
+ */
+
+import type { Repo, RepoEnvironment, RepoEnvironmentConfigV1, UUID } from '@agor/core/types';
+import { eq, like, sql } from 'drizzle-orm';
+import { normalizeRepoUrl } from '../../config/repo-reference.js';
+import { resolveVariant, wrapV1AsV2 } from '../../config/variant-resolver.js';
+import { generateId } from '../../lib/ids';
+import { resolveRepoCleanupPolicy, validateRepoCleanupPolicy } from '../../types/branch-cleanup';
+import { httpUrlHasUserinfo, stripHttpUrlUserinfo } from '../../utils/url';
+import type { Database } from '../client';
+import {
+  deleteFrom,
+  insert,
+  lockRowForUpdate,
+  runDatabaseTransaction,
+  select,
+  txAsDb,
+  update,
+} from '../database-wrapper';
+import { branches, type RepoInsert, type RepoRow, repos } from '../schema';
+import {
+  AmbiguousIdError,
+  attachHiddenTenant,
+  type BaseRepository,
+  EntityNotFoundError,
+  RESOLVE_SHORT_ID_FETCH_LIMIT,
+  RepositoryError,
+  resolveByShortIdPrefix,
+} from './base';
+import { deepMerge } from './merge-utils';
+
+/**
+ * Derive legacy v1 environment_config view from v2 environment.
+ *
+ * Returns undefined if the repo has no environment config or the default
+ * variant is missing. The v1 view reflects ONLY the default variant; UI
+ * callers that want variant-awareness should read `environment.variants`.
+ */
+function deriveV1FromV2(env: RepoEnvironment | undefined): RepoEnvironmentConfigV1 | undefined {
+  if (!env) return undefined;
+  // Canonical resolution lives in `variant-resolver.ts` — share it so the v1
+  // projection reflects exactly the same `extends` semantics as the parser,
+  // runtime commands, and UI.
+  const resolved = resolveVariant(env, env.default);
+  if (!resolved) return undefined;
+  // Resolved variant must have start/stop (parser validates). Fall back to
+  // empty string defensively so downstream consumers never see `undefined`.
+  const v1: RepoEnvironmentConfigV1 = {
+    up_command: resolved.start ?? '',
+    down_command: resolved.stop ?? '',
+  };
+  if (resolved.nuke) v1.nuke_command = resolved.nuke;
+  if (resolved.logs) v1.logs_command = resolved.logs;
+  if (resolved.app) v1.app_url_template = resolved.app;
+  if (resolved.health) v1.health_check = { type: 'http', url_template: resolved.health };
+  return v1;
+}
+
+export interface RepoRemoteUrlCredentialFinding {
+  repo_id: UUID;
+  slug: string;
+}
+
+/**
+ * Repo repository implementation
+ */
+export class RepoRepository implements BaseRepository<Repo, Partial<Repo>> {
+  constructor(private db: Database) {}
+
+  /**
+   * Convert database row to Repo type
+   *
+   * Normalizes environment config shape: v2 `environment` is source of truth;
+   * if only legacy `environment_config` is present (rows created before
+   * migration 0037/0026 ran, or written by legacy code paths), wrap it as v2
+   * in-memory. A v1 view is also kept on the returned object so existing UI
+   * code can keep reading `repo.environment_config.up_command` etc.
+   */
+  private rowToRepo(row: RepoRow): Repo {
+    const data = row.data as typeof row.data & {
+      environment?: RepoEnvironment;
+      environment_config?: RepoEnvironmentConfigV1;
+    };
+    const environment = data.environment ?? wrapV1AsV2(data.environment_config);
+    const environment_config = data.environment_config ?? deriveV1FromV2(environment);
+    const remote_url =
+      typeof data.remote_url === 'string' ? stripHttpUrlUserinfo(data.remote_url) : data.remote_url;
+
+    return attachHiddenTenant(
+      {
+        repo_id: row.repo_id as UUID,
+        slug: row.slug,
+        repo_type: (row.repo_type as Repo['repo_type']) ?? 'remote',
+        created_at: new Date(row.created_at).toISOString(),
+        last_updated: row.updated_at
+          ? new Date(row.updated_at).toISOString()
+          : new Date(row.created_at).toISOString(),
+        ...data,
+        cleanup_policy: resolveRepoCleanupPolicy(row.cleanup_policy),
+        remote_url,
+        environment,
+        environment_config,
+        clone_status: data.clone_status,
+        clone_error: data.clone_error,
+      },
+      row
+    );
+  }
+
+  /**
+   * Convert Repo to database insert format
+   */
+  private repoToInsert(repo: Partial<Repo>): RepoInsert {
+    const now = Date.now();
+    const repoId = repo.repo_id ?? generateId();
+
+    if (!repo.slug) {
+      throw new RepositoryError('slug is required when creating a repo');
+    }
+
+    if (!repo.repo_type) {
+      throw new RepositoryError('repo_type is required when creating a repo');
+    }
+
+    if (!repo.local_path) {
+      throw new RepositoryError('Repo must have a local_path');
+    }
+
+    if (repo.repo_type === 'remote' && !repo.remote_url) {
+      throw new RepositoryError('Remote repos must have a remote_url');
+    }
+
+    // v2 environment is the source of truth. If a caller passes a legacy
+    // v1 `environment_config` without a v2 `environment`, wrap it. If the
+    // caller passes both, prefer `environment` (v2).
+    const environment = repo.environment ?? wrapV1AsV2(repo.environment_config);
+    // Always derive the v1 projection from v2 so the UI-facing shape stays
+    // in sync with the source of truth on every write.
+    const environment_config = deriveV1FromV2(environment) ?? repo.environment_config;
+
+    return {
+      repo_id: repoId,
+      slug: repo.slug,
+      created_at: new Date(repo.created_at ?? now),
+      updated_at: repo.last_updated ? new Date(repo.last_updated) : new Date(now),
+      repo_type: repo.repo_type,
+      cleanup_policy: validateRepoCleanupPolicy(resolveRepoCleanupPolicy(repo.cleanup_policy)),
+      data: {
+        name: repo.name ?? repo.slug,
+        remote_url: repo.remote_url ? stripHttpUrlUserinfo(repo.remote_url) : undefined,
+        local_path: repo.local_path,
+        default_branch: repo.default_branch,
+        environment,
+        environment_config,
+        clone_status: repo.clone_status,
+        clone_generation: repo.clone_generation,
+        // `|| undefined` (not `??`) — deepMerge writes explicit `null` to
+        // clear `clone_error` on the success patch from the executor; we
+        // coerce that to `undefined` here so the stored value matches the
+        // `clone_error?: RepoCloneError` invariant (set only when failed).
+        clone_error: repo.clone_error || undefined,
+      },
+    };
+  }
+
+  /**
+   * Resolve short ID to full ID via the centralized helper.
+   */
+  private async resolveId(id: string): Promise<string> {
+    return resolveByShortIdPrefix(id, 'Repo', async (pattern) => {
+      const rows = await select(this.db)
+        .from(repos)
+        .where(like(repos.repo_id, pattern))
+        .limit(RESOLVE_SHORT_ID_FETCH_LIMIT)
+        .all();
+      return rows.map((r: { repo_id: string }) => r.repo_id);
+    });
+  }
+
+  /**
+   * Create a new repo
+   */
+  async create(data: Partial<Repo>): Promise<Repo> {
+    try {
+      const insertData = this.repoToInsert(data);
+      await insert(this.db, repos).values(insertData).run();
+
+      const row = await select(this.db)
+        .from(repos)
+        .where(eq(repos.repo_id, insertData.repo_id))
+        .one();
+
+      if (!row) {
+        throw new RepositoryError('Failed to retrieve created repo');
+      }
+
+      return this.rowToRepo(row);
+    } catch (error) {
+      if (error instanceof RepositoryError) throw error;
+      throw new RepositoryError(
+        `Failed to create repo: ${error instanceof Error ? error.message : String(error)}`,
+        error
+      );
+    }
+  }
+
+  /**
+   * Atomically register or retry a clone without replacing its identity or branches.
+   * The unique tenant/slug index arbitrates first-run races across daemon replicas;
+   * the row lock arbitrates failed retries. No network or filesystem work here.
+   */
+  async claimClone(data: Partial<Repo>): Promise<{
+    repo: Repo;
+    acquired: boolean;
+    created: boolean;
+  }> {
+    const candidate = this.repoToInsert({
+      ...data,
+      clone_status: 'cloning',
+      clone_generation: 1,
+      clone_error: undefined,
+    });
+    return runDatabaseTransaction(
+      this.db,
+      async (tx) => {
+        const inserted = await insert(tx, repos).values(candidate).onConflictDoNothing().run();
+        await lockRowForUpdate(tx, this.db, repos, eq(repos.slug, candidate.slug));
+        const row = await select(tx).from(repos).where(eq(repos.slug, candidate.slug)).one();
+        if (!row)
+          throw new RepositoryError('Repository setup could not reserve its record. Retry setup.');
+        const repo = this.rowToRepo(row);
+        if (
+          repo.repo_type !== 'remote' ||
+          normalizeRepoUrl(repo.remote_url ?? '') !== normalizeRepoUrl(data.remote_url ?? '')
+        ) {
+          throw new RepositoryError(
+            'This repository name is already registered with a different source. Choose another name or ask an administrator to check repository settings.'
+          );
+        }
+        if (inserted.rowsAffected > 0) return { repo, acquired: true, created: true };
+        if (repo.clone_status !== 'failed') return { repo, acquired: false, created: false };
+        // Preserve the original locator, environment, IDs, and every dependent branch.
+        // Only a settled failed attempt may be retried; age is not proof of settlement.
+        const retry = this.repoToInsert({
+          ...repo,
+          default_branch: data.default_branch ?? repo.default_branch,
+          clone_status: 'cloning',
+          clone_generation: (repo.clone_generation ?? 0) + 1,
+          clone_error: undefined,
+        });
+        await update(tx, repos)
+          .set({ data: retry.data, updated_at: new Date() })
+          .where(eq(repos.repo_id, repo.repo_id))
+          .run();
+        const claimed = await select(tx).from(repos).where(eq(repos.repo_id, repo.repo_id)).one();
+        return { repo: this.rowToRepo(claimed!), acquired: true, created: false };
+      },
+      { sqliteImmediate: true, sqliteBusyRetries: 3 }
+    );
+  }
+
+  /**
+   * Find repo by ID (supports short ID)
+   */
+  async findById(id: string): Promise<Repo | null> {
+    try {
+      const fullId = await this.resolveId(id);
+      const row = await select(this.db).from(repos).where(eq(repos.repo_id, fullId)).one();
+
+      return row ? this.rowToRepo(row) : null;
+    } catch (error) {
+      if (error instanceof EntityNotFoundError) return null;
+      if (error instanceof AmbiguousIdError) throw error;
+      throw new RepositoryError(
+        `Failed to find repo: ${error instanceof Error ? error.message : String(error)}`,
+        error
+      );
+    }
+  }
+
+  /**
+   * Find repo by slug (exact match)
+   */
+  async findBySlug(slug: string): Promise<Repo | null> {
+    try {
+      const row = await select(this.db).from(repos).where(eq(repos.slug, slug)).one();
+
+      return row ? this.rowToRepo(row) : null;
+    } catch (error) {
+      throw new RepositoryError(
+        `Failed to find repo by slug: ${error instanceof Error ? error.message : String(error)}`,
+        error
+      );
+    }
+  }
+
+  /**
+   * Find all repos
+   */
+  async findAll(): Promise<Repo[]> {
+    try {
+      const rows = await select(this.db).from(repos).all();
+      return rows.map((row: RepoRow) => this.rowToRepo(row));
+    } catch (error) {
+      throw new RepositoryError(
+        `Failed to find all repos: ${error instanceof Error ? error.message : String(error)}`,
+        error
+      );
+    }
+  }
+
+  /**
+   * Lock the canonical repository row before inventorying branches for delete.
+   *
+   * The caller must already own a native transaction. PostgreSQL's FOR UPDATE
+   * lock conflicts with the key-share lock taken by a concurrent branch FK
+   * insert, so no new child can appear between inventory and repository delete.
+   * SQLite relies on the caller's IMMEDIATE transaction for the equivalent
+   * write exclusion.
+   */
+  async lockForBranchInventory(id: string): Promise<Repo> {
+    try {
+      const fullId = await this.resolveId(id);
+      await lockRowForUpdate(this.db, this.db, repos, eq(repos.repo_id, fullId));
+
+      const row = await select(this.db).from(repos).where(eq(repos.repo_id, fullId)).one();
+      if (!row) throw new EntityNotFoundError('Repo', id);
+      return this.rowToRepo(row);
+    } catch (error) {
+      if (error instanceof EntityNotFoundError) throw error;
+      throw new RepositoryError(
+        `Failed to lock repo branch inventory: ${error instanceof Error ? error.message : String(error)}`,
+        error
+      );
+    }
+  }
+
+  /**
+   * Find managed repos only (DEPRECATED: all repos are managed now)
+   *
+   * Kept for backwards compatibility - returns all repos.
+   */
+  async findManaged(): Promise<Repo[]> {
+    return this.findAll();
+  }
+
+  /**
+   * Find persisted repo.remote_url rows that still contain HTTP(S) userinfo.
+   *
+   * This intentionally reads raw rows rather than `rowToRepo()` because reads
+   * sanitize `remote_url` before returning repo objects.
+   */
+  async scanRemoteUrls(): Promise<{ checked: number; findings: RepoRemoteUrlCredentialFinding[] }> {
+    try {
+      const rows = (await select(this.db).from(repos).all()) as RepoRow[];
+      const findings = rows.flatMap((row) => {
+        const data = row.data as typeof row.data & { remote_url?: unknown };
+        if (typeof data.remote_url !== 'string' || !httpUrlHasUserinfo(data.remote_url)) {
+          return [];
+        }
+        return [{ repo_id: row.repo_id as UUID, slug: row.slug }];
+      });
+
+      return { checked: rows.length, findings };
+    } catch (error) {
+      throw new RepositoryError(
+        `Failed to scan repo remote URLs: ${error instanceof Error ? error.message : String(error)}`,
+        error
+      );
+    }
+  }
+
+  /**
+   * Remove HTTP(S) userinfo from persisted repo.remote_url values.
+   *
+   * `rowToRepo()` sanitizes reads so legacy credential-bearing values are not
+   * returned through APIs or reused by daemon/executor code, but this method
+   * repairs the stored rows as a startup/admin hygiene pass.
+   */
+  async scrubRemoteUrls(): Promise<{ checked: number; changed: number }> {
+    try {
+      const scan = await this.scanRemoteUrls();
+      let changed = 0;
+
+      for (const finding of scan.findings) {
+        await this.db.transaction(async (tx) => {
+          await lockRowForUpdate(txAsDb(tx), this.db, repos, eq(repos.repo_id, finding.repo_id));
+
+          const currentRow = await select(txAsDb(tx))
+            .from(repos)
+            .where(eq(repos.repo_id, finding.repo_id))
+            .one();
+          if (!currentRow) return;
+
+          const data = currentRow.data as typeof currentRow.data & { remote_url?: unknown };
+          if (typeof data.remote_url !== 'string' || !httpUrlHasUserinfo(data.remote_url)) {
+            return;
+          }
+
+          await update(txAsDb(tx), repos)
+            .set({
+              updated_at: new Date(),
+              data: {
+                ...data,
+                remote_url: stripHttpUrlUserinfo(data.remote_url),
+              },
+            })
+            .where(eq(repos.repo_id, finding.repo_id))
+            .run();
+          changed += 1;
+        });
+      }
+
+      return { checked: scan.checked, changed };
+    } catch (error) {
+      throw new RepositoryError(
+        `Failed to scrub repo remote URLs: ${error instanceof Error ? error.message : String(error)}`,
+        error
+      );
+    }
+  }
+
+  /**
+   * Update repo by ID (atomic with database-level transaction)
+   *
+   * Uses a transaction to ensure read-merge-write is atomic, preventing race conditions
+   * when multiple updates happen concurrently (e.g., permission_config updates).
+   * A supplied v2 environment is a complete configuration and replaces the old
+   * value; omitting that top-level key preserves it. null/undefined clears it.
+   */
+  async update(id: string, updates: Partial<Repo>): Promise<Repo> {
+    try {
+      const fullId = await this.resolveId(id);
+
+      // Use transaction to make read-merge-write atomic
+      return await this.db.transaction(async (tx) => {
+        // Acquire row-level lock on PostgreSQL to prevent lost updates
+
+        await lockRowForUpdate(txAsDb(tx), this.db, repos, eq(repos.repo_id, fullId));
+
+        // STEP 1: Read current repo (within transaction)
+        const currentRow = await select(txAsDb(tx))
+          .from(repos)
+          .where(eq(repos.repo_id, fullId))
+          .one();
+
+        if (!currentRow) {
+          throw new EntityNotFoundError('Repo', id);
+        }
+
+        const current = this.rowToRepo(currentRow);
+        if (current.clone_generation && Object.hasOwn(updates, 'clone_status')) {
+          if (
+            updates.clone_generation !== current.clone_generation ||
+            current.clone_status !== 'cloning' ||
+            !['ready', 'failed'].includes(updates.clone_status ?? '')
+          )
+            return current;
+        }
+        // Only claimClone may advance the generation, never a generic metadata patch.
+        if (
+          Object.hasOwn(updates, 'clone_generation') &&
+          updates.clone_generation !== current.clone_generation
+        ) {
+          throw new RepositoryError('Clone attempt can only be changed by repository setup');
+        }
+
+        // STEP 2: Deep merge updates into current repo (in memory)
+        // Preserves nested objects like permission_config when doing partial updates
+        const merged = deepMerge(current, updates);
+        // YAML Save and imports supply a complete v2 configuration, not a
+        // nested patch. Otherwise removed variants/fields survive the merge.
+        if (Object.hasOwn(updates, 'environment')) {
+          merged.environment = updates.environment ?? undefined;
+          // Do not resurrect a cleared config through the legacy fallback.
+          // repoToInsert re-derives this projection from the replacement.
+          merged.environment_config = undefined;
+        }
+        if (Object.hasOwn(updates, 'cleanup_policy')) {
+          merged.cleanup_policy = validateRepoCleanupPolicy(updates.cleanup_policy);
+        }
+        const insertData = this.repoToInsert(merged);
+
+        // STEP 3: Write merged repo (within same transaction)
+        // Always refresh updated_at to current time so callers see the new timestamp.
+        const newUpdatedAt = new Date();
+        await update(txAsDb(tx), repos)
+          .set({
+            slug: insertData.slug,
+            updated_at: newUpdatedAt,
+            repo_type: insertData.repo_type,
+            cleanup_policy: insertData.cleanup_policy,
+            data: insertData.data,
+          })
+          .where(eq(repos.repo_id, fullId))
+          .run();
+
+        // Sync re-derived fields back onto `merged` so the returned object
+        // matches what was actually persisted. `repoToInsert` coerces
+        // explicit-clear sentinels (e.g. `clone_error: null` from deepMerge)
+        // to `undefined`; without this sync the caller sees the un-coerced
+        // null and the type invariant lies.
+        merged.environment = insertData.data.environment;
+        merged.environment_config = insertData.data.environment_config;
+        merged.clone_error = insertData.data.clone_error;
+        merged.remote_url = insertData.data.remote_url;
+        merged.last_updated = newUpdatedAt.toISOString();
+        return merged;
+      });
+    } catch (error) {
+      if (error instanceof RepositoryError) throw error;
+      if (error instanceof EntityNotFoundError) throw error;
+      throw new RepositoryError(
+        `Failed to update repo: ${error instanceof Error ? error.message : String(error)}`,
+        error
+      );
+    }
+  }
+
+  /**
+   * Replace the repo's `environment` column wholesale.
+   *
+   * Named convenience for imports; uses the same atomic replacement contract
+   * as {@link update} so imports and the repository YAML editor cannot drift.
+   *
+   * Pass `null` to clear the environment entirely. `template_overrides` is
+   * not treated specially here; callers that need to preserve DB-only
+   * template overrides across a replace must fold them into the incoming
+   * `environment` object themselves.
+   */
+  async setEnvironment(id: string, environment: RepoEnvironment | null): Promise<Repo> {
+    return this.update(id, { environment: environment ?? undefined });
+  }
+
+  /**
+   * Delete repo by ID
+   */
+  async delete(id: string): Promise<void> {
+    try {
+      const fullId = await this.resolveId(id);
+
+      const result = await runDatabaseTransaction(
+        this.db,
+        async (tx) => {
+          await new RepoRepository(tx).lockForBranchInventory(fullId);
+          if (await select(tx).from(branches).where(eq(branches.repo_id, fullId)).limit(1).one()) {
+            throw new RepositoryError(
+              'Permanently delete repository branches before deleting the repository'
+            );
+          }
+          return deleteFrom(tx, repos).where(eq(repos.repo_id, fullId)).run();
+        },
+        { sqliteImmediate: true }
+      );
+
+      if (result.rowsAffected === 0) {
+        throw new EntityNotFoundError('Repo', id);
+      }
+    } catch (error) {
+      if (error instanceof EntityNotFoundError) throw error;
+      throw new RepositoryError(
+        `Failed to delete repo: ${error instanceof Error ? error.message : String(error)}`,
+        error
+      );
+    }
+  }
+
+  /**
+   * @deprecated Branches are now first-class entities in their own table.
+   * Use BranchRepository instead.
+   */
+  async addBranch(): Promise<never> {
+    throw new Error('addBranch is deprecated. Use BranchRepository.create() instead.');
+  }
+
+  /**
+   * @deprecated Branches are now first-class entities in their own table.
+   * Use BranchRepository instead.
+   */
+  async removeBranch(): Promise<never> {
+    throw new Error(
+      'removeBranch is deprecated. Use the branch permanent deletion service instead.'
+    );
+  }
+
+  /**
+   * Count total repos
+   */
+  async count(): Promise<number> {
+    try {
+      const result = await select(this.db, { count: sql<number>`count(*)` }).from(repos).one();
+
+      return result?.count ?? 0;
+    } catch (error) {
+      throw new RepositoryError(
+        `Failed to count repos: ${error instanceof Error ? error.message : String(error)}`,
+        error
+      );
+    }
+  }
+}

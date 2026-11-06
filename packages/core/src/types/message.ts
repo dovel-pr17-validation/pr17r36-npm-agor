@@ -1,0 +1,445 @@
+/**
+ * Message Type
+ *
+ * Represents a single message in a conversation between user and agent.
+ * Messages are stored in a normalized table and referenced by tasks via message_range.
+ */
+
+import type { PersistedAgenticToolName } from './agentic-tool';
+import type { MessageID, SessionID, TaskID } from './id';
+import type { WidgetMessageMetadata } from './widget';
+
+/**
+ * Message role - who is speaking
+ */
+export enum MessageRole {
+  USER = 'user',
+  ASSISTANT = 'assistant',
+  SYSTEM = 'system',
+}
+
+/**
+ * Message source accepted by current prompt/runtime paths.
+ * - 'gateway': Message came from an external platform (Slack, Discord, etc.)
+ * - 'agor': Message originated from Agor UI
+ */
+export type MessageSource = 'gateway' | 'agor';
+
+/**
+ * Trusted prompt provenance sent over the daemon-to-executor boundary.
+ *
+ * This is deliberately narrower than persisted message source metadata. The
+ * daemon derives it from the admitted Task and Session; public prompt callers
+ * cannot select it. Omission means the prompt is synthesized or otherwise
+ * unattributed and must fail closed at provider human-trust gates.
+ */
+export type PromptOrigin = { kind: 'human' } | { kind: 'channel'; server: string };
+
+/**
+ * Read-only provenance left on messages written by removed integrations.
+ * Runtime request types intentionally exclude these values.
+ */
+export type LegacyMessageSource = 'cli-repl';
+export type PersistedMessageSource = MessageSource | LegacyMessageSource;
+
+/**
+ * Message type
+ * Distinguishes conversation messages from meta/synthetic messages
+ */
+export const MESSAGE_TYPE_VALUES = [
+  'user',
+  'assistant',
+  'system',
+  'file-history-snapshot',
+  'permission_request',
+  'input_request',
+  'daemon_restart',
+  'daemon_crash',
+  'widget_request',
+] as const;
+
+export type MessageType = (typeof MESSAGE_TYPE_VALUES)[number];
+
+/** Serialized field sizes before a lossy, display-only transcript projection. */
+export type TranscriptTruncation = Record<string, { original_bytes: number }>;
+
+/**
+ * Content block (for multi-modal messages)
+ */
+export interface ContentBlock {
+  /** Omitted/truncated tool fields; never use this projection as executable input. */
+  transcript_truncation?: TranscriptTruncation;
+  type:
+    | 'text'
+    | 'image'
+    | 'tool_use'
+    | 'tool_result'
+    | 'thinking'
+    | 'system_status'
+    | 'system_complete'
+    | 'rate_limit'
+    | 'api_wait'
+    | 'sdk_event';
+  [key: string]: unknown; // Additional type-specific fields
+}
+
+/**
+ * A single hunk from a structuredPatch diff computation.
+ * Used by executor diff enrichment and the UI diff viewer.
+ */
+export interface StructuredPatchHunk {
+  oldStart: number;
+  oldLines: number;
+  newStart: number;
+  newLines: number;
+  lines: string[];
+}
+
+/**
+ * Per-file diff data for multi-file tools (e.g. Codex edit_files).
+ */
+export interface FileDiff {
+  path: string;
+  kind: 'add' | 'update' | 'delete';
+  structuredPatch: StructuredPatchHunk[];
+}
+
+/**
+ * Diff enrichment data attached to tool_result content blocks.
+ * Computed best-effort by the executor for Edit/Write tool results.
+ *
+ * Single-file tools (Edit, Write) use `structuredPatch`.
+ * Multi-file tools (edit_files) use `files`.
+ */
+export interface DiffEnrichment {
+  structuredPatch: StructuredPatchHunk[];
+  /** Per-file diffs for multi-file tools like Codex edit_files */
+  files?: FileDiff[];
+}
+
+/**
+ * Tool use in a message
+ */
+export interface ToolUse {
+  transcript_truncation?: TranscriptTruncation;
+  id: string;
+  name: string;
+  input: Record<string, unknown>;
+}
+
+/**
+ * Permission scope - how long a permission grant lasts
+ * Maps to SDK's PermissionUpdateDestination
+ */
+export enum PermissionScope {
+  ONCE = 'once', // Just this one request (no updatedPermissions)
+  PROJECT = 'project', // For this entire project (SDK destination: 'projectSettings')
+  USER = 'user', // For all sessions globally (SDK destination: 'userSettings')
+  LOCAL = 'local', // For this project, gitignored (SDK destination: 'localSettings')
+}
+
+/**
+ * Permission request status
+ */
+export enum PermissionStatus {
+  PENDING = 'pending',
+  APPROVED = 'approved',
+  DENIED = 'denied',
+  TIMED_OUT = 'timed_out',
+}
+
+/**
+ * Permission request content
+ * Used when type === 'permission_request'
+ */
+export interface PermissionRequestContent {
+  request_id: string;
+  task_id?: TaskID; // Required for daemon to route permission_resolved event back to executor (optional for backward compat with legacy messages)
+  tool_name: string;
+  tool_input: Record<string, unknown>;
+  tool_use_id?: string;
+  status: PermissionStatus;
+  scope?: PermissionScope; // Set when approved
+  approved_by?: string; // User ID who approved/denied
+  approved_at?: string; // Timestamp of decision
+}
+
+/**
+ * Input request status (legacy / pre-#1177).
+ *
+ * The `AskUserQuestion` tool was disallowed at the SDK layer in #1177
+ * because it hung the executor in gateway channels. New sessions never
+ * produce `input_request` messages; this enum is kept so historical rows
+ * still type-check when read from the DB.
+ */
+export enum InputRequestStatus {
+  PENDING = 'pending',
+  ANSWERED = 'answered',
+  TIMED_OUT = 'timed_out',
+}
+
+/** Input request question option (legacy / pre-#1177, see `InputRequestStatus`). */
+export interface InputRequestOption {
+  label: string;
+  description: string;
+  markdown?: string;
+}
+
+/** Input request question (legacy / pre-#1177, see `InputRequestStatus`). */
+export interface InputRequestQuestion {
+  question: string;
+  header: string;
+  options: InputRequestOption[];
+  multiSelect: boolean;
+}
+
+/** Input request content (legacy / pre-#1177, see `InputRequestStatus`). */
+export interface InputRequestContent {
+  request_id: string;
+  task_id?: TaskID;
+  questions: InputRequestQuestion[];
+  status: InputRequestStatus;
+  answers?: Record<string, string>;
+  annotations?: Record<string, { markdown?: string; notes?: string }>;
+  answered_by?: string;
+  answered_at?: string;
+}
+
+/**
+ * Message
+ *
+ * Represents a single turn in the conversation.
+ */
+export interface Message {
+  /** Unique message identifier (UUIDv7) */
+  message_id: MessageID;
+
+  /** Session this message belongs to */
+  session_id: SessionID;
+
+  /** Task this message belongs to (optional - messages may exist before task assignment) */
+  task_id?: TaskID;
+
+  /** Message type (from transcript) */
+  type: MessageType;
+
+  /** Message role */
+  role: MessageRole;
+
+  /** Index in conversation (0-based, used for message_range queries) */
+  index: number;
+
+  /** When message was created */
+  timestamp: string;
+
+  /** Content preview (first 200 chars for list views) */
+  content_preview: string;
+
+  /** Full message content (type depends on message type) */
+  content: string | ContentBlock[] | PermissionRequestContent | InputRequestContent;
+
+  /** Read-only lean projection hint; contains no reasoning text. */
+  has_deferred_reasoning?: boolean;
+
+  /** Tool uses in this message (for assistant messages) */
+  tool_uses?: ToolUse[];
+
+  /**
+   * Parent tool use ID (from Claude Agent SDK)
+   * When a tool spawns nested operations (e.g., Task tool spawning Read/Grep),
+   * child operations have this set to the parent tool's ID.
+   * This enables grouping nested tool calls under their parent in the UI.
+   */
+  parent_tool_use_id?: string | null;
+
+  // NOTE: queueing moved off `messages` and onto `tasks.status='queued'` as
+  // of migration sqlite/0040 (postgres/0030). The `status` and `queue_position`
+  // fields are gone — see `Task.queue_position` instead.
+
+  /** Agent-specific metadata */
+  metadata?: {
+    /** Model used for this message */
+    model?: string;
+
+    /** Token counts */
+    tokens?: {
+      input: number;
+      output: number;
+    };
+
+    /** Original agent message ID (e.g., Claude's UUID) */
+    original_id?: string;
+
+    /** Parent message ID in agent's system */
+    parent_id?: string;
+
+    /** Whether this is a meta/synthetic message */
+    is_meta?: boolean;
+
+    /**
+     * Message source - where the message originated
+     * - 'gateway': Message came from external platform (Slack, Discord, etc.)
+     * - 'agor': Message originated from Agor UI
+     * - undefined: Legacy message or source not tracked
+     */
+    source?: PersistedMessageSource;
+
+    /**
+     * Widget request state. Only populated on `type === 'widget_request'`
+     * messages. Discriminated by `widget_type`; see `types/widget.ts`.
+     */
+    widget?: WidgetMessageMetadata;
+
+    /**
+     * Marks the user-role message / task as having been authored by the
+     * daemon on behalf of the user, rather than typed by a human.
+     * Used by widget auto-resume prompts (see `widget_id`) and other
+     * system-injected prompts so the UI can label them appropriately.
+     */
+    system_authored?: boolean;
+
+    /**
+     * For system-authored tasks queued in response to widget resolution,
+     * the widget message that triggered them. Lets the UI link the queued
+     * prompt back to the originating widget for audit / debugging.
+     */
+    widget_id?: MessageID;
+
+    /** Generic structural marker set by the executor on the message it emits
+     * for any task failure (i.e. the SDK call threw). Lets downstream consumers
+     * identify a failure message without type/role guessing. Note the
+     * credential-classification hook itself keys off the more specific
+     * `is_missing_credential_failure` / `is_zero_turn_result` flags, not this one. */
+    is_task_failure?: boolean;
+
+    /** Set only when the executor's scoped credential preflight fails. */
+    is_missing_credential_failure?: boolean;
+
+    /** Marks the synthesized message from a zero-turn success (no real model call). */
+    is_zero_turn_result?: boolean;
+
+    /** Marks an executor-owned terminal SDK error result for bounded classification. */
+    is_provider_failure_result?: boolean;
+
+    /**
+     * Set server-side when a task failure resolves to a missing credential or
+     * provider credit/quota exhaustion. Drives a recovery state instead of the
+     * raw error; `tool` names the provider that needs attention.
+     */
+    error_kind?: 'missing_credential' | 'provider_credit_exhausted';
+    tool?: PersistedAgenticToolName;
+
+    /** Additional agent-specific fields */
+    [key: string]: unknown;
+  };
+}
+
+/** Display metadata needed by the experimental lean transcript, never tool data. */
+export const LEAN_TRANSCRIPT_METADATA_FIELDS = [
+  'model',
+  'source',
+  'system_authored',
+  'widget_id',
+  'widget',
+  'is_agor_callback',
+  'is_btw_result',
+  'btw_prompt',
+  'btw_session_id',
+  'btw_caller_session_id',
+  'btw_caller_title',
+  'error_kind',
+  'tool',
+  'is_task_failure',
+  'is_missing_credential_failure',
+  'is_zero_turn_result',
+  'is_provider_failure_result',
+  'persistence_omission',
+] as const;
+
+const LEAN_TRANSCRIPT_OMITTED_BLOCKS = ['tool_use', 'tool_result', 'thinking'];
+
+/**
+ * Browser-side counterpart of MessagesRepository's SQL lean projection, used to
+ * release cached detail without a refetch. Keep the two in step; persisted
+ * history is unchanged and the full message can be reloaded on demand.
+ */
+export function leanMessage(message: Message): Message {
+  const { content } = message;
+  const hasThinking = Array.isArray(content) && content.some((block) => block.type === 'thinking');
+  const permission =
+    message.type === 'permission_request' &&
+    content &&
+    typeof content === 'object' &&
+    !Array.isArray(content) &&
+    'tool_name' in content
+      ? content
+      : undefined;
+  return {
+    message_id: message.message_id,
+    session_id: message.session_id,
+    task_id: message.task_id,
+    type: message.type,
+    role: message.role,
+    index: message.index,
+    timestamp: message.timestamp,
+    content_preview: '',
+    content: Array.isArray(content)
+      ? content.filter((block) => !LEAN_TRANSCRIPT_OMITTED_BLOCKS.includes(block.type))
+      : permission
+        ? {
+            ...permission,
+            // Never ask for approval of hidden arguments.
+            tool_input:
+              permission.status === PermissionStatus.PENDING ? (permission.tool_input ?? {}) : {},
+          }
+        : content,
+    ...(message.has_deferred_reasoning || hasThinking ? { has_deferred_reasoning: true } : {}),
+    tool_uses: undefined,
+    parent_tool_use_id: message.parent_tool_use_id || undefined,
+    metadata: Object.fromEntries(
+      Object.entries(message.metadata ?? {}).filter(
+        ([key]) =>
+          LEAN_TRANSCRIPT_METADATA_FIELDS.some((field) => field === key) &&
+          (key !== 'widget' || message.type === 'widget_request')
+      )
+    ),
+  };
+}
+
+/**
+ * Message creation input (without generated fields)
+ */
+export type MessageCreate = Omit<Message, 'message_id'> & {
+  message_id?: MessageID;
+};
+
+/**
+ * Fields that may change after a Message is created.
+ *
+ * Message identity, Session/Task membership, transcript position, type/role,
+ * and timestamps are deliberately immutable.
+ */
+export const MESSAGE_PATCH_FIELDS = [
+  'content_preview',
+  'content',
+  'tool_uses',
+  'parent_tool_use_id',
+  'metadata',
+] as const satisfies readonly (keyof Message)[];
+
+export type MessagePatch = Partial<Pick<Message, (typeof MESSAGE_PATCH_FIELDS)[number]>>;
+
+/**
+ * Streaming event types
+ *
+ * These events are broadcast by the executor to the daemon via /messages/streaming
+ * and relayed to connected clients via Socket.io for real-time message updates.
+ */
+export type StreamingEventType =
+  | 'streaming:start'
+  | 'streaming:chunk'
+  | 'streaming:end'
+  | 'streaming:error'
+  | 'thinking:start'
+  | 'thinking:chunk'
+  | 'thinking:end';

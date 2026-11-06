@@ -1,0 +1,754 @@
+import type {
+  AgorClient,
+  Branch,
+  BranchArchiveOrDeleteOptions,
+  Repo,
+  Session,
+  SpawnConfig,
+  User,
+} from '@agor-live/client';
+import {
+  canDismissBranchWorkspaceNotification,
+  getTeammateConfig,
+  isSessionExecuting,
+  isTeammate,
+} from '@agor-live/client';
+import {
+  BranchesOutlined,
+  CodeOutlined,
+  DragOutlined,
+  EditOutlined,
+  PushpinFilled,
+  RobotOutlined,
+} from '@ant-design/icons';
+import { Button, Card, Space, Spin, Tooltip, Typography, theme } from 'antd';
+import { AggregationColor } from 'antd/es/color-picker/color';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { useConnectionDisabled } from '../../contexts/ConnectionContext';
+import { useBranchAccess } from '../../hooks/useBranchAccess';
+import { useLocalStorage } from '../../hooks/useLocalStorage';
+import { useProgressiveMount } from '../../hooks/useProgressiveMount';
+import { readCollapsedBranchNode } from '../../utils/collapsedBranchNodes';
+import {
+  REACT_FLOW_DRAG_HANDLE_CLASS,
+  REACT_FLOW_NO_DRAG_CLASS,
+  REACT_FLOW_NO_WHEEL_CLASS,
+} from '../../utils/reactFlowDragClasses';
+import { ensureColorVisible, isDarkTheme } from '../../utils/theme';
+import { ArchiveActionButton } from '../ArchiveButton';
+import { ArchiveDeleteBranchModal } from '../ArchiveDeleteBranchModal';
+import {
+  BranchFilesystemRecovery,
+  getBranchStatusTag,
+  needsBranchAccess,
+} from '../BranchFilesystemRecovery';
+import { BranchWorkspaceStatus } from '../BranchWorkspaceStatus';
+import { EnvironmentPill } from '../EnvironmentPill';
+import { MarkdownPreview } from '../MarkdownRenderer';
+import { CreatedByTag } from '../metadata';
+import { IssuePill, PullRequestPill } from '../Pill';
+import { BranchSessionPeekSection } from './BranchSessionPeekSection';
+import { BranchSessionSections } from './BranchSessionSections';
+import { estimateBranchSessionSectionsHeight } from './branchCardLayout';
+
+const _BRANCH_CARD_MAX_WIDTH = 600;
+const PEEK_SESSIONS_STORAGE_KEY_PREFIX = 'agor:branch-card:peeked-session-ids:';
+
+interface BranchCardProps {
+  branch: Branch;
+  /** Absent while the repo list loads; the card says so instead of hiding. */
+  repo?: Repo;
+  sessions: Session[]; // Sessions for this specific branch
+  userById: Map<string, User>;
+  currentUserId?: string;
+  selectedSessionId?: string | null; // Currently open session in drawer
+  onTaskClick?: (taskId: string) => void;
+  onSessionClick?: (sessionId: string) => void;
+  onCreateSession?: (branchId: string) => void;
+  onForkSession?: (sessionId: string, prompt: string) => Promise<void>;
+  onSpawnSession?: (sessionId: string, config: string | Partial<SpawnConfig>) => Promise<void>;
+  onArchiveOrDelete?: (
+    branchId: string,
+    options: BranchArchiveOrDeleteOptions
+  ) => void | Promise<void>;
+  onOpenSettings?: (branchId: string) => void;
+  onOpenSessionSettings?: (sessionId: string) => void;
+  onOpenTerminal?: (commands: string[], branchId?: string) => void;
+  onStartEnvironment?: (branchId: string) => void;
+  onStopEnvironment?: (branchId: string) => void;
+  onViewLogs?: (branchId: string) => void;
+  onNukeEnvironment?: (branchId: string) => void;
+  onExecuteScheduleNow?: (branchId: string) => Promise<void>;
+  onUnpin?: (branchId: string) => void;
+  isPinned?: boolean;
+  zoneName?: string;
+  zoneColor?: string;
+  /** Off on the view-only canvas, where cards cannot be dragged. */
+  showDragHandle?: boolean;
+  /** Width of the arranged-zone slot to fill instead of the standard width. */
+  slotWidth?: number;
+  inPopover?: boolean; // NEW: Enable popover-optimized mode (hides board-specific controls)
+  panelMode?: boolean; // Render inside side panel instead of as a draggable canvas card
+  progressiveMountKey?: string | number | null;
+  /** True when this branch is the deep-link target of the current URL
+   *  (`/w/<branchShort>/`). Folded together with `isFocused` (a session
+   *  is open in the drawer) into a unified "selected" state — rendered
+   *  as a dashed outline in `colorTextBase`, distinct from the white
+   *  attention halo (returned / awaiting prompt). */
+  isActiveUrlTarget?: boolean;
+  client: AgorClient | null;
+}
+
+const BranchCardComponent = ({
+  branch,
+  repo,
+  sessions,
+  userById,
+  currentUserId,
+  selectedSessionId,
+  onSessionClick,
+  onCreateSession,
+  onForkSession,
+  onSpawnSession,
+  onArchiveOrDelete,
+  onOpenSettings,
+  onOpenSessionSettings,
+  onOpenTerminal,
+  onStartEnvironment,
+  onStopEnvironment,
+  onViewLogs,
+  onNukeEnvironment,
+  onUnpin,
+  isPinned = false,
+  zoneName,
+  zoneColor,
+  showDragHandle = true,
+  slotWidth,
+  inPopover = false,
+  panelMode = false,
+  progressiveMountKey,
+  isActiveUrlTarget = false,
+  client,
+}: BranchCardProps) => {
+  const { token } = theme.useToken();
+  const connectionDisabled = useConnectionDisabled();
+
+  const branchBoardId = (branch as { board_id?: string | null }).board_id;
+  const cardRef = React.useRef<HTMLDivElement>(null);
+  const sessionSectionsRef = React.useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const card = cardRef.current;
+    if (!card || inPopover || panelMode) return;
+
+    const onWheel = (event: WheelEvent) => {
+      if (!(event.target instanceof Element)) return;
+      const scrollArea = event.target.closest(`.${REACT_FLOW_NO_WHEEL_CLASS}`);
+      const renderer = card.closest('.react-flow__renderer');
+      if (!scrollArea || !card.contains(scrollArea) || !renderer) return;
+
+      // AntD puts nowheel on the tree wrapper, not its virtual scroll holder.
+      // Read current layout dimensions on every gesture (load/expand/resize can
+      // change them). Like markdown, an overflowing tree keeps ordinary wheel
+      // even at its edges; ctrl/meta still belongs to canvas zoom.
+      const treeHolder = scrollArea.querySelector<HTMLElement>('.ant-tree-list-holder');
+      const viewport = treeHolder ?? scrollArea;
+      const isPaginatedList = sessionSectionsRef.current?.contains(scrollArea) && !treeHolder;
+      // The spacer measures row content. Descendant decorations can extend
+      // scrollHeight a few pixels even when a short tree has no virtual scrolling.
+      const contentHeight = treeHolder?.firstElementChild?.clientHeight ?? viewport.scrollHeight;
+      const overflows =
+        contentHeight > viewport.clientHeight || viewport.scrollWidth > viewport.clientWidth;
+      if (!event.ctrlKey && !event.metaKey && !isPaginatedList && overflows) return;
+
+      // Removing nowheel alone is insufficient: the virtual list still consumes
+      // wheel. Capture first, then let React Flow own pan/zoom and anchoring.
+      event.preventDefault();
+      event.stopPropagation();
+      renderer.dispatchEvent(new WheelEvent(event.type, event));
+    };
+
+    // React's delegated wheel listeners are passive; cancellation must be native.
+    card.addEventListener('wheel', onWheel, { capture: true, passive: false });
+    return () => card.removeEventListener('wheel', onWheel, { capture: true });
+  }, [inPopover, panelMode]);
+
+  // Canvas cards hydrate their session sections in chunks after the board
+  // shell commits (#1768); panel/popover surfaces render a single card, so
+  // they mount immediately.
+  const sectionsReady = useProgressiveMount({
+    enabled: !inPopover && !panelMode,
+    priority: isActiveUrlTarget || sessions.some((s) => s.session_id === selectedSessionId) ? 2 : 0,
+    resetKey: progressiveMountKey ?? branchBoardId ?? 'unassigned',
+  });
+  const sessionShellMinHeight = useMemo(() => {
+    // The shell should reserve the height the sections will actually take,
+    // which depends on the persisted per-branch collapse exceptions.
+    const collapsedNode = readCollapsedBranchNode(branch.branch_id);
+    return estimateBranchSessionSectionsHeight(sessions, {
+      sessionsExpanded: !collapsedNode.sections?.includes('sessions'),
+    });
+  }, [branch.branch_id, sessions]);
+
+  // Archive/Delete modal state
+  const [archiveDeleteModalOpen, setArchiveDeleteModalOpen] = useState(false);
+  const [archiveDeleteModalMounted, setArchiveDeleteModalMounted] = useState(false);
+  const [pendingOperation, setPendingOperation] = useState<'archiving' | 'deleting' | null>(null);
+  const mutationPendingRef = React.useRef(false);
+  // Local pending covers the request before realtime arrives (and session
+  // activity stopping). Persisted deletion continues after request acceptance.
+  const operation = pendingOperation ?? (branch.deletion_status === 'deleting' ? 'deleting' : null);
+  const isOperating = operation !== null;
+
+  const openArchiveDeleteModal = useCallback(() => {
+    setArchiveDeleteModalMounted(true);
+    setArchiveDeleteModalOpen(true);
+  }, []);
+
+  const handleArchiveOrDelete = async (options: BranchArchiveOrDeleteOptions) => {
+    if (!onArchiveOrDelete || mutationPendingRef.current || isOperating) return;
+    mutationPendingRef.current = true;
+    setPendingOperation(options.metadataAction === 'archive' ? 'archiving' : 'deleting');
+    setArchiveDeleteModalOpen(false);
+    try {
+      await onArchiveOrDelete(branch.branch_id, options);
+    } catch {
+      // The mutation owner reports errors. Consume its rejection here so the
+      // event handler does not leak it, and restore the card for inspection/retry.
+    } finally {
+      mutationPendingRef.current = false;
+      setPendingOperation(null);
+    }
+  };
+
+  const [storedPeekedSessionIds, setStoredPeekedSessionIds] = useLocalStorage<string[]>(
+    `${PEEK_SESSIONS_STORAGE_KEY_PREFIX}${branch.branch_id}`,
+    []
+  );
+
+  const peekableSessions = useMemo(
+    () => sessions.filter((session) => !session.archived),
+    [sessions]
+  );
+  const peekableSessionById = useMemo(
+    () =>
+      new Map<string, Session>(peekableSessions.map((session) => [session.session_id, session])),
+    [peekableSessions]
+  );
+
+  const peekedSessionIds = useMemo(() => {
+    if (inPopover || panelMode) return [];
+
+    const resolvedIds: string[] = [];
+    const seen = new Set<string>();
+
+    for (const rawToken of storedPeekedSessionIds) {
+      const token = rawToken.trim();
+      if (!token) continue;
+
+      const session = peekableSessions.find((candidate) => candidate.session_id === token);
+      if (session && !seen.has(session.session_id)) {
+        resolvedIds.push(session.session_id);
+        seen.add(session.session_id);
+      }
+    }
+
+    return resolvedIds;
+  }, [inPopover, panelMode, peekableSessions, storedPeekedSessionIds]);
+
+  const peekedSessionIdSet = useMemo(() => new Set(peekedSessionIds), [peekedSessionIds]);
+  const peekedSessions = useMemo(
+    () =>
+      peekedSessionIds
+        .map((sessionId) => peekableSessionById.get(sessionId))
+        .filter((session): session is Session => !!session),
+    [peekableSessionById, peekedSessionIds]
+  );
+
+  const updatePeekedSessionIds = useCallback(
+    (nextSessionIds: string[]) => setStoredPeekedSessionIds(nextSessionIds),
+    [setStoredPeekedSessionIds]
+  );
+
+  useEffect(() => {
+    if (inPopover || panelMode) return;
+    if (storedPeekedSessionIds.join('|') === peekedSessionIds.join('|')) return;
+    setStoredPeekedSessionIds(peekedSessionIds);
+  }, [inPopover, panelMode, peekedSessionIds, setStoredPeekedSessionIds, storedPeekedSessionIds]);
+
+  const handleTogglePeekSession = useCallback(
+    (sessionId: string) => {
+      const next = peekedSessionIdSet.has(sessionId)
+        ? peekedSessionIds.filter((peekedSessionId) => peekedSessionId !== sessionId)
+        : [...peekedSessionIds, sessionId];
+      updatePeekedSessionIds(next);
+    },
+    [peekedSessionIdSet, peekedSessionIds, updatePeekedSessionIds]
+  );
+
+  // Filter out archived sessions from board card display
+  const activeSessions = peekableSessions;
+
+  // Check if any active (non-archived) session is running or stopping
+  const hasRunningSession = useMemo(
+    () => activeSessions.some(isSessionExecuting),
+    [activeSessions]
+  );
+
+  // Check if branch is still being created on filesystem
+  const isCreating = branch.filesystem_status === 'creating';
+  const statusTag = getBranchStatusTag(branch);
+  const isFailed = statusTag?.tone === 'error';
+  const currentUser = currentUserId ? userById.get(currentUserId) : null;
+  // One cached read per card, only for notices whose actions depend on it.
+  const branchAccess = useBranchAccess(
+    client,
+    branch,
+    currentUser,
+    !isOperating && (needsBranchAccess(branch) || canDismissBranchWorkspaceNotification(branch))
+  );
+
+  // Check if this branch is a persisted agent
+  const teammateConfig = useMemo(() => getTeammateConfig(branch), [branch]);
+  const isAgent = isTeammate(branch);
+
+  // True when one of this branch's sessions is the currently opened
+  // conversation. Drives the "focused" highlight on the canvas card and
+  // also suppresses the louder ready-for-prompt/needs-attention glow —
+  // there's no point screaming for attention at the branch you're
+  // already looking at.
+  const isFocused = useMemo(
+    () => activeSessions.some((s) => s.session_id === selectedSessionId),
+    [activeSessions, selectedSessionId]
+  );
+
+  // Check if branch needs attention (newly created OR has ready sessions)
+  // Don't highlight if a session from this branch is currently open in the drawer
+  const needsAttention = useMemo(() => {
+    const hasReadySession = activeSessions.some((s) => s.ready_for_prompt === true);
+    const shouldHighlight =
+      (branch.needs_attention || hasReadySession) && !isFocused && !isOperating;
+
+    return shouldHighlight;
+  }, [activeSessions, branch.needs_attention, isFocused, isOperating]);
+
+  const isDarkMode = isDarkTheme(token);
+  // AntD exposes `colorPrimaryBg` as the subtle primary surface token.
+  // In dark mode it can still read a bit bright on a large card, so mix it
+  // with the base background while staying in the primary token family.
+  const runningCardBackgroundColor = isDarkMode
+    ? `color-mix(in srgb, ${token.colorPrimaryBg} 67%, ${token.colorBgBase})`
+    : token.colorPrimaryBg;
+  const cardBackgroundColor =
+    hasRunningSession && !isOperating
+      ? runningCardBackgroundColor
+      : isAgent
+        ? token.colorInfoBg
+        : undefined;
+
+  // Memoize glow shadow string to avoid recomputing color normalization on every render
+  const attentionGlowShadow = useMemo(() => {
+    const glowColor = new AggregationColor(token.colorTextBase).toHexString();
+
+    // 2-layer glow: tight solid ring + soft halo (reduced from 4 layers for less paint work)
+    return `0 0 0 3px ${glowColor}, 0 0 24px 6px ${glowColor}99`;
+  }, [token.colorTextBase]);
+
+  // "Selected" state — branch is either focused (one of its sessions is
+  // open in the drawer) or it's the deep-link target of the current URL.
+  // The two are deliberately unified: from the user's perspective both
+  // answer "what am I looking at right now?". Rendered as a dashed
+  // outline in `colorTextBase` so it reads as neutral against any zone /
+  // teammate accent and works in both dark and light modes. Dashed
+  // because (per design discussion) it visually screams "selection"
+  // without leaning on a colored ring that would compete with the white
+  // attention halo. Dash length is the browser default — CSS doesn't
+  // expose a knob to customize it on `outline` / `border-style: dashed`,
+  // and going to SVG / `border-image` for true custom dashes is more
+  // complexity than this visual warrants.
+  const isSelected = isFocused || isActiveUrlTarget;
+  const selectedOutline = `2px dashed ${token.colorTextBase}`;
+
+  // Ensure pin color is visible (adjust lightness if too pale)
+  const visiblePinColor = useMemo(() => {
+    if (!zoneColor) return undefined;
+    return ensureColorVisible(zoneColor, isDarkMode, 50, 50);
+  }, [zoneColor, isDarkMode]);
+
+  // Compose card chrome from independent visual channels so multiple
+  // states can stack cleanly:
+  //   • `boxShadow` — attention halo for needs_attention / awaiting prompt
+  //   • `outline`   — dashed selected state (focused OR active URL target)
+  //   • `borderLeft` — thick accent stripe for teammate branches
+  //   • `borderColor` — zone color when pinned (no other states use it)
+  // outline + box-shadow are paint-only, so they don't disturb layout
+  // and don't fight with each other or with `borderLeft`.
+  const highlightStyle: React.CSSProperties = (() => {
+    if (inPopover) return {};
+    const style: React.CSSProperties = {};
+    if (needsAttention) style.boxShadow = attentionGlowShadow;
+    if (isSelected) {
+      style.outline = selectedOutline;
+      // Pull the outline fully inside the card edge so it reads as a
+      // selection *inside* the card chrome rather than a separate ring
+      // outside.
+      style.outlineOffset = -3;
+    }
+    if (isPinned && zoneColor) {
+      style.borderColor = zoneColor;
+      style.borderWidth = 1;
+    }
+    if (isAgent) {
+      // Teammate accent stripe: thick left border in `colorInfo`. Drops
+      // the previous full `colorInfo` border (which collided with the
+      // primary-color selected ring in the default theme where
+      // colorInfo === colorPrimary). The stripe lives only on the left
+      // edge so it doesn't compete with the dashed selected outline,
+      // and composes with the zone-color border on the other three
+      // edges when a teammate is also pinned.
+      style.borderLeft = `4px solid ${token.colorInfo}`;
+    }
+    return style;
+  })();
+
+  return (
+    <Card
+      ref={cardRef}
+      style={{
+        width: panelMode
+          ? '100%'
+          : peekedSessions.length > 0
+            ? Math.max(880, slotWidth ?? 0)
+            : (slotWidth ?? 500),
+        cursor: 'default', // Override React Flow's drag cursor - only drag handles should show grab cursor
+        transition:
+          'background-color 0.2s ease-in-out, box-shadow 0.6s ease-in-out, outline 0.2s ease-in-out, border 0.6s ease-in-out, opacity 0.2s ease-in-out',
+        willChange: needsAttention && !inPopover ? 'box-shadow' : 'auto',
+        ...highlightStyle,
+        ...(cardBackgroundColor ? { backgroundColor: cardBackgroundColor } : {}),
+        // Disconnected chokepoint: block all in-card interactions (clicking
+        // into a session, env pill actions, modals) and dim to communicate
+        // the state. Canvas pan/zoom and the slim app-shell banner remain
+        // active. The status notice opts back in so its Details stay readable.
+        // See docs/disconnected-state-design.md.
+        ...(connectionDisabled && !inPopover
+          ? { pointerEvents: 'none' as const, opacity: 0.55 }
+          : {}),
+      }}
+      styles={{
+        body: { padding: 16 },
+      }}
+    >
+      {/* Branch header */}
+      <div
+        className={!inPopover && !panelMode ? REACT_FLOW_DRAG_HANDLE_CLASS : undefined}
+        style={{
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          marginBottom: 12,
+          gap: 8,
+          cursor: !inPopover && !panelMode ? 'grab' : undefined,
+        }}
+      >
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            flex: 1,
+            minWidth: 0,
+          }}
+        >
+          {!inPopover && (
+            <div
+              className={REACT_FLOW_DRAG_HANDLE_CLASS}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                cursor: panelMode ? 'default' : 'grab',
+                width: 32,
+                height: 32,
+                justifyContent: 'center',
+                flexShrink: 0,
+              }}
+            >
+              {isOperating || isCreating || hasRunningSession ? (
+                <Spin size="large" />
+              ) : isAgent && teammateConfig?.emoji ? (
+                <span style={{ fontSize: 32 }}>{teammateConfig.emoji}</span>
+              ) : isAgent ? (
+                <RobotOutlined
+                  role={isFailed ? 'img' : undefined}
+                  aria-label={isFailed ? statusTag?.label : undefined}
+                  title={isFailed ? statusTag?.label : undefined}
+                  style={{
+                    fontSize: 32,
+                    color: isFailed ? token.colorError : token.colorInfo,
+                  }}
+                />
+              ) : (
+                <BranchesOutlined
+                  role={isFailed ? 'img' : undefined}
+                  aria-label={isFailed ? statusTag?.label : undefined}
+                  title={isFailed ? statusTag?.label : undefined}
+                  style={{
+                    fontSize: 32,
+                    color: isFailed ? token.colorError : token.colorPrimary,
+                  }}
+                />
+              )}
+            </div>
+          )}
+          <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minWidth: 0 }}>
+            {isAgent ? (
+              // Teammates are identified by their persona, not their git
+              // location — render the agent name in the prominent slot
+              // and drop the repo/branch subtitle. Repo + branch are still
+              // available in the branch settings modal for power users.
+              <Typography.Title
+                level={4}
+                style={{ margin: 0, fontWeight: 600 }}
+                ellipsis={{ tooltip: teammateConfig?.displayName ?? branch.name }}
+              >
+                {teammateConfig?.displayName ?? branch.name}
+              </Typography.Title>
+            ) : (
+              <>
+                <Typography.Text strong ellipsis={{ tooltip: branch.name }}>
+                  {branch.name}
+                </Typography.Text>
+                <Typography.Text
+                  type="secondary"
+                  style={{ fontSize: 12 }}
+                  ellipsis={{ tooltip: repo?.slug ?? 'Repository not loaded' }}
+                >
+                  {repo?.slug ?? 'Repository not loaded'}
+                </Typography.Text>
+              </>
+            )}
+          </div>
+        </div>
+
+        <Space size={4} style={{ flexShrink: 0 }}>
+          {!inPopover && !panelMode && isPinned && (
+            <Tooltip
+              title={
+                zoneName
+                  ? `Pinned to [${zoneName}] zone (click to unpin)`
+                  : 'Pinned (click to unpin)'
+              }
+            >
+              <Button
+                type="text"
+                size="small"
+                icon={<PushpinFilled style={{ color: visiblePinColor }} />}
+                disabled={isOperating}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onUnpin?.(branch.branch_id);
+                }}
+                className={REACT_FLOW_NO_DRAG_CLASS}
+              />
+            </Tooltip>
+          )}
+          {!inPopover && !panelMode && showDragHandle && (
+            <Button
+              type="text"
+              icon={<DragOutlined style={{ fontSize: 16 }} />}
+              className={REACT_FLOW_DRAG_HANDLE_CLASS}
+              title="Drag to reposition"
+              style={{ cursor: 'grab', padding: '4px 8px' }}
+            />
+          )}
+          <div className={REACT_FLOW_NO_DRAG_CLASS}>
+            {onOpenTerminal && (
+              <Button
+                type="text"
+                size="small"
+                icon={<CodeOutlined />}
+                disabled={isOperating}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onOpenTerminal([], branch.branch_id);
+                }}
+                title="Open terminal in branch directory"
+              />
+            )}
+            {/*
+              The per-branch execute-now button was tied to the old
+              one-schedule-per-branch model. Branches can now hold
+              multiple schedules; the run-now affordance moves into
+              the schedules list rendered inside the Schedules tab.
+              Removing this here in checkpoint 3; the Schedules UI
+              lands in checkpoint 5.
+            */}
+            {onOpenSettings && (
+              <Button
+                type="text"
+                size="small"
+                icon={<EditOutlined />}
+                disabled={isOperating}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onOpenSettings(branch.branch_id);
+                }}
+                title="Edit branch"
+              />
+            )}
+            {!inPopover && !panelMode && onArchiveOrDelete && (
+              <ArchiveActionButton
+                tooltip={
+                  branch.deletion_status ? 'View deletion status' : 'Archive or delete branch'
+                }
+                // A persisted deletion stays viewable; handleArchiveOrDelete refuses to submit.
+                disabled={connectionDisabled || pendingOperation !== null}
+                onClick={openArchiveDeleteModal}
+              />
+            )}
+          </div>
+        </Space>
+      </div>
+
+      {!isOperating && (
+        <BranchWorkspaceStatus
+          branch={branch}
+          client={client}
+          currentUser={currentUser}
+          access={branchAccess}
+        />
+      )}
+      {/* Branch metadata - all pills on one row with wrapping */}
+      <div className={REACT_FLOW_NO_DRAG_CLASS} style={{ marginBottom: 8 }}>
+        <Space size={4} wrap>
+          {branch.created_by && (
+            <CreatedByTag
+              createdBy={branch.created_by}
+              currentUserId={currentUserId}
+              userById={userById}
+              prefix="Created by"
+            />
+          )}
+          {branch.issue_url && <IssuePill issueUrl={branch.issue_url} currentRepo={repo} />}
+          {branch.pull_request_url && (
+            <PullRequestPill prUrl={branch.pull_request_url} currentRepo={repo} />
+          )}
+          {repo && (
+            <EnvironmentPill
+              repo={repo}
+              branch={branch}
+              onEdit={
+                !isOperating && onOpenSettings ? () => onOpenSettings(branch.branch_id) : undefined
+              }
+              onStartEnvironment={onStartEnvironment}
+              onStopEnvironment={onStopEnvironment}
+              onViewLogs={onViewLogs}
+              onNukeEnvironment={onNukeEnvironment}
+              connectionDisabled={connectionDisabled || isOperating}
+              showNukeEnvironment={false}
+            />
+          )}
+        </Space>
+      </div>
+
+      {!isOperating && (
+        <BranchFilesystemRecovery
+          branch={branch}
+          client={client}
+          currentUser={currentUser}
+          access={branchAccess}
+          onRetryDelete={
+            onArchiveOrDelete && !inPopover && !panelMode ? openArchiveDeleteModal : undefined
+          }
+        />
+      )}
+
+      {/* Notes */}
+      {branch.notes && (
+        <div className={REACT_FLOW_NO_DRAG_CLASS} style={{ marginBottom: 8 }}>
+          <MarkdownPreview
+            key={branch.branch_id}
+            content={branch.notes}
+            collapsedHeight={120}
+            moreLabel="See more"
+            lessLabel="See less"
+          />
+        </div>
+      )}
+
+      {/* Sessions & Scheduled Runs - composable content shared with the teammate panel */}
+      <div
+        ref={sessionSectionsRef}
+        className={REACT_FLOW_NO_DRAG_CLASS}
+        style={isOperating || sectionsReady ? undefined : { minHeight: sessionShellMinHeight }}
+      >
+        {isOperating ? (
+          <Space role="status" aria-live="polite" style={{ paddingBlock: token.paddingSM }}>
+            {inPopover && <Spin size="small" />}
+            <Typography.Text type="secondary">
+              {operation === 'archiving' ? 'Archiving branch…' : 'Agor is deleting this branch…'}
+            </Typography.Text>
+          </Space>
+        ) : sectionsReady ? (
+          <BranchSessionSections
+            branch={branch}
+            sessions={sessions}
+            userById={userById}
+            currentUserId={currentUserId}
+            selectedSessionId={selectedSessionId}
+            onSessionClick={onSessionClick}
+            onCreateSession={onCreateSession}
+            onForkSession={onForkSession}
+            onSpawnSession={onSpawnSession}
+            onOpenSessionSettings={onOpenSessionSettings}
+            peekedSessionIds={peekedSessionIdSet}
+            onTogglePeekSession={!inPopover && !panelMode ? handleTogglePeekSession : undefined}
+            mode="card"
+            client={client}
+          />
+        ) : (
+          // Truthful shell while this card waits for its hydration slot: real
+          // session count from data already in props, no fake placeholders.
+          <Typography.Text
+            type="secondary"
+            style={{ fontSize: 12, display: 'block', padding: '4px 0' }}
+          >
+            Sessions ({peekableSessions.length})
+          </Typography.Text>
+        )}
+      </div>
+
+      {!isOperating && !inPopover && !panelMode && peekedSessions.length > 0 && (
+        <BranchSessionPeekSection
+          client={client}
+          sessions={peekedSessions}
+          userById={userById}
+          currentUserId={currentUserId}
+          branchName={branch.name}
+          onCloseSession={handleTogglePeekSession}
+        />
+      )}
+
+      {/* Branch cards are repeated across the canvas, so mount this only on demand. */}
+      {archiveDeleteModalMounted && (
+        <ArchiveDeleteBranchModal
+          client={client}
+          currentUser={currentUser}
+          open={archiveDeleteModalOpen}
+          branch={branch}
+          sessionCount={sessions.length}
+          environmentRunning={branch.environment_instance?.status === 'running'}
+          onConfirm={handleArchiveOrDelete}
+          onCancel={() => setArchiveDeleteModalOpen(false)}
+          afterClose={() => setArchiveDeleteModalMounted(false)}
+        />
+      )}
+    </Card>
+  );
+};
+
+// Memoize BranchCard to prevent unnecessary re-renders when parent updates
+// Only re-render when branch, repo, sessions, or callback props actually change
+const BranchCard = React.memo(BranchCardComponent);
+
+export default BranchCard;

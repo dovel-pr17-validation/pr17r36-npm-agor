@@ -1,0 +1,283 @@
+/**
+ * Tests for session.ts runtime behavior
+ *
+ * Per-tool defaults:
+ * - Claude Code: auto (model classifier approves/denies prompts; unresolved
+ *   ones fall through to Agor's UI; MCP tool calls are auto-approved in the
+ *   executor via canUseTool)
+ * - Codex: allow-all (sandbox workspace-write + approval never +
+ *   network-on; MCP elicitation auto-approved via per-server
+ *   default_tools_approval_mode in the executor)
+ * - Gemini: autoEdit (unchanged — pending separate audit)
+ * - OpenCode: autoEdit (unchanged — pending separate audit)
+ * - Cursor: bypassPermissions (experimental/autonomous until permission callbacks exist)
+ */
+
+import { describe, expect, expectTypeOf, it } from 'vitest';
+import type { AgenticToolName } from './agentic-tool';
+import {
+  type CreateSessionInput,
+  getDefaultPermissionMode,
+  hasFullSessionDetails,
+  isSessionExecuting,
+  isSessionListRow,
+  isSessionPromptable,
+  SESSION_LIST_ROW_SHAPE,
+  type Session,
+  type SessionListRow,
+  type SessionUpdate,
+  sessionCanStartTask,
+  toLeanSessionListRow,
+} from './session';
+
+describe('session promptability helpers', () => {
+  it('treats idle sessions as promptable regardless of the attention flag', () => {
+    expect(sessionCanStartTask('idle', false)).toBe(true);
+    expect(sessionCanStartTask('idle', true)).toBe(true);
+    expect(isSessionPromptable({ status: 'idle', ready_for_prompt: false })).toBe(true);
+  });
+
+  it('treats failed sessions as promptable only after the terminal task made them ready', () => {
+    expect(sessionCanStartTask('failed', true)).toBe(true);
+    expect(sessionCanStartTask('failed', false)).toBe(false);
+    expect(isSessionPromptable({ status: 'failed', ready_for_prompt: true })).toBe(true);
+    expect(isSessionPromptable({ status: 'failed', ready_for_prompt: false })).toBe(false);
+  });
+
+  it('allows a new prompt after a permission timeout once the executor has exited', () => {
+    expect(sessionCanStartTask('timed_out', true)).toBe(true);
+    expect(sessionCanStartTask('timed_out', false)).toBe(false);
+    expect(isSessionPromptable({ status: 'timed_out', ready_for_prompt: true })).toBe(true);
+    expect(isSessionPromptable({ status: 'timed_out', ready_for_prompt: false })).toBe(false);
+  });
+
+  it('does not confuse ready_for_prompt attention state with promptability', () => {
+    expect(sessionCanStartTask('running', true)).toBe(false);
+    expect(isSessionPromptable({ status: 'running', ready_for_prompt: true })).toBe(false);
+  });
+
+  it('identifies execution states separately from promptability', () => {
+    expect(isSessionExecuting({ status: 'running' })).toBe(true);
+    expect(isSessionExecuting({ status: 'stopping' })).toBe(true);
+    expect(isSessionExecuting({ status: 'awaiting_permission' })).toBe(true);
+    expect(isSessionExecuting({ status: 'idle' })).toBe(false);
+    expect(isSessionExecuting({ status: 'completed' })).toBe(false);
+    expect(isSessionExecuting({ status: 'failed' })).toBe(false);
+    expect(isSessionExecuting({ status: 'timed_out' })).toBe(false);
+  });
+});
+
+describe('getDefaultPermissionMode', () => {
+  it('returns "allow-all" for codex (Agor MCP-heavy default)', () => {
+    expect(getDefaultPermissionMode('codex')).toBe('allow-all');
+  });
+
+  it('returns "auto" for claude-code (model classifier; unresolved prompts fall through to Agor UI)', () => {
+    expect(getDefaultPermissionMode('claude-code')).toBe('auto');
+  });
+
+  it('returns "autoEdit" for gemini (native Gemini mode)', () => {
+    expect(getDefaultPermissionMode('gemini')).toBe('autoEdit');
+  });
+
+  it('returns "autoEdit" for opencode (uses Gemini-like modes)', () => {
+    expect(getDefaultPermissionMode('opencode')).toBe('autoEdit');
+  });
+
+  it('returns "bypassPermissions" for cursor (experimental autonomous provider)', () => {
+    expect(getDefaultPermissionMode('cursor')).toBe('bypassPermissions');
+  });
+
+  it('returns "auto" for any unknown tool (default case)', () => {
+    // Type assertion to test default behavior with invalid input
+    const unknownTool = 'unknown-tool' as AgenticToolName;
+    expect(getDefaultPermissionMode(unknownTool)).toBe('auto');
+  });
+
+  describe('permission mode characteristics', () => {
+    it('codex maps to sandbox workspace-write + approval never', () => {
+      const mode = getDefaultPermissionMode('codex');
+      expect(mode).toBe('allow-all');
+    });
+
+    it('claude-code uses auto (model classifier; unresolved prompts fall through to Agor UI)', () => {
+      const mode = getDefaultPermissionMode('claude-code');
+      expect(mode).toBe('auto');
+    });
+
+    it('gemini uses native Gemini SDK mode', () => {
+      const mode = getDefaultPermissionMode('gemini');
+      expect(mode).toBe('autoEdit');
+    });
+
+    it('returns consistent values for repeated calls', () => {
+      // Ensure function is deterministic
+      const tool: AgenticToolName = 'claude-code';
+      const first = getDefaultPermissionMode(tool);
+      const second = getDefaultPermissionMode(tool);
+      const third = getDefaultPermissionMode(tool);
+
+      expect(first).toBe(second);
+      expect(second).toBe(third);
+    });
+  });
+
+  describe('all agentic tools coverage', () => {
+    it('handles all valid AgenticToolName values', () => {
+      const allTools: AgenticToolName[] = [
+        'claude-code',
+        'codex',
+        'gemini',
+        'opencode',
+        'copilot',
+        'cursor',
+      ];
+      const results: Record<string, string> = {};
+
+      for (const tool of allTools) {
+        results[tool] = getDefaultPermissionMode(tool);
+      }
+
+      expect(results['claude-code']).toBe('auto');
+      expect(results.codex).toBe('allow-all');
+      expect(results.gemini).toBe('autoEdit');
+      expect(results.opencode).toBe('autoEdit');
+      expect(results.copilot).toBe('acceptEdits');
+      expect(results.cursor).toBe('bypassPermissions');
+    });
+
+    it('returns valid PermissionMode values', () => {
+      const allTools: AgenticToolName[] = [
+        'claude-code',
+        'codex',
+        'gemini',
+        'opencode',
+        'copilot',
+        'cursor',
+      ];
+      const validModes = [
+        // Claude Code native modes
+        'default',
+        'acceptEdits',
+        'bypassPermissions',
+        'plan',
+        'dontAsk',
+        // Gemini native modes
+        'autoEdit',
+        'yolo',
+        // Codex native modes
+        'ask',
+        'auto',
+        'on-failure',
+        'allow-all',
+      ];
+
+      for (const tool of allTools) {
+        const mode = getDefaultPermissionMode(tool);
+        expect(validModes).toContain(mode);
+      }
+    });
+  });
+});
+
+it('keeps the computed usage summary out of session mutation inputs', () => {
+  expectTypeOf<'usage_summary'>().not.toExtend<keyof CreateSessionInput>();
+  expectTypeOf<'usage_summary'>().not.toExtend<keyof SessionUpdate>();
+});
+
+describe('toLeanSessionListRow', () => {
+  const row = () => {
+    const session = {
+      session_id: 's-1',
+      custom_context: {
+        teamName: 'Backend',
+        scheduled_run: { schedule_id: 'sched-1' },
+        slash_commands: ['/review'],
+        skills: ['pdf'],
+      },
+    } as unknown as Session;
+    // Mirrors attachHiddenTenant: the daemon's tenant after-hook reads it.
+    Object.defineProperty(session, 'tenant_id', { value: 'tenant-a', enumerable: false });
+    return session;
+  };
+
+  it('omits single-session context keys without mutating the input', () => {
+    const input = row();
+    const lean = toLeanSessionListRow(input);
+
+    expect(lean.custom_context).toEqual({ teamName: 'Backend' });
+    expect(input.custom_context).toHaveProperty('scheduled_run');
+    expect(lean).not.toBe(input);
+  });
+
+  it('keeps hidden (non-enumerable) properties such as tenant_id', () => {
+    const lean = toLeanSessionListRow(row());
+
+    expect(Object.getOwnPropertyDescriptor(lean, 'tenant_id')).toMatchObject({
+      value: 'tenant-a',
+      enumerable: false,
+    });
+    expect(Object.keys(lean)).not.toContain('tenant_id');
+  });
+
+  it('stamps every lean row, also when there was nothing to omit', () => {
+    const session = { session_id: 's-2', custom_context: { teamName: 'x' } } as unknown as Session;
+    const lean = toLeanSessionListRow(session);
+
+    expect(lean).not.toBe(session);
+    expect(lean.custom_context).toEqual({ teamName: 'x' });
+    expect(lean.read_shape).toBe(SESSION_LIST_ROW_SHAPE);
+    expect(toLeanSessionListRow({ session_id: 's-3' } as unknown as Session).read_shape).toBe(
+      SESSION_LIST_ROW_SHAPE
+    );
+    expect(session).not.toHaveProperty('read_shape');
+  });
+
+  it('makes the marker enumerable (survives JSON) and read-only', () => {
+    const lean = toLeanSessionListRow(row());
+
+    expect(JSON.parse(JSON.stringify(lean))).toMatchObject({ read_shape: SESSION_LIST_ROW_SHAPE });
+    expect(Object.getOwnPropertyDescriptor(lean, 'read_shape')).toMatchObject({
+      enumerable: true,
+      writable: false,
+    });
+    expect(toLeanSessionListRow(lean)).toEqual(lean);
+  });
+
+  it('strips withheld keys from a row that forges the marker', () => {
+    const forged = { ...row(), read_shape: SESSION_LIST_ROW_SHAPE } as unknown as Session;
+    const lean = toLeanSessionListRow(forged);
+
+    expect(lean).not.toBe(forged);
+    expect(lean.custom_context).not.toHaveProperty('scheduled_run');
+    expect(lean.custom_context).not.toHaveProperty('slash_commands');
+    expect(lean.custom_context).not.toHaveProperty('skills');
+    expect(Object.getOwnPropertyDescriptor(lean, 'read_shape')).toMatchObject({
+      value: SESSION_LIST_ROW_SHAPE,
+      writable: false,
+    });
+  });
+});
+
+describe('isSessionListRow / hasFullSessionDetails', () => {
+  it('tells a lean summary from a full record', () => {
+    const full = { session_id: 's-1', custom_context: { skills: ['pdf'] } } as unknown as Session;
+    const lean = toLeanSessionListRow(full);
+    // A lean row that went over the wire is a plain object with the marker.
+    const wire = JSON.parse(JSON.stringify(lean)) as Session;
+
+    expect(isSessionListRow(full)).toBe(false);
+    expect(hasFullSessionDetails(full)).toBe(true);
+    for (const candidate of [lean, wire]) {
+      expect(isSessionListRow(candidate)).toBe(true);
+      expect(hasFullSessionDetails(candidate)).toBe(false);
+    }
+  });
+
+  it('types withheld keys as unavailable on a list row', () => {
+    expectTypeOf<SessionListRow>().toExtend<Session>();
+    expectTypeOf<
+      NonNullable<SessionListRow['custom_context']>['scheduled_run']
+    >().toEqualTypeOf<undefined>();
+  });
+});

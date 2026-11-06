@@ -1,0 +1,431 @@
+/**
+ * FeathersJS Type Declarations for Agor Daemon
+ *
+ * Provides proper TypeScript types for:
+ * - Hook contexts with authentication
+ * - Service implementations with custom methods
+ * - Application instance
+ */
+
+import type { AgorConfig } from '@agor/core/config';
+import type { DistributedWorkIdentity } from '@agor/core/coordination';
+import type {
+  TaskDispatchClaimResult,
+  TaskTerminationCoordinationClaimInput,
+  TaskTerminationCoordinationClaimResult,
+  TerminationClaimInput,
+  TerminationClaimResult,
+  TerminationSettlementResult,
+} from '@agor/core/db';
+import type { ExpressApplication, Service } from '@agor/core/feathers';
+import type {
+  Board,
+  Branch,
+  BranchID,
+  CancelQueuedTasksInput,
+  CloneRepositoryResult,
+  AuthenticatedParams as CoreAuthenticatedParams,
+  AuthenticatedUser as CoreAuthenticatedUser,
+  CreateHookContext as CoreCreateHookContext,
+  HookContext as CoreHookContext,
+  CreateSessionInput,
+  DeepReadonly,
+  Params as FeathersParams,
+  Message,
+  ReorderQueuedTasksInput,
+  Repo,
+  RuntimeTelemetryInput,
+  SdkHealthFailureInput,
+  Session,
+  SessionUpdate,
+  Task,
+  TaskPendingDispatchStatus,
+  TaskQueueMutationResult,
+} from '@agor/core/types';
+import type { DaemonMetrics, DaemonOperationalMetrics } from './metrics/index.js';
+import type { EnvironmentHealthCheckOptions } from './services/branches.js';
+import type {
+  ExecuteTaskData,
+  SessionArchiveBatchResult,
+  SessionArchiveOptions,
+  SessionArchiveResult,
+  SessionBulkArchiveOptions,
+  SessionBulkArchiveResult,
+} from './services/sessions.js';
+import type { TaskTerminationSettlementInput } from './services/tasks.js';
+
+// Re-export core types for convenience
+export type AuthenticatedUser = CoreAuthenticatedUser;
+export type AuthenticatedParams = CoreAuthenticatedParams;
+export type CreateHookContext<T = unknown> = CoreCreateHookContext<T>;
+export type HookContext<T = unknown> = CoreHookContext<T>;
+
+/**
+ * Application type for the daemon
+ */
+export type Application = ExpressApplication & {
+  get(name: 'config'): DeepReadonly<AgorConfig>;
+  set(name: 'config', value: DeepReadonly<AgorConfig>): ExpressApplication;
+  get(name: 'distributedWorkIdentity'): DistributedWorkIdentity | undefined;
+  set(name: 'distributedWorkIdentity', value: DistributedWorkIdentity): ExpressApplication;
+  get(name: 'metrics'): DaemonMetrics | undefined;
+  set(name: 'metrics', value: DaemonMetrics): ExpressApplication;
+  get(name: 'daemonOperationalMetrics'): DaemonOperationalMetrics | undefined;
+  set(name: 'daemonOperationalMetrics', value: DaemonOperationalMetrics): ExpressApplication;
+};
+
+/**
+ * Sessions service with custom methods (server-side implementation)
+ * This matches the SessionRepository methods exposed via the service adapter
+ */
+export interface SessionsServiceImpl
+  extends Omit<
+    Service<Session, CreateSessionInput, FeathersParams, SessionUpdate>,
+    'patch' | 'update'
+  > {
+  patch(
+    id: import('@agor/core/types').NullableId,
+    data: SessionUpdate,
+    params?: FeathersParams
+  ): Promise<Session | Session[]>;
+  update(id: string, data: SessionUpdate, params?: FeathersParams): Promise<Session>;
+  fork(
+    id: string,
+    data: { prompt: string; task_id?: string },
+    params?: FeathersParams
+  ): Promise<Session>;
+  spawn(
+    id: string,
+    data: Partial<import('@agor/core/types').SpawnConfig>,
+    params?: FeathersParams
+  ): Promise<Session>;
+  getGenealogy(
+    id: string,
+    params?: FeathersParams
+  ): Promise<{
+    session: import('@agor/core/types').Session;
+    ancestors: import('@agor/core/types').Session[];
+    children: import('@agor/core/types').Session[];
+  }>;
+  archive(
+    id: string,
+    options?: SessionArchiveOptions,
+    params?: FeathersParams
+  ): Promise<SessionArchiveResult>;
+  unarchive(
+    id: string,
+    options?: SessionArchiveOptions,
+    params?: FeathersParams
+  ): Promise<SessionArchiveResult>;
+  archiveBtwSession(id: string, params?: FeathersParams): Promise<SessionArchiveResult>;
+  archiveBranchSessions(
+    branchId: BranchID,
+    params?: FeathersParams
+  ): Promise<SessionArchiveBatchResult>;
+  unarchiveBranchSessions(
+    branchId: BranchID,
+    params?: FeathersParams
+  ): Promise<SessionArchiveBatchResult>;
+  archiveRootsInBranch(
+    branchId: BranchID,
+    rootIds: import('@agor/core/types').SessionID[],
+    options: SessionBulkArchiveOptions,
+    params?: FeathersParams
+  ): Promise<SessionBulkArchiveResult>;
+  enrichRemoteRelationships(
+    sessionList: import('@agor/core/types').Session[]
+  ): Promise<import('@agor/core/types').Session[]>;
+  // Callback queue processing
+  setQueueProcessor(
+    processor: (
+      sessionId: import('@agor/core/types').SessionID,
+      params?: FeathersParams
+    ) => Promise<void>
+  ): void;
+  triggerQueueProcessing(id: string, params?: FeathersParams): Promise<void>;
+  // Feathers/WebSocket executor architecture handlers
+  setExecuteHandler(
+    handler: (
+      sessionId: string,
+      data: ExecuteTaskData,
+      params?: FeathersParams
+    ) => Promise<{
+      success: boolean;
+      taskId: string;
+      status: string;
+      streaming: boolean;
+    }>
+  ): void;
+  executeTask(
+    id: string,
+    data: ExecuteTaskData,
+    params?: FeathersParams
+  ): Promise<{
+    success: boolean;
+    taskId: string;
+    status: string;
+    streaming: boolean;
+  }>;
+  materializeAgenticToolPreset(session: Session, params?: FeathersParams): Promise<Session>;
+  // Event emitter methods (FeathersJS EventEmitter interface - any[] for event args flexibility)
+  // biome-ignore lint/suspicious/noExplicitAny: FeathersJS event handlers accept variable arguments
+  on(event: string, handler: (...args: any[]) => void): this;
+  // biome-ignore lint/suspicious/noExplicitAny: FeathersJS event handlers accept variable arguments
+  removeListener(event: string, handler: (...args: any[]) => void): this;
+}
+
+/**
+ * Tasks service with custom methods (server-side implementation)
+ */
+export interface TasksServiceImpl extends Service<Task, Partial<Task>, FeathersParams> {
+  claimDispatchAndProjectSession(
+    taskId: string,
+    expectedStatus: TaskPendingDispatchStatus,
+    updates: Partial<Task>,
+    params?: FeathersParams
+  ): Promise<TaskDispatchClaimResult>;
+  connectExecutor(data: { task_id: string }, params?: FeathersParams): Promise<Task>;
+  reportExecutorInterruption(
+    data: import('@agor/core/types').ExecutorInterruptionInput,
+    params?: FeathersParams
+  ): Promise<Task>;
+  reportTerminationComplete(
+    data: import('@agor/core/types').ExecutorTerminationCompleteInput,
+    params?: FeathersParams
+  ): Promise<Task>;
+  recordExecutorStartupWarning(
+    taskId: string,
+    warning: string,
+    params?: FeathersParams
+  ): Promise<Task | null>;
+  reportRuntimeTelemetry(data: RuntimeTelemetryInput, params?: FeathersParams): Promise<Task>;
+  reportSdkHealthFailure(data: SdkHealthFailureInput, params?: FeathersParams): Promise<Task>;
+  beginOpenCodeCheckpoint(
+    data: import('@agor/core/types').OpenCodeCheckpointBeginInput,
+    params?: FeathersParams
+  ): Promise<import('@agor/core/types').OpenCodeCheckpointAdmission>;
+  acknowledgeOpenCodeCleanup(
+    data: import('@agor/core/types').OpenCodeCheckpointCleanupInput,
+    params?: FeathersParams
+  ): Promise<void>;
+  cancelQueued(
+    data: CancelQueuedTasksInput,
+    params?: FeathersParams
+  ): Promise<TaskQueueMutationResult>;
+  reorderQueued(
+    data: ReorderQueuedTasksInput,
+    params?: FeathersParams
+  ): Promise<TaskQueueMutationResult>;
+  autoTitleSession(task: Task, params?: FeathersParams): Promise<void>;
+  complete(
+    id: string,
+    data: { git_state?: { sha_at_end?: string; commit_message?: string } },
+    params?: FeathersParams
+  ): Promise<Task>;
+  fail(id: string, data: { error?: string }, params?: FeathersParams): Promise<Task>;
+  getOrphaned(params?: FeathersParams): Promise<Task[]>;
+  getActiveWithExecutorHeartbeat(params?: FeathersParams): Promise<Task[]>;
+  claimTermination(
+    input: TerminationClaimInput,
+    params?: FeathersParams
+  ): Promise<TerminationClaimResult>;
+  claimTerminationCoordination(
+    input: TaskTerminationCoordinationClaimInput,
+    params?: FeathersParams
+  ): Promise<TaskTerminationCoordinationClaimResult>;
+  retryTermination(
+    taskId: string,
+    requestedAt: string,
+    revision: string,
+    params?: FeathersParams
+  ): Promise<Task | null>;
+  beginCleanupAttempt(
+    taskId: string,
+    claimToken: string,
+    params?: FeathersParams
+  ): Promise<Task | null>;
+  settleTermination(
+    input: TaskTerminationSettlementInput,
+    params?: FeathersParams
+  ): Promise<TerminationSettlementResult>;
+}
+
+/**
+ * Repos service with custom methods (server-side implementation)
+ */
+export interface ReposServiceImpl extends Service<Repo, Partial<Repo>, FeathersParams> {
+  addLocalRepository(data: { path: string; slug?: string }, params?: FeathersParams): Promise<Repo>;
+  cloneRepository(
+    data: { url: string; name?: string; slug?: string; default_branch?: string },
+    params?: FeathersParams
+  ): Promise<CloneRepositoryResult>;
+  updateMetadata(
+    id: string,
+    patch: {
+      name?: string;
+      slug?: string;
+      repo_type?: 'remote' | 'local';
+      remote_url?: string;
+      default_branch?: string;
+    },
+    params?: FeathersParams
+  ): Promise<Repo>;
+  createBranch(
+    id: string,
+    data: {
+      name: string;
+      ref: string;
+      refType?: 'branch' | 'tag';
+      createBranch?: boolean;
+      pullLatest?: boolean;
+      sourceBranch?: string;
+      sourceRemoteUrl?: string;
+      issue_url?: string;
+      pull_request_url?: string;
+      boardId: string;
+      zoneId?: string;
+    },
+    params?: FeathersParams
+  ): Promise<Branch>;
+  retryBranchProvisioning(branchId: string, params?: FeathersParams): Promise<Branch>;
+  // Takes AuthenticatedParams, not bare FeathersParams: the startup watchdog
+  // calls it with an explicit static-tenant context and no user, and that
+  // tenant has to survive into the repository scope.
+  reconcileStuckCreatingBranches(
+    params?: CoreAuthenticatedParams
+  ): Promise<{ scanned: number; failed: number }>;
+  removeBranch(id: string, name: string, params?: FeathersParams): Promise<Repo>;
+  importFromAgorYml(
+    id: string,
+    data: { branch_id: string },
+    params?: FeathersParams
+  ): Promise<Repo>;
+  exportToAgorYml(
+    id: string,
+    data: { branch_id: string },
+    params?: FeathersParams
+  ): Promise<{ path: string }>;
+}
+
+/**
+ * Boards service with custom methods (server-side implementation)
+ */
+export interface BoardsServiceImpl extends Service<Board, Partial<Board>, FeathersParams> {
+  addSession(boardId: string, sessionId: string, params?: FeathersParams): Promise<Board>;
+  removeSession(boardId: string, sessionId: string, params?: FeathersParams): Promise<Board>;
+  upsertBoardObject(
+    boardId: string,
+    objectId: string,
+    objectData: unknown,
+    params?: FeathersParams
+  ): Promise<Board>;
+  removeBoardObject(boardId: string, objectId: string, params?: FeathersParams): Promise<Board>;
+  batchUpsertBoardObjects(
+    boardId: string,
+    objects: unknown[],
+    params?: FeathersParams
+  ): Promise<Board>;
+  mergeBoardObjectFields(
+    boardId: string,
+    patches: Record<string, unknown>,
+    params?: FeathersParams
+  ): Promise<Board>;
+  placeZoneEntities(
+    boardId: string,
+    zoneId: string,
+    size: { width: number; height: number },
+    positions: Record<string, { x: number; y: number }>,
+    params?: FeathersParams
+  ): Promise<{ board: Board; moved: import('@agor/core/types').BoardEntityObject[] }>;
+  deleteZone(
+    boardId: string,
+    zoneId: string,
+    deleteAssociatedSessions: boolean,
+    params?: FeathersParams
+  ): Promise<{ board: Board; affectedSessions: string[] }>;
+  // Export/import/clone methods
+  toBlob(
+    boardId: string,
+    params?: FeathersParams
+  ): Promise<import('@agor/core/types').BoardExportBlob>;
+  fromBlob(
+    blob: import('@agor/core/types').BoardExportBlob,
+    params?: FeathersParams
+  ): Promise<import('@agor/core/types').BoardImportResult>;
+  toYaml(boardId: string, params?: FeathersParams): Promise<string>;
+  fromYaml(
+    yamlContent: string,
+    params?: FeathersParams
+  ): Promise<import('@agor/core/types').BoardImportResult>;
+  clone(boardId: string, newName: string, params?: FeathersParams): Promise<Board>;
+  setPrimaryTeammate(
+    data: { id?: string; boardId?: string; branchId: string },
+    params?: FeathersParams
+  ): Promise<Board>;
+  clearPrimaryTeammate(boardId: string, params?: FeathersParams): Promise<Board>;
+  archive(id: string, params?: FeathersParams): Promise<Board>;
+  unarchive(id: string, params?: FeathersParams): Promise<Board>;
+}
+
+/**
+ * Messages service with custom methods (server-side implementation)
+ */
+export interface MessagesServiceImpl
+  extends Service<
+    Message,
+    import('@agor/core/types').MessageCreate,
+    FeathersParams,
+    import('@agor/core/types').MessagePatch
+  > {
+  findByIdForScopeCheck(messageId: import('@agor/core/types').MessageID): Promise<Message | null>;
+}
+
+/**
+ * Branches service with custom methods (server-side implementation)
+ */
+export interface BranchesServiceImpl extends Service<Branch, Partial<Branch>, FeathersParams> {
+  forceReleaseDeletion(id: BranchID, params?: FeathersParams): Promise<Branch>;
+  retireTeammate(
+    id: BranchID,
+    params?: FeathersParams
+  ): Promise<import('@agor/core/types').BranchCleanAccepted>;
+  clean(
+    input: { branchId: import('@agor/core/types').BranchID },
+    params?: FeathersParams
+  ): Promise<import('@agor/core/types').BranchCleanAccepted>;
+  startEnvironment(id: BranchID, params?: FeathersParams, confirmationOf?: string): Promise<Branch>;
+  stopEnvironment(id: BranchID, params?: FeathersParams): Promise<Branch>;
+  restartEnvironment(id: BranchID, params?: FeathersParams): Promise<Branch>;
+  nukeEnvironment(id: BranchID, params?: FeathersParams): Promise<Branch>;
+  renderEnvironment(
+    id: BranchID,
+    data: { variant?: string } | undefined,
+    params?: FeathersParams
+  ): Promise<Branch>;
+  checkHealth(
+    id: BranchID,
+    params?: FeathersParams,
+    internalOptions?: EnvironmentHealthCheckOptions
+  ): Promise<Branch>;
+  getLogs(
+    id: BranchID,
+    params?: FeathersParams
+  ): Promise<{
+    logs: string;
+    timestamp: string;
+    error?: string;
+    truncated?: boolean;
+  }>;
+  archiveOrDelete(
+    id: BranchID,
+    options: import('@agor/core/types').BranchArchiveOrDeleteOptions,
+    params?: FeathersParams
+  ): Promise<import('@agor/core/types').BranchArchiveOrDeleteResult>;
+  /** Internal only; intentionally omitted from the branches transport methods. */
+  removeMetadataWithRealtime(id: BranchID, params?: FeathersParams): Promise<Branch>;
+  unarchive(
+    id: BranchID,
+    options?: { boardId?: import('@agor/core/types').BoardID },
+    params?: FeathersParams
+  ): Promise<Branch>;
+}

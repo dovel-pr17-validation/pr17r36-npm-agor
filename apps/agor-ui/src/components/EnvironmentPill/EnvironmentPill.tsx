@@ -1,0 +1,399 @@
+import { hasActiveEnvironmentCommand } from '@agor/core/types';
+import type { Branch, Repo } from '@agor-live/client';
+import {
+  EditOutlined,
+  FileTextOutlined,
+  FireOutlined,
+  GlobalOutlined,
+  PlayCircleOutlined,
+  StopOutlined,
+} from '@ant-design/icons';
+import { Button, Space, Tooltip, theme } from 'antd';
+import { useAuthConfigSnapshot } from '../../hooks/useAuthConfig';
+import { useConfirmNukeEnvironment } from '../../hooks/useConfirmNukeEnvironment';
+import { getEnvironmentAccessUrls } from '../../utils/environmentAccessUrls';
+import { hasEnvironmentLogs } from '../../utils/environmentCommand';
+import { getEffectiveEnv } from '../../utils/environmentConfig';
+import { getEnvironmentState } from '../../utils/environmentState';
+import { Tag } from '../Tag';
+import { EnvironmentStatusIcon } from './EnvironmentStatusIcon';
+import {
+  ENVIRONMENT_NO_CONTROL,
+  ENVIRONMENT_NOT_CONFIGURED,
+  getEnvironmentProblemLine,
+  getEnvironmentStopTooltip,
+  isEnvironmentUnconfirmed,
+} from './environmentStatusCopy';
+
+interface EnvironmentPillProps {
+  repo: Repo; // Need repo for environment_config
+  branch: Branch; // Has environment_instance (runtime state)
+  onEdit?: () => void; // Opens BranchModal → Environment tab
+  onStartEnvironment?: (branchId: string) => void;
+  onStopEnvironment?: (branchId: string) => void;
+  onNukeEnvironment?: (branchId: string) => void;
+  onViewLogs?: (branchId: string) => void;
+  canControlEnvironment?: boolean;
+  connectionDisabled?: boolean; // Disable actions when disconnected
+  /** Whether to show the destructive Nuke action when available. Defaults to true. */
+  showNukeEnvironment?: boolean;
+}
+
+export function EnvironmentPill({
+  repo,
+  branch,
+  onEdit,
+  onStartEnvironment,
+  onStopEnvironment,
+  onNukeEnvironment,
+  onViewLogs,
+  canControlEnvironment,
+  connectionDisabled = false,
+  showNukeEnvironment = true,
+}: EnvironmentPillProps) {
+  const { token } = theme.useToken();
+  const confirmNuke = useConfirmNukeEnvironment();
+  const effectiveEnv = getEffectiveEnv(repo);
+  const hasConfig = effectiveEnv.hasConfig;
+  const env = branch.environment_instance;
+  const { featuresConfig } = useAuthConfigSnapshot();
+  const canViewLogs = hasEnvironmentLogs(
+    env,
+    branch.logs_command,
+    featuresConfig?.environmentCommands?.shellLogs
+  );
+  // If a parent has loaded effective branch access (e.g. BranchModal), honor
+  // that explicit decision. Otherwise do not try to infer from direct owners or
+  // `others_can`: group grants are not present on the branch payload, and the
+  // daemon is the source of truth for environment authorization.
+  const resolvedCanControlEnvironment = canControlEnvironment ?? true;
+  const controlDisabledTooltip = resolvedCanControlEnvironment ? undefined : ENVIRONMENT_NO_CONTROL;
+
+  // Prefer reported access links, retaining the user-editable static fallback.
+  const environmentUrl = getEnvironmentAccessUrls(env, branch.app_url)[0]?.url;
+  const commandActive = hasActiveEnvironmentCommand(env);
+
+  // Surface the active environment variant name on the pill instead of the
+  // generic "env" label — but only when the repo actually defines more than one
+  // variant to distinguish. Single-variant repos (and v1 configs, whose lone
+  // variant is named "default") stay quiet as "env" to avoid noise, mirroring
+  // the StorageModePill "quiet default" philosophy.
+  const variantCount = repo.environment ? Object.keys(repo.environment.variants ?? {}).length : 0;
+  const activeVariant = branch.environment_variant;
+  const envLabel = activeVariant && variantCount > 1 ? activeVariant : 'env';
+  // When a specific variant is surfaced, prefix tooltips with its name so the
+  // hover text still explains what the (now variant-named) label represents.
+  const variantPrefix = envLabel !== 'env' ? `${envLabel} · ` : '';
+
+  // Case 1: No config at all - show grayed discovery pill
+  if (!hasConfig) {
+    return (
+      <Tooltip title={ENVIRONMENT_NOT_CONFIGURED}>
+        <Button
+          size="small"
+          aria-label="Configure environment"
+          icon={<GlobalOutlined style={{ fontSize: 12 }} />}
+          disabled={!onEdit}
+          onClick={(event) => {
+            event.stopPropagation();
+            onEdit?.();
+          }}
+          style={{
+            height: 22,
+            paddingInline: 7,
+            fontSize: 12,
+            opacity: 0.6,
+          }}
+        >
+          <Space size={4}>
+            <span style={{ fontFamily: token.fontFamilyCode }}>env</span>
+            <EditOutlined style={{ fontSize: 12 }} />
+          </Space>
+        </Button>
+      </Tooltip>
+    );
+  }
+
+  // Infer environment state by combining runtime status + health check
+  const inferredState = getEnvironmentState(env);
+  const unconfirmed = isEnvironmentUnconfirmed(env);
+
+  const handleEdit = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    onEdit?.();
+  };
+
+  const status = env?.status || 'stopped';
+  const isRunning = status === 'running';
+  const isStarting = status === 'starting';
+  const isStopping = status === 'stopping';
+  const canStop =
+    status === 'running' || status === 'starting' || (status === 'error' && !!env?.command_attempt);
+  const canOpenEnvironment = (isRunning || isStarting) && Boolean(environmentUrl);
+  const startDisabled =
+    commandActive ||
+    connectionDisabled ||
+    !resolvedCanControlEnvironment ||
+    !hasConfig ||
+    !onStartEnvironment ||
+    isStarting ||
+    isStopping ||
+    isRunning;
+  const stopDisabled =
+    commandActive ||
+    connectionDisabled ||
+    !resolvedCanControlEnvironment ||
+    !hasConfig ||
+    !onStopEnvironment ||
+    isStopping ||
+    !canStop;
+
+  const getTooltipText = () => {
+    const healthCheck = env?.last_health_check;
+    const healthMessage = healthCheck?.message ? ` - ${healthCheck.message}` : '';
+
+    switch (inferredState) {
+      case 'healthy':
+        return environmentUrl
+          ? `Healthy - ${environmentUrl}${healthMessage}`
+          : `Healthy${healthMessage}`;
+      case 'running':
+        return environmentUrl
+          ? `Started - ${environmentUrl} (health unavailable${healthMessage})`
+          : `Started (health unavailable${healthMessage})`;
+      case 'starting':
+        return environmentUrl ? `Starting… - ${environmentUrl}` : 'Starting…';
+      case 'stopping':
+        return 'Stopping…';
+      case 'unhealthy':
+      case 'error':
+        return getEnvironmentProblemLine(env) ?? '';
+      default:
+        return 'Stopped';
+    }
+  };
+
+  // Determine color based on inferred state
+  const getColor = () => {
+    switch (inferredState) {
+      case 'healthy':
+        return 'green'; // Green for healthy
+      case 'unhealthy':
+        return 'orange'; // Orange for unhealthy
+      case 'running':
+        return 'blue'; // Blue for running without health check
+      case 'starting':
+      case 'stopping':
+        return 'blue'; // Blue for transitioning
+      case 'error':
+        return unconfirmed ? 'orange' : 'red';
+      default:
+        return 'default'; // Gray for stopped
+    }
+  };
+
+  return (
+    <Tag
+      color={getColor()}
+      style={{
+        userSelect: 'none',
+        padding: 0,
+        overflow: 'hidden',
+        lineHeight: '20px',
+        display: 'inline-flex',
+        alignItems: 'stretch',
+      }}
+    >
+      <Space
+        size={0}
+        style={{ width: '100%', display: 'inline-flex', alignItems: 'center' }}
+        orientation="horizontal"
+      >
+        {/* The static fallback remains useful while Start discovers a runtime URL. */}
+        {canOpenEnvironment && environmentUrl ? (
+          <Tooltip title={`${variantPrefix}Open environment - ${environmentUrl}`}>
+            <a
+              href={environmentUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              onClick={(e) => e.stopPropagation()}
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                color: 'inherit',
+                padding: '0 7px',
+                textDecoration: 'none',
+                height: '22px',
+                cursor: 'pointer',
+              }}
+            >
+              <Space size={4} align="center">
+                <EnvironmentStatusIcon state={inferredState} unconfirmed={unconfirmed} size={12} />
+                <span style={{ fontFamily: token.fontFamilyCode, lineHeight: 1 }}>{envLabel}</span>
+              </Space>
+            </a>
+          </Tooltip>
+        ) : (
+          <Tooltip title={`${variantPrefix}${getTooltipText()}`}>
+            <div
+              style={{
+                padding: '0 7px',
+                height: '22px',
+                display: 'inline-flex',
+                alignItems: 'center',
+                cursor: 'default',
+              }}
+            >
+              <Space size={4} align="center">
+                <EnvironmentStatusIcon state={inferredState} unconfirmed={unconfirmed} size={12} />
+                <span style={{ fontFamily: token.fontFamilyCode, lineHeight: 1 }}>{envLabel}</span>
+              </Space>
+            </div>
+          </Tooltip>
+        )}
+
+        {/* Environment controls */}
+        {(onStartEnvironment || onStopEnvironment) && hasConfig && (
+          <Space
+            size={2}
+            style={{
+              padding: '0 6px',
+              borderLeft: `1px solid ${token.colorBorderSecondary}`,
+              height: '22px',
+              display: 'inline-flex',
+              alignItems: 'center',
+            }}
+          >
+            {onStartEnvironment && (
+              <Tooltip
+                title={
+                  controlDisabledTooltip ??
+                  (status === 'running' ? 'Environment running' : 'Start environment')
+                }
+              >
+                <Button
+                  type="text"
+                  size="small"
+                  aria-label="Start environment"
+                  icon={<PlayCircleOutlined />}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    if (!startDisabled) {
+                      onStartEnvironment(branch.branch_id);
+                    }
+                  }}
+                  disabled={startDisabled}
+                  style={{
+                    height: 22,
+                    width: 22,
+                    minWidth: 22,
+                    padding: 0,
+                  }}
+                />
+              </Tooltip>
+            )}
+            {onStopEnvironment && (
+              <Tooltip title={controlDisabledTooltip ?? getEnvironmentStopTooltip(env)}>
+                <Button
+                  type="text"
+                  size="small"
+                  aria-label="Stop environment"
+                  icon={<StopOutlined />}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    if (!stopDisabled) {
+                      onStopEnvironment(branch.branch_id);
+                    }
+                  }}
+                  disabled={stopDisabled}
+                  style={{
+                    height: 22,
+                    width: 22,
+                    minWidth: 22,
+                    padding: 0,
+                  }}
+                />
+              </Tooltip>
+            )}
+            {onViewLogs && (
+              <Tooltip
+                title={
+                  controlDisabledTooltip ?? (canViewLogs ? 'View environment logs' : 'No logs yet.')
+                }
+              >
+                <Button
+                  type="text"
+                  size="small"
+                  aria-label="View environment logs"
+                  icon={<FileTextOutlined />}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    if (resolvedCanControlEnvironment && canViewLogs) {
+                      onViewLogs(branch.branch_id);
+                    }
+                  }}
+                  disabled={!resolvedCanControlEnvironment || !canViewLogs}
+                  style={{
+                    height: 22,
+                    width: 22,
+                    minWidth: 22,
+                    padding: 0,
+                  }}
+                />
+              </Tooltip>
+            )}
+            {showNukeEnvironment && onNukeEnvironment && branch.nuke_command && (
+              <Tooltip
+                title={
+                  controlDisabledTooltip ??
+                  'Nuke environment. This removes all its data and volumes.'
+                }
+              >
+                <Button
+                  type="text"
+                  size="small"
+                  danger
+                  aria-label="Nuke environment"
+                  icon={<FireOutlined />}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    if (resolvedCanControlEnvironment && !connectionDisabled) {
+                      confirmNuke(() => onNukeEnvironment(branch.branch_id));
+                    }
+                  }}
+                  disabled={commandActive || connectionDisabled || !resolvedCanControlEnvironment}
+                  style={{
+                    height: 22,
+                    width: 22,
+                    minWidth: 22,
+                    padding: 0,
+                  }}
+                />
+              </Tooltip>
+            )}
+          </Space>
+        )}
+
+        {/* Edit button - always visible */}
+        <Tooltip title="Configure environment">
+          <Button
+            type="text"
+            size="small"
+            aria-label="Configure environment"
+            icon={<EditOutlined />}
+            onClick={handleEdit}
+            disabled={!onEdit}
+            style={{
+              padding: 0,
+              height: 22,
+              width: 22,
+              minWidth: 22,
+              borderLeft: `1px solid ${token.colorBorderSecondary}`,
+              ...(onEdit ? { cursor: 'pointer' } : {}),
+            }}
+          />
+        </Tooltip>
+      </Space>
+    </Tag>
+  );
+}

@@ -1,0 +1,204 @@
+import type { Board, Branch, Repo, Session } from '@agor-live/client';
+import { act, cleanup, render, screen, waitFor } from '@testing-library/react';
+import { BrowserRouter, Route, Routes, useNavigate } from 'react-router-dom';
+import { afterEach, expect, it, vi } from 'vitest';
+import { userEvent } from 'vitest/browser';
+import { agorStore } from '../../store/agorStore';
+import { boardScopeKey, type ScopeCoverage } from '../../store/scopeMerge';
+import { boardCoverage } from '../../test/userScopeCoverage';
+import { MobileApp } from './MobileApp';
+
+// Keep the real mobile shell/router/page/close callback. The heavy conversation
+// renderer is a boundary stub; its close prop is already wired by SessionPage.
+vi.mock('../SessionPanel', () => ({
+  SessionPanel: ({ session, onClose }: { session: Session; onClose: () => void }) => {
+    const navigate = useNavigate();
+    return (
+      <div>
+        <h1>{session.session_id}</h1>
+        <button type="button" onClick={onClose}>
+          Close session
+        </button>
+        <button type="button" onClick={() => navigate('/m/session/child')}>
+          Open child session
+        </button>
+      </div>
+    );
+  },
+}));
+vi.mock('../SessionSettingsModal', () => ({ SessionSettingsModal: () => null }));
+vi.mock('../HomePage', () => ({ HomePage: () => <h1>Home</h1> }));
+vi.mock('./MobileSearchPage', () => ({ MobileSearchPage: () => null }));
+vi.mock('./MobileSessionsPage', () => ({ MobileSessionsPage: () => null }));
+vi.mock('./MobileMarketplacePage', () => ({ MobileMarketplacePage: () => null }));
+vi.mock('./MobileMoreSheet', () => ({ MobileMoreSheet: () => null }));
+vi.mock('../BranchModal', () => ({ BranchModal: () => null }));
+vi.mock('../SettingsModal/PrimaryTeammatePicker', () => ({ PrimaryTeammatePicker: () => null }));
+vi.mock('../MarkdownRenderer/MarkdownRenderer', () => ({ MarkdownRenderer: () => null }));
+vi.mock('../AgentSelectionGrid', () => ({ AgentSelectionGrid: () => null, AVAILABLE_AGENTS: [] }));
+vi.mock('../SessionCanvas/SessionCanvas', () => ({ default: () => null }));
+
+const originalUrl = window.location.href;
+afterEach(() => {
+  cleanup();
+  window.history.replaceState(null, '', originalUrl);
+  agorStore.getState().reset();
+});
+const boards = new Map([
+  ['a', { board_id: 'a', name: 'Alpha', slug: 'alpha', primary_teammate_id: 'assistant' } as Board],
+  ['b', { board_id: 'b', name: 'Beta', slug: 'beta' } as Board],
+]);
+const branches = new Map([
+  ['assistant', { branch_id: 'assistant', board_id: 'a', name: 'Ada', repo_id: 'r' } as Branch],
+  ['other', { branch_id: 'other', board_id: 'b' } as Branch],
+]);
+/** A loaded partition's membership: the rows its read returned. */
+const withMembers = (entry: ScopeCoverage, branchIds: string[], sessionIds: string[]) => ({
+  ...entry,
+  members: { ...entry.members, branches: new Set(branchIds), sessions: new Set(sessionIds) },
+});
+function mount(path = '/m/board/alpha') {
+  agorStore.setState({
+    boardById: boards,
+    // Both boards' partitions are loaded (the page waits for them), with their rows.
+    coverage: new Map([
+      [boardScopeKey('a'), withMembers(boardCoverage(), ['assistant'], ['parent'])],
+      [boardScopeKey('b'), withMembers(boardCoverage(), ['other'], ['child'])],
+    ]),
+    branchById: branches,
+    repoById: new Map([['r', { repo_id: 'r', slug: 'org/repo' } as Repo]]),
+    sessionById: new Map([
+      ['parent', { session_id: 'parent', title: 'Parent', branch_id: 'assistant' } as Session],
+      [
+        'child',
+        { session_id: 'child', branch_id: 'other', parent_session_id: 'parent' } as Session,
+      ],
+    ]),
+    sessionsByBranch: new Map([
+      ['assistant', [{ session_id: 'parent', title: 'Parent', status: 'idle' } as Session]],
+    ]),
+    loading: false,
+  });
+  window.history.replaceState(null, '', path);
+  render(
+    <BrowserRouter>
+      <Routes>
+        <Route
+          path="/m/*"
+          element={
+            <MobileApp
+              client={null}
+              authGeneration={0}
+              onCreateSession={vi.fn(async () => null)}
+              onForkSession={vi.fn(async () => {})}
+              onBtwForkSession={vi.fn(async () => {})}
+              onSpawnSession={vi.fn(async () => {})}
+              onUpdateSession={vi.fn()}
+              onDeleteSession={vi.fn()}
+              onSendComment={vi.fn()}
+              onOpenWorkspaceSettings={vi.fn()}
+              onOpenUserSettings={vi.fn()}
+            />
+          }
+        />
+      </Routes>
+    </BrowserRouter>
+  );
+}
+
+it('uses real browser history for session switches, Back/Forward, a Back-style X and board switches', async () => {
+  mount('/m/board/alpha?tab=teammate'); // board a, Teammate tab
+  await userEvent.click(await screen.findByRole('button', { name: /^Open session Parent/ }));
+  await userEvent.click(await screen.findByRole('button', { name: 'Open child session' }));
+  expect(window.location.pathname).toBe('/m/session/child');
+  await act(async () => window.history.back());
+  await screen.findByRole('heading', { name: 'parent' });
+  await act(async () => window.history.forward());
+  await screen.findByRole('heading', { name: 'child' });
+  // The leading X is a real history Back: it returns to the previously viewed
+  // session, not the closed session's board, and does not replace history.
+  await userEvent.click(screen.getByRole('button', { name: 'Close session' }));
+  expect(window.location.pathname).toBe('/m/session/parent');
+  await screen.findByRole('heading', { name: 'parent' });
+  // Backing out once more reaches the board the run started on.
+  await userEvent.click(screen.getByRole('button', { name: 'Close session' }));
+  expect(window.location.pathname).toBe('/m/board/alpha');
+  await waitFor(() =>
+    expect(screen.queryByRole('button', { name: 'Close session' })).not.toBeInTheDocument()
+  );
+  await userEvent.click(await screen.findByRole('button', { name: /^Alpha/ }));
+  await userEvent.click(await screen.findByRole('menuitem', { name: /Beta/ }));
+  expect(window.location.pathname).toBe('/m/board/b');
+  await userEvent.click(screen.getByRole('button', { name: 'Home', exact: true }));
+  await userEvent.click(screen.getByRole('button', { name: 'Board', exact: true }));
+  expect(window.location.pathname).toBe('/m/board/b');
+});
+
+it('keeps the primary tab bar docked on the full-screen session sub-view', async () => {
+  mount('/m/session/parent');
+  // Ask (center action) plus the Home/Board tabs are reachable from a session.
+  expect(screen.getByRole('button', { name: 'Ask your primary assistant' })).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'Home', exact: true })).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'Board', exact: true })).toBeInTheDocument();
+  // The session's own leading Close is still present alongside the tab bar.
+  expect(screen.getByRole('button', { name: 'Close session' })).toBeInTheDocument();
+});
+
+it('remembers the canonical slug board rather than defaulting to another board', async () => {
+  mount('/m/board/beta');
+  await userEvent.click(screen.getByRole('button', { name: 'Home', exact: true }));
+  await userEvent.click(screen.getByRole('button', { name: 'Board', exact: true }));
+  expect(window.location.pathname).toBe('/m/board/b');
+});
+
+it('uses home when a direct session loses board access, without reopening on late data', async () => {
+  mount('/m/session/child');
+  await act(async () => agorStore.setState({ boardById: new Map([['a', boards.get('a')!]]) }));
+  await userEvent.click(screen.getByRole('button', { name: 'Close session' }));
+  expect(window.location.pathname).toBe('/m');
+  await act(async () => agorStore.setState({ boardById: boards }));
+  await waitFor(() => expect(window.location.pathname).toBe('/m'));
+});
+
+it('tracks a live branch move rather than a stale session board projection', async () => {
+  mount('/m/session/child');
+  await act(async () =>
+    agorStore.setState({
+      branchById: new Map([
+        ...branches,
+        ['other', { ...branches.get('other'), board_id: 'a' } as Branch],
+      ]),
+      sessionById: new Map([
+        ['child', { session_id: 'child', branch_id: 'other', branch_board_id: 'b' } as Session],
+      ]),
+    })
+  );
+  await userEvent.click(screen.getByRole('button', { name: 'Close session' }));
+  expect(window.location.pathname).toBe('/m/board/a');
+});
+
+it('lets the user exit when an open session is removed or becomes inaccessible', async () => {
+  mount('/m/session/child');
+  await act(async () => agorStore.setState({ sessionById: new Map() }));
+  expect(await screen.findByText('Session not loaded')).toBeInTheDocument();
+  await userEvent.click(screen.getByRole('button', { name: 'Back to home' }));
+  expect(window.location.pathname).toBe('/m');
+});
+
+it('waits for the targeted read of an uncached session and renders its late result', async () => {
+  mount('/m/session/archived');
+  expect(screen.queryByText('Session not loaded')).not.toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'Back to home' })).toBeInTheDocument();
+  await act(async () =>
+    agorStore.setState({
+      sessionById: new Map([
+        ['archived', { session_id: 'archived', branch_id: 'other', archived: true } as Session],
+      ]),
+    })
+  );
+  expect(await screen.findByRole('heading', { name: 'archived' })).toBeInTheDocument();
+  expect(screen.queryByText('Session not loaded')).not.toBeInTheDocument();
+  expect(window.location.pathname).toBe('/m/session/archived');
+  await userEvent.click(screen.getByRole('button', { name: 'Close session' }));
+  expect(window.location.pathname).toBe('/m/board/b');
+});

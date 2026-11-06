@@ -1,0 +1,40 @@
+# PostgreSQL + RBAC Testing Environment
+# Extends base docker-compose.yml with PostgreSQL database and RBAC features
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.postgres.yml \
+#     --profile postgres up postgres agor-dev
+#
+# This profile provides:
+# - PostgreSQL database (instead of SQLite)
+# - RBAC + executor filesystem sandbox enabled
+# - Test users (alice, bob)
+# - Test branches with ownership configured
+#
+services:
+  agor-dev:
+    # Rich sandbox environments select this file explicitly, so Compose does
+    # not auto-load docker-compose.override.yml. Permit Codex's nested Linux
+    # sandbox here as part of the self-contained rich environment overlay.
+    security_opt:
+      - apparmor=unconfined
+      - seccomp=unconfined
+    environment:
+      # PostgreSQL database configuration
+      - AGOR_DB_DIALECT=postgresql
+      - DATABASE_URL=postgresql://agor_app:agor_dev_secret@postgres:5432/agor
+
+      # Enable RBAC + local filesystem sandbox
+      - AGOR_UNIX_USER_MODE=${AGOR_UNIX_USER_MODE:-sandbox}
+      - AGOR_SANDBOX_ENABLED=${AGOR_SANDBOX_ENABLED:-true}
+      - AGOR_SANDBOX_HOME_MODE=${AGOR_SANDBOX_HOME_MODE:-per_user}
+      # Rich/full is the advanced RBAC fixture, so new compatible Sessions use
+      # branch-owned SDK state by default. Operators can still override this
+      # with AGOR_SANDBOX_SDK_HOME_MODE=inherit for compatibility testing.
+      - AGOR_SANDBOX_SDK_HOME_MODE=${AGOR_SANDBOX_SDK_HOME_MODE:-per_branch}
+
+      # Create test principals (alice, bob) on startup
+      - CREATE_RBAC_TEST_USERS=${CREATE_RBAC_TEST_USERS:-true}
+
+    # Use PostgreSQL+RBAC-specific entrypoint
+    entrypoint: ['/usr/local/bin/docker-entrypoint-postgres.sh']

@@ -1,0 +1,582 @@
+// biome-ignore-all lint/plugin/noHardcodedColorLiteral: xterm requires an exact ANSI terminal palette
+// biome-ignore-all lint/plugin/noHardcodedColorProperty: xterm requires compound terminal overlay colors
+import type { AgorClient, TerminalAllocatedEvent, User, UserID } from '@agor-live/client';
+import { hasMinimumRole } from '@agor-live/client';
+import { ClipboardAddon } from '@xterm/addon-clipboard';
+import { FitAddon } from '@xterm/addon-fit';
+import { WebLinksAddon } from '@xterm/addon-web-links';
+import { Terminal } from '@xterm/xterm';
+import { App, Badge, Button, Modal } from 'antd';
+import { useEffect, useRef, useState } from 'react';
+import { loadWebglRenderer } from '../../utils/xtermWebgl';
+import '@xterm/xterm/css/xterm.css';
+import { WEB_TERMINAL_MIN_ROLE } from './constants';
+
+// Re-exported for backward compatibility with existing deep imports.
+export { WEB_TERMINAL_MIN_ROLE };
+
+const OSC_SEQUENCE_START = '\u001B]8;';
+const OSC_SEQUENCE_END = '\u001B]8;;\u0007';
+const BELL = '\u0007';
+
+const expandOscHyperlinks = (input: string): string => {
+  let output = '';
+  let index = 0;
+
+  while (index < input.length) {
+    const start = input.indexOf(OSC_SEQUENCE_START, index);
+    if (start === -1) {
+      output += input.slice(index);
+      break;
+    }
+
+    output += input.slice(index, start);
+
+    const paramUriStart = start + OSC_SEQUENCE_START.length;
+    const firstBell = input.indexOf(BELL, paramUriStart);
+    if (firstBell === -1) {
+      output += input.slice(start);
+      break;
+    }
+
+    const paramUriSegment = input.slice(paramUriStart, firstBell);
+    const lastSemicolon = paramUriSegment.lastIndexOf(';');
+    const rawUri =
+      lastSemicolon === -1 ? paramUriSegment : paramUriSegment.slice(lastSemicolon + 1);
+    const trimmedUri = rawUri.trim();
+
+    const labelStart = firstBell + 1;
+    const terminatorIndex = input.indexOf(OSC_SEQUENCE_END, labelStart);
+    if (terminatorIndex === -1) {
+      output += input.slice(labelStart);
+      break;
+    }
+
+    const rawLabel = input.slice(labelStart, terminatorIndex);
+
+    if (!trimmedUri) {
+      output += rawLabel;
+    } else if (rawLabel.includes(trimmedUri)) {
+      output += rawLabel;
+    } else {
+      const trimmedLabel = rawLabel.trim();
+      const safeLabel = trimmedLabel.length > 0 ? trimmedLabel : trimmedUri;
+      output += `${safeLabel} (${trimmedUri})`;
+    }
+
+    index = terminatorIndex + OSC_SEQUENCE_END.length;
+  }
+
+  return output;
+};
+
+export interface TerminalModalProps {
+  open: boolean;
+  onClose: () => void;
+  client: AgorClient | null;
+  user?: User | null;
+  branchId?: string; // Branch context for Zellij integration
+  initialCommands?: string[]; // Commands to execute after connection
+}
+
+export const TerminalModal: React.FC<TerminalModalProps> = ({
+  open,
+  onClose,
+  client,
+  user,
+  branchId,
+  initialCommands = [],
+}) => {
+  const { modal } = App.useApp();
+  const terminalDivRef = useRef<HTMLDivElement>(null);
+  const terminalRef = useRef<Terminal | null>(null);
+  const fitAddonRef = useRef<FitAddon | null>(null);
+  const [isConnected, setIsConnected] = useState(false);
+  const [reconnecting, setReconnecting] = useState(false);
+  const [needsReconnect, setNeedsReconnect] = useState(false);
+  const [reconnectGeneration, setReconnectGeneration] = useState(0);
+  const [socketConnected, setSocketConnected] = useState(client?.io.connected === true);
+  const [modalReady, setModalReady] = useState(false);
+  const [zellijMissing, setZellijMissing] = useState(false);
+  const [sessionInfo, setSessionInfo] = useState<{
+    zellijSession?: string;
+    zellijReused?: boolean;
+    branchName?: string;
+  }>({});
+
+  // The instance-level `execution.allow_web_terminal` flag is enforced
+  // server-side and also gates whether the open-terminal buttons appear at
+  // all in the UI; here we only re-check the role as a belt-and-suspenders
+  // safeguard.
+  const canUseTerminal = hasMinimumRole(user?.role, WEB_TERMINAL_MIN_ROLE);
+
+  useEffect(() => {
+    // Explicit reconnect increments this value to replace the owner-local
+    // attachment; reading it makes that lifecycle dependency intentional.
+    void reconnectGeneration;
+    if (!open || !modalReady || !terminalDivRef.current || !client) return;
+
+    // Skip terminal setup for users without terminal access
+    if (!canUseTerminal) return;
+
+    // Executor mode requires user to be logged in
+    if (!user?.user_id) {
+      console.error('[Terminal] Terminal requires authenticated user');
+      return;
+    }
+
+    let mounted = true;
+    let currentChannel: string | null = null;
+    let currentTerminalId: string | null = null;
+    let initialCommandsSent = false;
+    const failedTerminalIds = new Set<string>();
+    // Monotonic attach generation: each (re)attach bumps it and a disconnect
+    // bumps it, so a stale/out-of-order attach resolve can't flip the modal
+    // back to connected after the socket has moved on.
+    let attachGeneration = 0;
+    let transformData: (value: string) => string = (value) => value;
+    const socket = client.io;
+    setSocketConnected(socket.connected);
+    setIsConnected(false);
+    setNeedsReconnect(false);
+
+    // Cleanup channel listeners
+    const removeChannelListeners = () => {
+      if (socket) {
+        socket.off('terminal:output', handleChannelOutput);
+        socket.off('terminal:exit', handleChannelExit);
+        socket.off('terminal:ready', handleChannelReady);
+        socket.off('terminal:error', handleChannelError);
+        socket.off('terminal:allocated', handleTerminalAllocated);
+        socket.off('connect', handleReconnect);
+        socket.off('disconnect', handleDisconnect);
+        if (currentChannel) {
+          socket.emit('leave', currentChannel);
+        }
+      }
+    };
+
+    const handleTerminalAllocated = (payload: TerminalAllocatedEvent) => {
+      if (payload.userId !== user?.user_id || payload.branchId !== branchId) return;
+      currentTerminalId = payload.terminalId;
+    };
+
+    const sendInitialCommands = () => {
+      if (!currentTerminalId || initialCommandsSent || initialCommands.length === 0) return;
+      initialCommandsSent = true;
+      for (const cmd of initialCommands) {
+        socket.emit('terminal:input', {
+          userId: user?.user_id,
+          terminalId: currentTerminalId,
+          input: `${cmd}\r`,
+        });
+      }
+    };
+
+    // Channel-based event handlers
+    const handleChannelOutput = (payload: { userId: string; terminalId: string; data: string }) => {
+      if (!terminalRef.current) return;
+      if (payload.userId === user?.user_id && payload.terminalId === currentTerminalId) {
+        terminalRef.current.write(transformData(payload.data));
+      }
+    };
+
+    const handleChannelExit = (payload: {
+      userId: string;
+      terminalId: string;
+      exitCode: number;
+    }) => {
+      if (!terminalRef.current) return;
+      if (payload.userId === user?.user_id && payload.terminalId === currentTerminalId) {
+        failedTerminalIds.add(payload.terminalId);
+        terminalRef.current.writeln(`\r\n\r\n[Terminal exited with code ${payload.exitCode}]`);
+        terminalRef.current.writeln('[Close and reopen terminal to start a new session]');
+        setIsConnected(false);
+        setNeedsReconnect(true);
+      }
+    };
+
+    // Readiness is the authoritative connected signal — the executor confirmed
+    // its PTY is spawned and attached. We flip on this rather than on the
+    // terminals.create resolution so a post-spawn executor crash surfaces
+    // instead of leaving the modal wedged on a blank screen.
+    const handleChannelReady = (payload: { userId: string; terminalId: string }) => {
+      if (payload.userId !== user?.user_id || payload.terminalId !== currentTerminalId) return;
+      if (failedTerminalIds.has(payload.terminalId)) return;
+      sendInitialCommands();
+      setIsConnected(true);
+      setReconnecting(false);
+      setNeedsReconnect(false);
+    };
+
+    const handleChannelError = (payload: {
+      userId: string;
+      terminalId: string;
+      message?: string;
+    }) => {
+      if (payload.userId !== user?.user_id || payload.terminalId !== currentTerminalId) return;
+      failedTerminalIds.add(payload.terminalId);
+      if (terminalRef.current) {
+        terminalRef.current.writeln(`\r\n[Terminal error: ${payload.message ?? 'attach failed'}]`);
+      }
+      setIsConnected(false);
+      setReconnecting(false);
+      setNeedsReconnect(true);
+    };
+
+    // Create xterm instance with common configuration
+    const createTerminalInstance = () => {
+      const terminal = new Terminal({
+        allowProposedApi: true,
+        fontSize: 14,
+        fontFamily: 'Menlo, Monaco, "Courier New", monospace',
+        cursorBlink: true,
+        scrollback: 1000,
+        rows: 40,
+        cols: 160,
+        linkHandler: {
+          activate: (_event, uri) => {
+            window.open(uri, '_blank', 'noopener,noreferrer');
+          },
+          hover: () => {
+            // no-op but ensures handler exists so OSC links get hover feedback
+          },
+        },
+        theme: {
+          // Ant Design dark theme colors
+          background: '#141414', // colorBgContainer
+          foreground: '#ffffff', // colorText
+          cursor: '#2e9a92', // Agor teal
+          cursorAccent: '#141414',
+
+          // ANSI colors matching Ant Design palette
+          black: '#000000',
+          red: '#ff4d4f', // colorError
+          green: '#52c41a', // colorSuccess
+          yellow: '#faad14', // colorWarning
+          blue: '#1890ff', // colorInfo
+          magenta: '#eb2f96',
+          cyan: '#2e9a92', // Agor teal (colorPrimary)
+          white: '#f0f0f0',
+
+          // Bright colors
+          brightBlack: '#8c8c8c', // colorTextSecondary
+          brightRed: '#ff7875',
+          brightGreen: '#95de64',
+          brightYellow: '#ffc53d',
+          brightBlue: '#40a9ff',
+          brightMagenta: '#f759ab',
+          brightCyan: '#3db5ab', // Lighter teal
+          brightWhite: '#ffffff',
+        },
+      });
+
+      terminal.open(terminalDivRef.current!);
+      terminalRef.current = terminal;
+
+      // Load Clipboard addon for OSC 52 support
+      // This enables Zellij to copy to the browser clipboard via OSC 52 escape sequences
+      const clipboardAddon = new ClipboardAddon();
+      terminal.loadAddon(clipboardAddon);
+
+      // Load Web Links addon for clickable URLs
+      const webLinksAddon = new WebLinksAddon((_event, uri) => {
+        window.open(uri, '_blank', 'noopener,noreferrer');
+      });
+      terminal.loadAddon(webLinksAddon);
+
+      // GPU renderer first (falls back to DOM if WebGL is unavailable), then
+      // fit the terminal to the modal body instead of the hardcoded 160×40.
+      loadWebglRenderer(terminal);
+      const fitAddon = new FitAddon();
+      terminal.loadAddon(fitAddon);
+      fitAddonRef.current = fitAddon;
+
+      return terminal;
+    };
+
+    const fitToContainer = () => {
+      if (!terminalDivRef.current || !fitAddonRef.current) return;
+      const box = terminalDivRef.current.getBoundingClientRect();
+      if (box.width <= 0 || box.height <= 0) return;
+      try {
+        fitAddonRef.current.fit();
+      } catch {
+        /* xterm refuses absurd sizes; ignore */
+      }
+    };
+
+    // Create the xterm instance and wire persistent listeners once. Only the
+    // server-side room join is lost on a socket reconnect, so these survive it;
+    // `attach` re-joins and re-issues the (idempotent) create.
+    const terminal = createTerminalInstance();
+    transformData = expandOscHyperlinks;
+    // Size the terminal to the modal body before announcing dims to the daemon,
+    // then keep it fitted as the viewport (and thus the modal) resizes — see the
+    // ResizeObserver below.
+    fitToContainer();
+    socket.on('terminal:output', handleChannelOutput);
+    socket.on('terminal:exit', handleChannelExit);
+    socket.on('terminal:ready', handleChannelReady);
+    socket.on('terminal:error', handleChannelError);
+    socket.on('terminal:allocated', handleTerminalAllocated);
+
+    terminal.onData((data) => {
+      if (!currentTerminalId) return;
+      socket.emit('terminal:input', {
+        userId: user?.user_id,
+        terminalId: currentTerminalId,
+        input: data,
+      });
+    });
+    terminal.onResize(({ cols, rows }) => {
+      if (!currentTerminalId) return;
+      socket.emit('terminal:resize', {
+        userId: user?.user_id,
+        terminalId: currentTerminalId,
+        cols,
+        rows,
+      });
+    });
+
+    const attach = async () => {
+      const generation = ++attachGeneration;
+      try {
+        // Request terminal from daemon
+        // This spawns an executor with zellij.attach if not already running.
+        // Idempotent, so re-issuing it on reconnect is safe.
+        const result = (await client.service('terminals').create({
+          rows: terminal.rows,
+          cols: terminal.cols,
+          branchId,
+        })) as {
+          userId: UserID;
+          terminalId: string;
+          channel: string;
+          sessionName: string;
+          isNew: boolean;
+          branchName?: string;
+          ready?: boolean;
+        };
+
+        // Drop a stale/superseded attach (a later reconnect started, or the
+        // socket dropped while this call was in flight) so a late resolve
+        // can't wrongly flip the modal back to connected.
+        if (!mounted || generation !== attachGeneration || !socket.connected) {
+          return;
+        }
+
+        currentChannel = result.channel;
+        currentTerminalId = result.terminalId;
+        setSessionInfo({
+          zellijSession: result.sessionName,
+          zellijReused: !result.isNew,
+          branchName: result.branchName,
+        });
+        // Allocation is delivered before executor startup. If that executor
+        // already failed while the create response was in flight, preserve
+        // its actionable output and do not send terminal I/O into a retired
+        // attachment.
+        if (failedTerminalIds.has(result.terminalId)) return;
+        // Only clear for new sessions - reconnections will get screen via redraw
+        if (result.isNew) {
+          terminal.clear();
+        }
+
+        // Send initial resize to trigger Zellij full redraw (important for reconnections)
+        // This ensures the tab bar and status bar are properly rendered
+        socket.emit('terminal:resize', {
+          userId: user?.user_id,
+          terminalId: result.terminalId,
+          cols: terminal.cols,
+          rows: terminal.rows,
+        });
+
+        // Warm path: the executor is already attached, so connect right away.
+        // Cold path: wait for the executor's `terminal:ready` ack.
+        if (result.ready) {
+          sendInitialCommands();
+          setIsConnected(true);
+          setReconnecting(false);
+          setNeedsReconnect(false);
+        }
+      } catch (error) {
+        if (!mounted || generation !== attachGeneration) return;
+        console.error('[Terminal] Failed to create terminal:', error);
+        const message = error instanceof Error ? error.message : String(error);
+        setReconnecting(false);
+        // Surface the "Zellij not installed" case as a friendly inline panel
+        // with a link to the install docs, rather than a raw xterm error.
+        if (/zellij is not installed/i.test(message)) {
+          setZellijMissing(true);
+          if (terminalRef.current) {
+            terminalRef.current.dispose();
+            terminalRef.current = null;
+          }
+          return;
+        }
+        if (terminalRef.current) {
+          terminalRef.current.writeln('\r\nFailed to connect to terminal');
+          terminalRef.current.writeln(`Error: ${message}`);
+        }
+      }
+    };
+
+    // A transport reconnect is not a PTY resume protocol. The owner boot may
+    // be gone, so require an explicit user reconnect which creates a fresh
+    // attachment (and may reattach Zellij on a surviving runtime).
+    const handleReconnect = () => {
+      setSocketConnected(true);
+      setIsConnected(false);
+      setReconnecting(false);
+      setNeedsReconnect(true);
+    };
+    const handleDisconnect = () => {
+      // Invalidate any in-flight attach so a late resolve can't flip us back
+      // to connected while we're actually down.
+      attachGeneration++;
+      setSocketConnected(false);
+      setIsConnected(false);
+      setReconnecting(false);
+      setNeedsReconnect(true);
+    };
+    socket.on('connect', handleReconnect);
+    socket.on('disconnect', handleDisconnect);
+
+    // Setup terminal
+    void attach();
+
+    // Re-fit when the modal body resizes (viewport changes, browser zoom).
+    const ro = new ResizeObserver(() => fitToContainer());
+    if (terminalDivRef.current) ro.observe(terminalDivRef.current);
+
+    return () => {
+      mounted = false;
+      ro.disconnect();
+      // Cleanup terminal instance (also disposes its loaded addons).
+      if (terminalRef.current) {
+        terminalRef.current.dispose();
+        terminalRef.current = null;
+      }
+      fitAddonRef.current = null;
+      if (currentTerminalId && socket.connected) {
+        void client
+          .service('terminals')
+          .remove(currentTerminalId)
+          .catch(() => undefined);
+      }
+      removeChannelListeners();
+    };
+  }, [
+    open,
+    modalReady,
+    client,
+    initialCommands,
+    canUseTerminal,
+    branchId,
+    user?.user_id,
+    reconnectGeneration,
+  ]);
+
+  const handleClose = () => {
+    if (isConnected) {
+      modal.confirm({
+        title: 'Close Terminal?',
+        content:
+          'This Agor terminal attachment will close. If this runtime supports persistent Zellij sessions, the branch shell may be available when you reconnect.',
+        okText: 'Close',
+        okType: 'primary',
+        cancelText: 'Cancel',
+        onOk: () => {
+          onClose();
+        },
+      });
+    } else {
+      onClose();
+    }
+  };
+
+  return (
+    <Modal
+      title={`Terminal${sessionInfo.branchName ? ` - ${sessionInfo.branchName}` : ''}`}
+      open={open}
+      onCancel={handleClose}
+      afterOpenChange={setModalReady}
+      footer={null}
+      width="auto"
+      styles={{
+        body: {
+          padding: '16px',
+          background: '#000',
+        },
+      }}
+      centered
+    >
+      {!canUseTerminal ? (
+        <div style={{ padding: '24px', color: '#fff' }}>
+          <p>
+            Terminal access requires at least <strong>{WEB_TERMINAL_MIN_ROLE}</strong> role.
+          </p>
+          <p style={{ marginBottom: 0 }}>
+            Contact your Agor administrator to request elevated permissions.
+          </p>
+        </div>
+      ) : zellijMissing ? (
+        <div style={{ padding: '24px', color: '#fff', maxWidth: 560 }}>
+          <p style={{ marginTop: 0 }}>
+            <strong>Zellij isn't installed in the selected terminal runtime.</strong>
+          </p>
+          <p>
+            The web terminal uses{' '}
+            <a
+              href="https://zellij.dev/"
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{ color: '#3db5ab' }}
+            >
+              Zellij
+            </a>{' '}
+            for optional shell persistence on that runtime. Agor terminal transport remains
+            ephemeral. Install it to enable terminals — everything else in Agor works without it.
+          </p>
+          <p style={{ marginBottom: 0 }}>
+            <a
+              href="https://agor.live/guide/extended-install#optional-zellij-for-the-web-terminal"
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{ color: '#3db5ab' }}
+            >
+              Extended install guide →
+            </a>
+          </p>
+        </div>
+      ) : (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 12, color: '#fff' }}>
+          {needsReconnect ? (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+              <Badge status="error" text="Disconnected" />
+              <Button
+                size="small"
+                disabled={!socketConnected}
+                onClick={() => {
+                  setNeedsReconnect(false);
+                  setReconnecting(true);
+                  setReconnectGeneration((generation) => generation + 1);
+                }}
+              >
+                Reconnect
+              </Button>
+            </div>
+          ) : reconnecting ? (
+            <Badge status="warning" text="Reconnecting…" />
+          ) : !isConnected ? (
+            <Badge status="processing" text="Connecting to terminal…" />
+          ) : null}
+          {/* Concrete size gives @xterm/addon-fit a box to measure; the
+              width="auto" Modal then sizes itself to the terminal. */}
+          <div ref={terminalDivRef} style={{ width: '80vw', maxWidth: 1100, height: '70vh' }} />
+        </div>
+      )}
+    </Modal>
+  );
+};

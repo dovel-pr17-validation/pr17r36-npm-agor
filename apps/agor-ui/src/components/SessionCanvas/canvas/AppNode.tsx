@@ -1,0 +1,181 @@
+import type { AppBoardObject, BoardObject, SandpackTemplate } from '@agor-live/client';
+import { CodeOutlined, DeleteOutlined, EyeOutlined } from '@ant-design/icons';
+import { SandpackPreview, SandpackProvider, type SandpackSetup } from '@codesandbox/sandpack-react';
+import { Button, Card, Tooltip, Typography, theme } from 'antd';
+import { useCallback, useRef, useState } from 'react';
+import { NodeResizer } from 'reactflow';
+import { useMutationGate } from '../../../contexts/ConnectionContext';
+import { useStableSandpackProviderInputs } from './utils/sandpackDefaults';
+
+export interface AppNodeData {
+  objectId: string;
+  title: string;
+  description?: string;
+  template: SandpackTemplate;
+  files: Record<string, string>;
+  dependencies?: Record<string, string>;
+  entryFile?: string;
+  showEditor?: boolean;
+  showConsole?: boolean;
+  width: number;
+  height: number;
+  canEdit: boolean;
+  onUpdate: (id: string, data: BoardObject) => void;
+  onDelete?: (id: string) => void;
+}
+
+const MIN_WIDTH = 300;
+const MIN_HEIGHT = 200;
+
+export const AppNode = ({ data, selected }: { data: AppNodeData; selected?: boolean }) => {
+  const { token } = theme.useToken();
+  const mutationGate = useMutationGate();
+  const layoutMutationDisabled = !mutationGate.canMutate || !data.canEdit;
+  const [interactMode, setInteractMode] = useState(false);
+  const iframeContainerRef = useRef<HTMLDivElement>(null);
+  const sandpackInputs = useStableSandpackProviderInputs({
+    template: data.template,
+    files: data.files,
+    dependencies: data.dependencies,
+    entryFile: data.entryFile,
+  });
+
+  const handleResize = useCallback(
+    (_event: unknown, params: { x: number; y: number; width: number; height: number }) => {
+      if (layoutMutationDisabled) return;
+      const objectData: AppBoardObject = {
+        type: 'app',
+        x: params.x,
+        y: params.y,
+        width: Math.max(params.width, MIN_WIDTH),
+        height: Math.max(params.height, MIN_HEIGHT),
+        title: data.title,
+        description: data.description,
+        template: data.template,
+        files: data.files,
+        dependencies: data.dependencies,
+        entryFile: data.entryFile,
+        showEditor: data.showEditor,
+        showConsole: data.showConsole,
+      };
+      data.onUpdate(data.objectId, objectData);
+    },
+    [data, layoutMutationDisabled]
+  );
+
+  const toggleInteract = useCallback(() => {
+    setInteractMode((prev) => !prev);
+  }, []);
+
+  const headerHeight = 40;
+  const previewHeight = data.height - headerHeight - 16; // 16 for padding
+
+  return (
+    <>
+      <NodeResizer
+        isVisible={selected && !layoutMutationDisabled}
+        minWidth={MIN_WIDTH}
+        minHeight={MIN_HEIGHT}
+        onResize={handleResize}
+        lineStyle={{ borderColor: token.colorPrimary }}
+        handleStyle={{ backgroundColor: token.colorPrimary, width: 8, height: 8 }}
+      />
+      <Card
+        style={{
+          width: data.width,
+          height: data.height,
+          background: token.colorBgContainer,
+          border: `2px solid ${selected ? token.colorPrimary : token.colorBorder}`,
+          borderRadius: 8,
+          boxShadow: token.boxShadowSecondary,
+          overflow: 'hidden',
+          display: 'flex',
+          flexDirection: 'column',
+        }}
+        styles={{
+          body: {
+            padding: 0,
+            flex: 1,
+            display: 'flex',
+            flexDirection: 'column',
+            overflow: 'hidden',
+          },
+        }}
+        size="small"
+        title={
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <Typography.Text
+              style={{ fontSize: 12, fontWeight: 600, maxWidth: data.width - 120 }}
+              ellipsis
+            >
+              {data.title}
+            </Typography.Text>
+            <div style={{ display: 'flex', gap: 2 }}>
+              <Tooltip title={interactMode ? 'Exit interact mode' : 'Interact with app'}>
+                <Button
+                  type={interactMode ? 'primary' : 'text'}
+                  size="small"
+                  icon={interactMode ? <EyeOutlined /> : <CodeOutlined />}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    toggleInteract();
+                  }}
+                />
+              </Tooltip>
+              {data.onDelete && (
+                <Button
+                  type="text"
+                  size="small"
+                  danger
+                  icon={<DeleteOutlined />}
+                  aria-label="Delete app"
+                  disabled={layoutMutationDisabled}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    if (layoutMutationDisabled) return;
+                    data.onDelete?.(data.objectId);
+                  }}
+                />
+              )}
+            </div>
+          </div>
+        }
+      >
+        <div
+          ref={iframeContainerRef}
+          // In interact mode, React Flow's node-drag / canvas-pan / wheel-zoom
+          // listeners would otherwise capture every mousedown and wheel event
+          // before the iframe sees them — text selection (and therefore
+          // copy/paste) breaks, and scrolling zooms the canvas. The
+          // `nodrag nopan nowheel` classes are React Flow's documented
+          // escape hatch.
+          className={interactMode ? 'nodrag nopan nowheel' : undefined}
+          style={{
+            flex: 1,
+            position: 'relative',
+            // Block pointer events on the iframe when not in interact mode
+            // so React Flow can handle pan/zoom/drag
+            pointerEvents: interactMode ? 'auto' : 'none',
+          }}
+        >
+          <SandpackProvider
+            template={sandpackInputs.template as 'react'}
+            files={sandpackInputs.files}
+            customSetup={sandpackInputs.customSetup as SandpackSetup | undefined}
+            options={sandpackInputs.options}
+          >
+            <SandpackPreview
+              style={{
+                height: previewHeight > 0 ? previewHeight : 200,
+                border: 'none',
+              }}
+              showNavigator={false}
+              showOpenInCodeSandbox={false}
+              showRefreshButton={interactMode}
+            />
+          </SandpackProvider>
+        </div>
+      </Card>
+    </>
+  );
+};

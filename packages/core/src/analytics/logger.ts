@@ -1,0 +1,166 @@
+import type { AnalyticsInstance } from 'analytics';
+import { Analytics } from 'analytics';
+import { getDefaultAnalyticsConfig } from '../config/analytics-defaults.js';
+import { isSafeAnalyticsKey } from '../config/analytics-validation.js';
+import type { AgorAnalyticsSettings, AgorConfig } from '../config/types.js';
+import { getCurrentTenantId } from '../db/tenant-context.js';
+import { isAnalyticsEventExcluded } from './filters.js';
+import { resolveAnalyticsPlugins } from './plugins.js';
+import {
+  type AnalyticsLogger,
+  type AnalyticsProperties,
+  type AnalyticsTrackOptions,
+  OPERATOR_OWNED_ANALYTICS_CONTEXT_KEYS,
+} from './types.js';
+
+function mergeAnalyticsConfig(config?: AgorAnalyticsSettings): AgorAnalyticsSettings {
+  const defaults = getDefaultAnalyticsConfig();
+  if (!config) return defaults;
+
+  return {
+    ...defaults,
+    ...config,
+    client: {
+      ...defaults.client,
+      ...config.client,
+    },
+    filters: {
+      ...defaults.filters,
+      ...config.filters,
+    },
+    plugins: config.plugins ?? defaults.plugins,
+  };
+}
+
+export function resolveAnalyticsConfig(
+  config: AgorConfig | AgorAnalyticsSettings
+): AgorAnalyticsSettings {
+  if ('analytics' in config) {
+    return mergeAnalyticsConfig(config.analytics);
+  }
+  return mergeAnalyticsConfig(config as AgorAnalyticsSettings);
+}
+
+export class NoopAnalyticsLogger implements AnalyticsLogger {
+  isEnabled(): boolean {
+    return false;
+  }
+
+  track(_event: string, _properties?: AnalyticsProperties, _options?: AnalyticsTrackOptions): void {
+    // Intentionally empty: analytics is off by default and must be safe to call unconditionally.
+  }
+}
+
+export class AnalyticsPackageLogger implements AnalyticsLogger {
+  private readonly client: AnalyticsInstance;
+  private readonly excludeEvents: readonly string[];
+  private readonly deploymentId: string | undefined;
+
+  constructor(
+    client: AnalyticsInstance,
+    excludeEvents: readonly string[] = [],
+    deploymentId?: string
+  ) {
+    this.client = client;
+    this.excludeEvents = excludeEvents;
+    this.deploymentId = deploymentId;
+  }
+
+  isEnabled(): boolean {
+    return true;
+  }
+
+  track(
+    event: string,
+    properties: AnalyticsProperties = {},
+    options: AnalyticsTrackOptions = {}
+  ): void {
+    if (isAnalyticsEventExcluded(event, this.excludeEvents)) return;
+
+    const trackOptions: Record<string, unknown> = {};
+    const tenantId = getCurrentTenantId();
+    if (options.context || tenantId || this.deploymentId) {
+      // Strip reserved and poison keys before the analytics package can merge options.
+      const callerContext = Object.fromEntries(
+        Object.entries(options.context ?? {}).filter(
+          ([key]) =>
+            isSafeAnalyticsKey(key) &&
+            key !== 'tenant_id' &&
+            key !== 'deployment_id' &&
+            !OPERATOR_OWNED_ANALYTICS_CONTEXT_KEYS.includes(key)
+        )
+      );
+      trackOptions.context = {
+        ...callerContext,
+        ...(tenantId ? { tenant_id: tenantId } : {}),
+        ...(this.deploymentId ? { deployment_id: this.deploymentId } : {}),
+      };
+    }
+    if (options.userId) trackOptions.userId = options.userId;
+    if (options.anonymousId) trackOptions.anonymousId = options.anonymousId;
+
+    try {
+      void this.client.track(event, properties, trackOptions).catch((error: unknown) => {
+        console.warn(
+          `[analytics] track failed for "${event}":`,
+          error instanceof Error ? error.message : String(error)
+        );
+      });
+    } catch (error) {
+      console.warn(
+        `[analytics] track failed for "${event}":`,
+        error instanceof Error ? error.message : String(error)
+      );
+    }
+  }
+}
+
+export async function createAnalyticsLogger(
+  config: AgorConfig | AgorAnalyticsSettings
+): Promise<AnalyticsLogger> {
+  const resolved = resolveAnalyticsConfig(config);
+  if (resolved.enabled !== true) return new NoopAnalyticsLogger();
+
+  // Deployment identity is process configuration, never caller context.
+  // Snapshot before plugin initialization yields, just like operator metadata.
+  const deploymentId = 'daemon' in config ? config.daemon?.deployment_id : undefined;
+  const plugins = await resolveAnalyticsPlugins(resolved);
+  const client = Analytics({
+    ...(resolved.client ?? {}),
+    plugins,
+  });
+
+  // Tenant identity is captured synchronously at track time,
+  // before the analytics package or HTTP transport can queue the event.
+  return new AnalyticsPackageLogger(client, resolved.filters?.exclude_events ?? [], deploymentId);
+}
+
+let globalAnalyticsLogger: AnalyticsLogger = new NoopAnalyticsLogger();
+
+export async function configureAnalyticsLogger(
+  config: AgorConfig | AgorAnalyticsSettings
+): Promise<AnalyticsLogger> {
+  try {
+    globalAnalyticsLogger = await createAnalyticsLogger(config);
+  } catch (error) {
+    console.warn(
+      '[analytics] failed to configure analytics; continuing with analytics disabled:',
+      error instanceof Error ? error.message : String(error)
+    );
+    globalAnalyticsLogger = new NoopAnalyticsLogger();
+  }
+  return globalAnalyticsLogger;
+}
+
+export function setAnalyticsLoggerForTests(logger: AnalyticsLogger): void {
+  globalAnalyticsLogger = logger;
+}
+
+export function resetAnalyticsLoggerForTests(): void {
+  globalAnalyticsLogger = new NoopAnalyticsLogger();
+}
+
+export const analyticsLogger: AnalyticsLogger = {
+  isEnabled: () => globalAnalyticsLogger.isEnabled(),
+  track: (event, properties, options) => globalAnalyticsLogger.track(event, properties, options),
+};

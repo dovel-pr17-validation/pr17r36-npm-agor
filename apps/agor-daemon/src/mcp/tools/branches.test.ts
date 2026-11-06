@@ -1,0 +1,2944 @@
+import { getBranchPath } from '@agor/core/config';
+import { BranchRepository, CapabilityPolicyRepository } from '@agor/core/db';
+import { Forbidden, feathers } from '@agor/core/feathers';
+import type { Branch, BranchPermissionLevel } from '@agor/core/types';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport, McpServer, type ServerContext } from '@modelcontextprotocol/server';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { DrizzleService, type Repository } from '../../adapters/drizzle.js';
+import { loadBranch } from '../../utils/branch-authorization.js';
+import {
+  type McpPromptProvenanceStamp,
+  resolvePromptProvenance,
+} from '../../utils/prompt-provenance.js';
+import { requestExecutor } from '../../utils/spawn-executor.js';
+import { registerBranchTools } from './branches.js';
+
+vi.mock('../../utils/executor-delegated-home.js', () => ({
+  resolveDelegatedExecutionHomeKey: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock('../../utils/spawn-executor.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../utils/spawn-executor.js')>();
+  return {
+    ...actual,
+    requestExecutor: vi.fn(async (payload: { params?: { branchIds?: string[] } }) => ({
+      success: true,
+      data: {
+        statuses: (payload.params?.branchIds ?? []).map((branchId) => ({
+          branchId,
+          exists: !branchId.startsWith('missing-'),
+        })),
+      },
+    })),
+  };
+});
+
+type ToolHandler = (
+  args: Record<string, unknown>,
+  requestContext?: ServerContext
+) => Promise<{
+  content: Array<{ type: string; text: string }>;
+  isError?: boolean;
+}>;
+
+type ToolConfig = {
+  description?: string;
+  inputSchema?: {
+    safeParse: (
+      value: unknown
+    ) =>
+      | { success: true; data: unknown }
+      | { success: false; error: { issues: Array<{ message: string }> } };
+  };
+};
+
+function requestContext(signal = new AbortController().signal): ServerContext {
+  return { mcpReq: { signal } } as ServerContext;
+}
+
+function registerAndCaptureHandler(
+  toolName: string,
+  ctx: {
+    app: unknown;
+    userId: string;
+    sessionId?: string;
+    baseServiceParams?: Record<string, unknown>;
+    authenticatedUser?: {
+      user_id: string;
+      role: string;
+      email?: string;
+      _isServiceAccount?: boolean;
+    };
+  }
+): ToolHandler {
+  let handler: ToolHandler | undefined;
+  const fakeServer = {
+    registerTool: (name: string, _cfg: unknown, cb: ToolHandler) => {
+      if (name === toolName) handler = cb;
+    },
+  } as unknown as McpServer;
+
+  registerBranchTools(fakeServer, {
+    app: ctx.app as Parameters<typeof registerBranchTools>[1]['app'],
+    // A `.run` marker makes runWithMcpTenantDatabaseScope treat this as the
+    // SQLite-like handle (identity scope, no native transaction to fake) when a
+    // tenant is present in baseServiceParams.
+    db: { run: () => undefined } as unknown as Parameters<typeof registerBranchTools>[1]['db'],
+    userId: ctx.userId as Parameters<typeof registerBranchTools>[1]['userId'],
+    sessionId: ctx.sessionId as Parameters<typeof registerBranchTools>[1]['sessionId'],
+    authenticatedUser: (ctx.authenticatedUser ?? {
+      user_id: ctx.userId,
+      email: 'user@example.test',
+      role: 'member',
+    }) as Parameters<typeof registerBranchTools>[1]['authenticatedUser'],
+    baseServiceParams: (ctx.baseServiceParams ?? {}) as Parameters<
+      typeof registerBranchTools
+    >[1]['baseServiceParams'],
+  });
+
+  if (!handler) throw new Error(`${toolName} was not registered`);
+  return handler;
+}
+
+function registerAndCaptureConfig(
+  toolName: string,
+  ctx: {
+    app: unknown;
+    userId: string;
+    sessionId?: string;
+    baseServiceParams?: Record<string, unknown>;
+    authenticatedUser?: {
+      user_id: string;
+      role: string;
+      email?: string;
+      _isServiceAccount?: boolean;
+    };
+  }
+): ToolConfig {
+  let config: ToolConfig | undefined;
+  const fakeServer = {
+    registerTool: (name: string, cfg: ToolConfig, _cb: ToolHandler) => {
+      if (name === toolName) config = cfg;
+    },
+  } as unknown as McpServer;
+
+  registerBranchTools(fakeServer, {
+    app: ctx.app as Parameters<typeof registerBranchTools>[1]['app'],
+    // A `.run` marker makes runWithMcpTenantDatabaseScope treat this as the
+    // SQLite-like handle (identity scope, no native transaction to fake) when a
+    // tenant is present in baseServiceParams.
+    db: { run: () => undefined } as unknown as Parameters<typeof registerBranchTools>[1]['db'],
+    userId: ctx.userId as Parameters<typeof registerBranchTools>[1]['userId'],
+    sessionId: ctx.sessionId as Parameters<typeof registerBranchTools>[1]['sessionId'],
+    authenticatedUser: (ctx.authenticatedUser ?? {
+      user_id: ctx.userId,
+      email: 'user@example.test',
+      role: 'member',
+    }) as Parameters<typeof registerBranchTools>[1]['authenticatedUser'],
+    baseServiceParams: (ctx.baseServiceParams ?? {}) as Parameters<
+      typeof registerBranchTools
+    >[1]['baseServiceParams'],
+  });
+
+  if (!config) throw new Error(`${toolName} was not registered`);
+  return config;
+}
+
+function registerAndCaptureUpdate(ctx: {
+  app: unknown;
+  userId: string;
+  sessionId?: string;
+  baseServiceParams?: Record<string, unknown>;
+}): ToolHandler {
+  return registerAndCaptureHandler('agor_branches_update', ctx);
+}
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.useRealTimers();
+});
+
+describe('agor_branches_wait_for_ready', () => {
+  const makeBranch = (filesystemStatus: string, overrides: Record<string, unknown> = {}) => ({
+    branch_id: '01900000-0000-7000-8000-000000000001',
+    filesystem_status: filesystemStatus,
+    archived: false,
+    path: '/worktrees/feature',
+    start_command: 'pnpm dev',
+    board_id: 'board-1',
+    ...overrides,
+  });
+
+  it('returns the refreshed authoritative branch on the already-ready fast path', async () => {
+    const baseServiceParams = {
+      authenticated: true,
+      provider: 'mcp',
+      user: { user_id: 'user-1', role: 'member' },
+      tenant: { tenant_id: 'tenant-1' },
+    };
+    const ready = makeBranch('ready');
+    const get = vi.fn(async () => ready);
+    const app = {
+      service(name: string) {
+        if (name === 'branches') return { get };
+        throw new Error(`Unexpected service call: ${name}`);
+      },
+    };
+    const waitForReady = registerAndCaptureHandler('agor_branches_wait_for_ready', {
+      app,
+      userId: 'user-1',
+      baseServiceParams,
+    });
+
+    const result = await waitForReady({ branchId: '01900000' }, requestContext());
+    const payload = JSON.parse(result.content[0].text);
+
+    expect(result.isError).toBeUndefined();
+    expect(payload).toMatchObject({
+      branch: ready,
+      _readiness: { outcome: 'ready', poll_interval_ms: 1_000 },
+    });
+    expect(get).toHaveBeenCalledWith('01900000', baseServiceParams);
+  });
+
+  it('uses fresh authorized service reads until a creating branch is ready', async () => {
+    vi.useFakeTimers();
+    const creating = makeBranch('creating');
+    const ready = makeBranch('ready', { path: '/worktrees/feature-ready' });
+    const get = vi.fn().mockResolvedValueOnce(creating).mockResolvedValueOnce(ready);
+    const baseServiceParams = { provider: 'mcp', tenant: { tenant_id: 'tenant-1' } };
+    const app = {
+      service(name: string) {
+        if (name === 'branches') return { get };
+        throw new Error(`Unexpected service call: ${name}`);
+      },
+    };
+    const waitForReady = registerAndCaptureHandler('agor_branches_wait_for_ready', {
+      app,
+      userId: 'user-1',
+      baseServiceParams,
+    });
+
+    const waiting = waitForReady({ branchId: '01900000' }, requestContext());
+    await vi.advanceTimersByTimeAsync(1_000);
+    const result = await waiting;
+    const payload = JSON.parse(result.content[0].text);
+
+    expect(payload.branch).toEqual(ready);
+    expect(get.mock.calls).toEqual([
+      ['01900000', baseServiceParams],
+      ['01900000-0000-7000-8000-000000000001', baseServiceParams],
+    ]);
+    expect(get.mock.calls[0][1]).not.toBe(baseServiceParams);
+    expect(get.mock.calls[1][1]).not.toBe(get.mock.calls[0][1]);
+  });
+
+  it('uses pristine params so real Feathers RBAC hooks cannot pin the first branch row', async () => {
+    vi.useFakeTimers();
+    const creating = makeBranch('creating') as unknown as Branch;
+    const ready = makeBranch('ready', { path: '/worktrees/feature-ready' }) as unknown as Branch;
+    const findById = vi.fn().mockResolvedValueOnce(creating).mockResolvedValueOnce(ready);
+    const repository = {
+      findById,
+      findAll: vi.fn(),
+      create: vi.fn(),
+      update: vi.fn(),
+      delete: vi.fn(),
+      isOwner: vi.fn(async () => false),
+      resolveUserPermission: vi.fn(async () => 'view' as BranchPermissionLevel),
+    } as unknown as Repository<Branch> & {
+      isOwner: (branchId: string, userId: string) => Promise<boolean>;
+      resolveUserPermission: (branch: Branch, userId: string) => Promise<BranchPermissionLevel>;
+    };
+    const app = feathers();
+    app.use(
+      'branches',
+      new DrizzleService<Branch>(repository, { id: 'branch_id', resourceType: 'Branch' })
+    );
+    app.service('branches').hooks({
+      before: { get: [loadBranch(repository as never)] },
+    });
+
+    // Optional current-Session authorization can already have populated these
+    // request-scoped hook caches before the tool starts. A shallow clone would
+    // carry the stale row into every observation.
+    const poisonedBaseParams = {
+      provider: 'mcp',
+      user: { user_id: 'user-1', email: 'user@example.test', role: 'member' },
+      branch: creating,
+      _agorPrefetchedRecord: {
+        id: creating.branch_id,
+        idField: 'branch_id',
+        record: creating,
+      },
+      _agorRbacCache: {
+        sessions: new Map(),
+        branches: new Map([[creating.branch_id, creating]]),
+        branchAccess: new Map(),
+      },
+    };
+    const waitForReady = registerAndCaptureHandler('agor_branches_wait_for_ready', {
+      app,
+      userId: 'user-1',
+      baseServiceParams: poisonedBaseParams,
+    });
+
+    const waiting = waitForReady({ branchId: '01900000' }, requestContext());
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(1_000);
+    const result = await waiting;
+    const payload = JSON.parse(result.content[0].text);
+
+    expect(payload.branch).toEqual(ready);
+    expect(findById).toHaveBeenCalledTimes(2);
+  });
+
+  it('returns a retryable structured timeout while preserving the creating branch', async () => {
+    vi.useFakeTimers();
+    const creating = makeBranch('creating');
+    const get = vi.fn(async () => creating);
+    const app = {
+      service(name: string) {
+        if (name === 'branches') return { get };
+        throw new Error(`Unexpected service call: ${name}`);
+      },
+    };
+    const waitForReady = registerAndCaptureHandler('agor_branches_wait_for_ready', {
+      app,
+      userId: 'user-1',
+    });
+
+    const waiting = waitForReady(
+      { branchId: creating.branch_id, waitTimeoutMs: 1_000 },
+      requestContext()
+    );
+    await vi.advanceTimersByTimeAsync(1_000);
+    const result = await waiting;
+    const payload = JSON.parse(result.content[0].text);
+
+    expect(result.isError).toBeUndefined();
+    expect(payload).toMatchObject({
+      branch: creating,
+      _readiness: {
+        outcome: 'timeout',
+        timeout_ms: 1_000,
+        poll: {
+          tool: 'agor_branches_wait_for_ready',
+          arguments: { branchId: creating.branch_id },
+        },
+      },
+    });
+  });
+
+  it('stops polling when the MCP request is cancelled', async () => {
+    vi.useFakeTimers();
+    const controller = new AbortController();
+    const creating = makeBranch('creating');
+    const get = vi.fn(async () => creating);
+    const app = {
+      service(name: string) {
+        if (name === 'branches') return { get };
+        throw new Error(`Unexpected service call: ${name}`);
+      },
+    };
+    const waitForReady = registerAndCaptureHandler('agor_branches_wait_for_ready', {
+      app,
+      userId: 'user-1',
+    });
+
+    const waiting = waitForReady(
+      { branchId: creating.branch_id },
+      requestContext(controller.signal)
+    );
+    await vi.advanceTimersByTimeAsync(0);
+    controller.abort(new Error('client disconnected'));
+
+    await expect(waiting).rejects.toThrow('client disconnected');
+    expect(get).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('returns the persisted safe failure as a structured terminal error', async () => {
+    const failed = makeBranch('failed', { error_message: 'clone authentication failed' });
+    const app = {
+      service(name: string) {
+        if (name === 'branches') return { get: vi.fn(async () => failed) };
+        throw new Error(`Unexpected service call: ${name}`);
+      },
+    };
+    const waitForReady = registerAndCaptureHandler('agor_branches_wait_for_ready', {
+      app,
+      userId: 'user-1',
+    });
+
+    const result = await waitForReady({ branchId: failed.branch_id }, requestContext());
+    const payload = JSON.parse(result.content[0].text);
+
+    expect(result.isError).toBe(true);
+    expect(payload).toMatchObject({
+      branch: failed,
+      _readiness: { outcome: 'failed', message: 'clone authentication failed' },
+    });
+  });
+
+  it('enforces bounded MCP timeout inputs in the tool schema', () => {
+    const config = registerAndCaptureConfig('agor_branches_wait_for_ready', {
+      app: {},
+      userId: 'user-1',
+    });
+
+    expect(
+      config.inputSchema?.safeParse({ branchId: 'branch-1', waitTimeoutMs: 1_000 }).success
+    ).toBe(true);
+    expect(
+      config.inputSchema?.safeParse({ branchId: 'branch-1', waitTimeoutMs: 999 }).success
+    ).toBe(false);
+    expect(
+      config.inputSchema?.safeParse({ branchId: 'branch-1', waitTimeoutMs: 300_001 }).success
+    ).toBe(false);
+  });
+});
+
+describe('agor_branches_delete authorization boundary', () => {
+  it('uses the hooked route so a view-only rejection happens before destructive work', async () => {
+    const branchId = '01900000-0000-7000-8000-000000000001';
+    const baseServiceParams = {
+      authenticated: true,
+      provider: 'mcp',
+      user: { user_id: 'view-only', role: 'member' },
+    };
+    const directArchiveOrDelete = vi.fn();
+    const routeCreate = vi.fn(async () => {
+      throw new Forbidden("You need 'all' permission to archive or delete branches");
+    });
+    const generateToken = vi.fn();
+    const app = {
+      sessionTokenService: { generateToken },
+      get: () => ({ execution: { allow_superadmin: false } }),
+      service(name: string) {
+        if (name === 'branches') {
+          return {
+            get: vi.fn(async () => ({ branch_id: branchId })),
+            archiveOrDelete: directArchiveOrDelete,
+          };
+        }
+        if (name === '/branches/:id/archive-or-delete') return { create: routeCreate };
+        throw new Error(`Unexpected service call: ${name}`);
+      },
+    };
+    const deleteBranch = registerAndCaptureHandler('agor_branches_delete', {
+      app,
+      userId: 'view-only',
+      baseServiceParams,
+    });
+
+    await expect(deleteBranch({ branchId, filesystemAction: 'deleted' })).rejects.toBeInstanceOf(
+      Forbidden
+    );
+
+    expect(routeCreate).toHaveBeenCalledWith(
+      { metadataAction: 'delete', filesystemAction: 'deleted' },
+      { ...baseServiceParams, route: { id: branchId } }
+    );
+    expect(directArchiveOrDelete).not.toHaveBeenCalled();
+    expect(generateToken).not.toHaveBeenCalled();
+  });
+});
+
+describe('agor_branches_release_deletion authorization boundary', () => {
+  it('goes through the administrator-gated route and never the service directly', async () => {
+    const branchId = '01900000-0000-7000-8000-000000000001';
+    const baseServiceParams = {
+      authenticated: true,
+      provider: 'mcp',
+      user: { user_id: 'member', role: 'member' },
+    };
+    const directRelease = vi.fn();
+    const routeCreate = vi.fn(async () => {
+      throw new Forbidden('Administrator role required to release fenced branch deletions');
+    });
+    const app = {
+      get: () => ({ execution: { allow_superadmin: false } }),
+      service(name: string) {
+        if (name === 'branches')
+          return {
+            get: vi.fn(async () => ({ branch_id: branchId })),
+            forceReleaseDeletion: directRelease,
+          };
+        if (name === '/branches/:id/release-deletion') return { create: routeCreate };
+        throw new Error(`Unexpected service call: ${name}`);
+      },
+    };
+    const release = registerAndCaptureHandler('agor_branches_release_deletion', {
+      app,
+      userId: 'member',
+      baseServiceParams,
+    });
+
+    await expect(release({ branchId })).rejects.toBeInstanceOf(Forbidden);
+    expect(routeCreate).toHaveBeenCalledWith({}, { ...baseServiceParams, route: { id: branchId } });
+    expect(directRelease).not.toHaveBeenCalled();
+  });
+});
+
+describe('agor_branches_update', () => {
+  it('replaces an explicit normalized override package', async () => {
+    const permissions = {
+      primary_owner_user_id: '00000000-0000-7000-8000-000000000001',
+      revision: 1,
+      binding_mode: 'override',
+      override_config: {
+        access: {
+          schema_version: 1,
+          policy_kind: 'branch_access',
+          sharing_mode: 'private',
+          entries: [],
+          others: { preset: 'none', capabilities: [], fs_access: 'none' },
+        },
+        allow_shared_session_prompts: false,
+      },
+    };
+    const permissionsPatch = vi.fn(async (_id, data) => data);
+    const app = {
+      get: () => ({ execution: { allow_superadmin: false } }),
+      service(name: string) {
+        if (name === 'branches/:id/permissions') return { patch: permissionsPatch };
+        throw new Error(`Unexpected service call: ${name}`);
+      },
+    };
+    const update = registerAndCaptureHandler('agor_branches_permissions_update', {
+      app,
+      userId: 'user-1',
+    });
+
+    await update({ branchId: 'branch-1', permissions });
+
+    expect(permissionsPatch).toHaveBeenCalledWith(null, permissions, {
+      route: { id: 'branch-1' },
+    });
+  });
+
+  it('uses authenticated service params when falling back to the current session branch', async () => {
+    const baseServiceParams = {
+      authenticated: true,
+      provider: 'mcp',
+      user: { user_id: 'user-1', role: 'member' },
+    };
+    const sessionsGet = vi.fn(async () => ({ session_id: 'session-1', branch_id: 'branch-1' }));
+    const branchesPatch = vi.fn(async () => ({ branch_id: 'branch-1', notes: 'updated' }));
+    const app = {
+      get: () => ({ execution: { allow_superadmin: false } }),
+      service(name: string) {
+        if (name === 'sessions') return { get: sessionsGet };
+        if (name === 'branches') return { patch: branchesPatch };
+        throw new Error(`Unexpected service call: ${name}`);
+      },
+    };
+
+    const update = registerAndCaptureUpdate({
+      app,
+      userId: 'user-1',
+      sessionId: 'session-1',
+      baseServiceParams,
+    });
+
+    await update({ notes: 'updated' });
+
+    expect(sessionsGet).toHaveBeenCalledWith('session-1', baseServiceParams);
+    expect(branchesPatch).toHaveBeenCalledWith('branch-1', { notes: 'updated' }, baseServiceParams);
+  });
+
+  it('clears branch attention state through branch metadata updates', async () => {
+    const branchesGet = vi.fn(async () => ({ branch_id: 'branch-1' }));
+    const branchesPatch = vi.fn(async () => ({
+      branch_id: 'branch-1',
+      needs_attention: false,
+    }));
+    const app = {
+      get: () => ({}),
+      service(name: string) {
+        if (name === 'branches') return { get: branchesGet, patch: branchesPatch };
+        throw new Error(`Unexpected service call: ${name}`);
+      },
+    };
+
+    const update = registerAndCaptureUpdate({ app, userId: 'user-1' });
+
+    await update({ branchId: 'branch-1', needsAttention: false });
+
+    expect(branchesGet).toHaveBeenCalledWith('branch-1', {});
+    expect(branchesPatch).toHaveBeenCalledWith('branch-1', { needs_attention: false }, {});
+  });
+
+  it('marks branch attention state through branch metadata updates', async () => {
+    const branchesGet = vi.fn(async () => ({ branch_id: 'branch-1' }));
+    const branchesPatch = vi.fn(async () => ({
+      branch_id: 'branch-1',
+      needs_attention: true,
+    }));
+    const app = {
+      get: () => ({}),
+      service(name: string) {
+        if (name === 'branches') return { get: branchesGet, patch: branchesPatch };
+        throw new Error(`Unexpected service call: ${name}`);
+      },
+    };
+
+    const update = registerAndCaptureUpdate({ app, userId: 'user-1' });
+
+    await update({ branchId: 'branch-1', needsAttention: true });
+
+    expect(branchesGet).toHaveBeenCalledWith('branch-1', {});
+    expect(branchesPatch).toHaveBeenCalledWith('branch-1', { needs_attention: true }, {});
+  });
+
+  it('returns an actionable error when branchId is omitted without session context', async () => {
+    const sessionsGet = vi.fn();
+    const app = {
+      get: () => ({}),
+      service(name: string) {
+        if (name === 'sessions') return { get: sessionsGet };
+        throw new Error(`Unexpected service call: ${name}`);
+      },
+    };
+
+    const update = registerAndCaptureUpdate({ app, userId: 'user-1' });
+    const result = await update({ notes: 'updated' });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(result.isError).toBe(true);
+    expect(parsed.error).toMatch(/requires current Agor session context/i);
+    expect(parsed.error).toMatch(/X-Agor-Session-Id/);
+    expect(sessionsGet).not.toHaveBeenCalled();
+  });
+});
+
+describe('agor_branches_create', () => {
+  function waitFixture(options: {
+    name: string;
+    initial?: Record<string, unknown>;
+    observed?: Record<string, unknown>;
+  }) {
+    const branchId = '01900000-0000-7000-8000-000000000001';
+    const creating = {
+      branch_id: branchId,
+      name: options.name,
+      board_id: 'board-1',
+      filesystem_status: 'creating',
+      ...options.initial,
+    };
+    const observed = {
+      ...creating,
+      base_ref: 'main',
+      base_sha: 'a'.repeat(40),
+      ...options.observed,
+    };
+    const createBranch = vi.fn(async () => creating);
+    const branchesGet = vi.fn(async () => observed);
+    const app = {
+      get: () => ({}),
+      service(name: string) {
+        if (name === 'repos') {
+          return {
+            get: vi.fn(async () => ({ repo_id: 'repo-1', default_branch: 'main' })),
+            createBranch,
+          };
+        }
+        if (name === 'boards') return { get: vi.fn(async () => ({ board_id: 'board-1' })) };
+        if (name === 'branches') return { get: branchesGet };
+        throw new Error(`Unexpected service call: ${name}`);
+      },
+    };
+    return { app, branchId, creating, observed, createBranch, branchesGet };
+  }
+
+  it('rejects waitTimeoutMs unless waitForReady is enabled', async () => {
+    const create = registerAndCaptureHandler('agor_branches_create', {
+      app: {},
+      userId: 'user-1',
+    });
+
+    await expect(
+      create({
+        repoId: 'repo-1',
+        branchName: 'feature',
+        boardId: 'board-1',
+        waitTimeoutMs: 1_000,
+      })
+    ).rejects.toThrow('waitTimeoutMs requires waitForReady=true');
+  });
+
+  it('passes acting MCP user params through to branch creation so ownership resolves to the prompter', async () => {
+    const baseServiceParams = {
+      authenticated: true,
+      provider: 'mcp',
+      user: { user_id: 'user-b', role: 'member' },
+    };
+    const createBranch = vi.fn(async (_repoId: string, data: unknown, params: unknown) => {
+      expect(params).toBe(baseServiceParams);
+      return {
+        branch_id: 'branch-new',
+        created_by: 'user-b',
+        ...(data as Record<string, unknown>),
+        base_ref: (data as { sourceBranch?: string }).sourceBranch ?? 'main',
+        base_sha: 'a'.repeat(40),
+      };
+    });
+    const reposGet = vi.fn(async (_repoId: string) => ({
+      repo_id: 'repo-1',
+      default_branch: 'main',
+    }));
+    const app = {
+      get: () => ({}),
+      service(name: string) {
+        if (name === 'repos') return { get: reposGet, createBranch };
+        if (name === 'boards') return { get: vi.fn(async () => ({ board_id: 'board-1' })) };
+        throw new Error(`Unexpected service call: ${name}`);
+      },
+    };
+
+    const create = registerAndCaptureHandler('agor_branches_create', {
+      app,
+      userId: 'user-b',
+      sessionId: 'sess-owned-by-a',
+      baseServiceParams,
+    });
+
+    const result = await create({
+      repoId: 'repo-1',
+      branchName: 'user-b-feature',
+      boardId: 'board-1',
+      autoSuffix: false,
+    });
+    const payload = JSON.parse(result.content[0].text);
+
+    expect(createBranch).toHaveBeenCalledWith(
+      'repo-1',
+      expect.objectContaining({ name: 'user-b-feature', boardId: 'board-1' }),
+      baseServiceParams
+    );
+    expect(payload).toMatchObject({
+      base_ref: 'main',
+      base_sha: 'a'.repeat(40),
+      _resolution: {
+        outcome: 'resolved',
+        requested_ref: 'main',
+        resolved_ref: 'main',
+        resolved_sha: 'a'.repeat(40),
+      },
+    });
+  });
+
+  it('optionally waits and returns the authoritative ready branch in the existing flat response', async () => {
+    const baseServiceParams = {
+      authenticated: true,
+      provider: 'mcp',
+      tenant: { tenant_id: 'tenant-1' },
+    };
+    const {
+      app,
+      branchId,
+      observed: ready,
+      branchesGet,
+    } = waitFixture({
+      name: 'waited-feature',
+      observed: {
+        filesystem_status: 'ready',
+        path: '/worktrees/waited-feature',
+        start_command: 'pnpm dev',
+      },
+    });
+    const create = registerAndCaptureHandler('agor_branches_create', {
+      app,
+      userId: 'user-1',
+      baseServiceParams,
+    });
+
+    const result = await create(
+      {
+        repoId: 'repo-1',
+        branchName: 'waited-feature',
+        boardId: 'board-1',
+        autoSuffix: false,
+        waitForReady: true,
+      },
+      requestContext()
+    );
+    const payload = JSON.parse(result.content[0].text);
+
+    expect(result.isError).toBeUndefined();
+    expect(payload).toMatchObject({
+      ...ready,
+      _readiness: {
+        outcome: 'ready',
+        timeout_ms: 45_000,
+        poll_interval_ms: 1_000,
+      },
+    });
+    expect(payload).not.toHaveProperty('branch');
+    expect(branchesGet).toHaveBeenCalledWith(branchId, baseServiceParams);
+  });
+
+  it('returns a retryable timeout without undoing an opt-in creation', async () => {
+    vi.useFakeTimers();
+    const { app, branchId, creating, createBranch, branchesGet } = waitFixture({
+      name: 'slow-clone',
+      initial: { storage_mode: 'clone' },
+    });
+    const create = registerAndCaptureHandler('agor_branches_create', {
+      app,
+      userId: 'user-1',
+    });
+
+    const waiting = create(
+      {
+        repoId: 'repo-1',
+        branchName: 'slow-clone',
+        boardId: 'board-1',
+        autoSuffix: false,
+        storage_mode: 'clone',
+        waitForReady: true,
+        waitTimeoutMs: 1_000,
+      },
+      requestContext()
+    );
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(100);
+    await vi.advanceTimersByTimeAsync(1_000);
+    const result = await waiting;
+    const payload = JSON.parse(result.content[0].text);
+
+    expect(result.isError).toBeUndefined();
+    expect(payload).toMatchObject({
+      ...creating,
+      _readiness: {
+        outcome: 'timeout',
+        timeout_ms: 1_000,
+        poll: {
+          tool: 'agor_branches_wait_for_ready',
+          arguments: { branchId },
+        },
+      },
+    });
+    expect(createBranch).toHaveBeenCalledOnce();
+    expect(branchesGet).toHaveBeenCalledTimes(3);
+    expect(branchesGet.mock.calls[1][1]).not.toBe(branchesGet.mock.calls[0][1]);
+    expect(branchesGet.mock.calls[2][1]).not.toBe(branchesGet.mock.calls[1][1]);
+  });
+
+  it('returns a persisted materialization failure without losing creation metadata', async () => {
+    const { app, observed: failed } = waitFixture({
+      name: 'failed-clone',
+      observed: {
+        filesystem_status: 'failed',
+        error_message: 'clone authentication failed',
+      },
+    });
+    const create = registerAndCaptureHandler('agor_branches_create', {
+      app,
+      userId: 'user-1',
+    });
+
+    const result = await create(
+      {
+        repoId: 'repo-1',
+        branchName: 'failed-clone',
+        boardId: 'board-1',
+        autoSuffix: false,
+        waitForReady: true,
+      },
+      requestContext()
+    );
+    const payload = JSON.parse(result.content[0].text);
+
+    expect(result.isError).toBe(true);
+    expect(payload).toMatchObject({
+      ...failed,
+      _readiness: { outcome: 'failed', message: 'clone authentication failed' },
+    });
+  });
+
+  it('returns parseable created JSON over tools/call when the readiness read fails after creation', async () => {
+    const { app, branchId, creating, observed, createBranch, branchesGet } = waitFixture({
+      name: 'flaky-read',
+    });
+    branchesGet
+      .mockResolvedValueOnce(observed)
+      .mockRejectedValueOnce(new Error('Connection terminated unexpectedly'));
+    const server = new McpServer({ name: 'branches-create-test', version: '1.0.0' });
+    registerBranchTools(server, {
+      app: app as unknown as Parameters<typeof registerBranchTools>[1]['app'],
+      db: { run: () => undefined } as unknown as Parameters<typeof registerBranchTools>[1]['db'],
+      userId: 'user-1' as Parameters<typeof registerBranchTools>[1]['userId'],
+      authenticatedUser: {
+        user_id: 'user-1',
+        email: 'user@example.test',
+        role: 'member',
+      } as Parameters<typeof registerBranchTools>[1]['authenticatedUser'],
+      baseServiceParams: {},
+    } as Parameters<typeof registerBranchTools>[1]);
+    const client = new Client({ name: 'branches-create-client', version: '1.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+    let result: { content: Array<{ type: string; text: string }>; isError?: boolean };
+    try {
+      result = (await client.callTool({
+        name: 'agor_branches_create',
+        arguments: {
+          repoId: 'repo-1',
+          branchName: 'flaky-read',
+          boardId: 'board-1',
+          autoSuffix: false,
+          waitForReady: true,
+        },
+      })) as typeof result;
+    } finally {
+      await client.close();
+      await server.close();
+    }
+
+    expect(createBranch).toHaveBeenCalledOnce();
+    const payload = JSON.parse(result.content[0].text);
+    expect(result.isError).toBeFalsy();
+    expect(payload).toMatchObject({
+      ...creating,
+      _create: { outcome: 'created', branch_id: branchId, retry_safe: false },
+      _resolution: { outcome: 'resolved' },
+      _readiness: {
+        outcome: 'unknown',
+        reason: 'read_failed',
+        poll: { tool: 'agor_branches_wait_for_ready', arguments: { branchId } },
+      },
+    });
+  });
+
+  it('reports created with unknown resolution and readiness when the first read after creation fails', async () => {
+    const { app, branchId, createBranch, branchesGet } = waitFixture({ name: 'no-read' });
+    branchesGet.mockRejectedValue(new Error('statement timeout'));
+    const create = registerAndCaptureHandler('agor_branches_create', { app, userId: 'user-1' });
+
+    const result = await create(
+      {
+        repoId: 'repo-1',
+        branchName: 'no-read',
+        boardId: 'board-1',
+        autoSuffix: false,
+        waitForReady: true,
+      },
+      requestContext()
+    );
+    const payload = JSON.parse(result.content[0].text);
+
+    expect(createBranch).toHaveBeenCalledOnce();
+    expect(result.isError).toBeUndefined();
+    expect(payload).toMatchObject({
+      branch_id: branchId,
+      _create: { outcome: 'created', branch_id: branchId, retry_safe: false },
+      _resolution: { outcome: 'unknown', reason: 'read_failed' },
+      _readiness: {
+        outcome: 'unknown',
+        poll: { tool: 'agor_branches_wait_for_ready', arguments: { branchId } },
+      },
+    });
+  });
+
+  it('returns a structured created result when the request is cancelled during the readiness wait', async () => {
+    vi.useFakeTimers();
+    const { app, branchId, createBranch } = waitFixture({ name: 'cancelled-wait' });
+    const create = registerAndCaptureHandler('agor_branches_create', { app, userId: 'user-1' });
+    const controller = new AbortController();
+
+    const waiting = create(
+      {
+        repoId: 'repo-1',
+        branchName: 'cancelled-wait',
+        boardId: 'board-1',
+        autoSuffix: false,
+        waitForReady: true,
+      },
+      requestContext(controller.signal)
+    );
+    await vi.advanceTimersByTimeAsync(100);
+    await vi.advanceTimersByTimeAsync(0);
+    controller.abort('Request cancelled by client');
+    const result = await waiting;
+    const payload = JSON.parse(result.content[0].text);
+
+    expect(createBranch).toHaveBeenCalledOnce();
+    expect(result.isError).toBeUndefined();
+    expect(payload).toMatchObject({
+      branch_id: branchId,
+      _create: { outcome: 'created', branch_id: branchId, retry_safe: false },
+      _readiness: { outcome: 'unknown', reason: 'cancelled' },
+    });
+  });
+
+  it('does not flag a still-creating branch as an error when ref resolution times out', async () => {
+    vi.useFakeTimers();
+    const { app, branchId, branchesGet } = waitFixture({
+      name: 'slow-resolve',
+      observed: { base_ref: undefined, base_sha: undefined },
+    });
+    const create = registerAndCaptureHandler('agor_branches_create', { app, userId: 'user-1' });
+
+    const waiting = create(
+      { repoId: 'repo-1', branchName: 'slow-resolve', boardId: 'board-1', autoSuffix: false },
+      requestContext()
+    );
+    await vi.advanceTimersByTimeAsync(45_100);
+    const result = await waiting;
+    const payload = JSON.parse(result.content[0].text);
+
+    expect(branchesGet).toHaveBeenCalled();
+    expect(result.isError).toBeUndefined();
+    expect(payload).toMatchObject({
+      branch_id: branchId,
+      _create: { outcome: 'created', branch_id: branchId, retry_safe: false },
+      _resolution: { outcome: 'timeout' },
+    });
+  });
+
+  it('flags a terminal ref-resolution failure as an error', async () => {
+    const { app, branchId } = waitFixture({
+      name: 'bad-ref',
+      initial: { filesystem_status: 'failed', error_message: 'ref not found' },
+    });
+    const create = registerAndCaptureHandler('agor_branches_create', { app, userId: 'user-1' });
+
+    const result = await create(
+      { repoId: 'repo-1', branchName: 'bad-ref', boardId: 'board-1', autoSuffix: false },
+      requestContext()
+    );
+
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0].text)).toMatchObject({
+      _create: { outcome: 'created', branch_id: branchId },
+      _resolution: { outcome: 'failed', message: 'ref not found' },
+    });
+  });
+
+  it('creates a one-shot teammate branch by writing teammate metadata into custom_context', async () => {
+    const baseServiceParams = {
+      authenticated: true,
+      provider: 'mcp',
+      user: { user_id: 'user-a', role: 'member' },
+    };
+    const createBranch = vi.fn(async (_repoId: string, data: unknown) => ({
+      branch_id: 'teammate-branch',
+      created_by: 'user-a',
+      ...(data as Record<string, unknown>),
+      base_ref: (data as { sourceBranch?: string }).sourceBranch ?? 'main',
+      base_sha: 'a'.repeat(40),
+    }));
+    const reposGet = vi.fn(async () => ({
+      repo_id: 'repo-1',
+      slug: 'siebel-crm',
+      default_branch: 'main',
+    }));
+    const app = {
+      get: () => ({}),
+      service(name: string) {
+        if (name === 'repos') return { get: reposGet, createBranch };
+        if (name === 'boards') return { get: vi.fn(async () => ({ board_id: 'board-1' })) };
+        throw new Error(`Unexpected service call: ${name}`);
+      },
+    };
+
+    const create = registerAndCaptureHandler('agor_branches_create', {
+      app,
+      userId: 'user-a',
+      baseServiceParams,
+    });
+
+    const result = await create({
+      repoId: 'repo-1',
+      branchName: 'siebel-crm',
+      boardId: 'board-1',
+      autoSuffix: false,
+      teammate: { displayName: 'Siebel CRM', emoji: '🤖' },
+    });
+
+    // The teammate metadata must land on the initial branch row so
+    // BranchesService.create can wire the board primary teammate pointer and
+    // provision the Knowledge namespace atomically (mirrors the UI create flow).
+    expect(createBranch).toHaveBeenCalledWith(
+      'repo-1',
+      expect.objectContaining({
+        name: 'siebel-crm',
+        boardId: 'board-1',
+        custom_context: {
+          teammate: {
+            kind: 'teammate',
+            displayName: 'Siebel CRM',
+            emoji: '🤖',
+            frameworkRepo: 'siebel-crm',
+            createdViaOnboarding: false,
+          },
+        },
+      }),
+      baseServiceParams
+    );
+
+    const payload = JSON.parse(result.content[0].text) as {
+      _teammate?: Record<string, unknown>;
+    };
+    expect(payload._teammate).toMatchObject({ created: true, display_name: 'Siebel CRM' });
+  });
+
+  it('does not set custom_context when no teammate metadata is provided', async () => {
+    const createBranch = vi.fn(async (_repoId: string, data: unknown) => ({
+      branch_id: 'plain-branch',
+      created_by: 'user-a',
+      ...(data as Record<string, unknown>),
+      base_ref: (data as { sourceBranch?: string }).sourceBranch ?? 'main',
+      base_sha: 'a'.repeat(40),
+    }));
+    const reposGet = vi.fn(async () => ({
+      repo_id: 'repo-1',
+      slug: 'repo-slug',
+      default_branch: 'main',
+    }));
+    const app = {
+      get: () => ({}),
+      service(name: string) {
+        if (name === 'repos') return { get: reposGet, createBranch };
+        if (name === 'boards') return { get: vi.fn(async () => ({ board_id: 'board-1' })) };
+        throw new Error(`Unexpected service call: ${name}`);
+      },
+    };
+
+    const create = registerAndCaptureHandler('agor_branches_create', {
+      app,
+      userId: 'user-a',
+      baseServiceParams: {},
+    });
+
+    await create({
+      repoId: 'repo-1',
+      branchName: 'plain',
+      boardId: 'board-1',
+      autoSuffix: false,
+    });
+
+    const passed = createBranch.mock.calls[0][1] as Record<string, unknown>;
+    expect(passed).not.toHaveProperty('custom_context');
+  });
+
+  it('leaves an omitted sourceBranch implicit so the executor resolves the remote default', async () => {
+    const createBranch = vi.fn(async (_repoId: string, data: unknown) => ({
+      branch_id: 'plain-branch',
+      created_by: 'user-a',
+      ...(data as Record<string, unknown>),
+      base_ref: 'master',
+      base_sha: 'a'.repeat(40),
+    }));
+    const app = {
+      get: () => ({}),
+      service(name: string) {
+        if (name === 'repos') {
+          return {
+            get: vi.fn(async () => ({ repo_id: 'repo-1', default_branch: 'master' })),
+            createBranch,
+          };
+        }
+        if (name === 'boards') return { get: vi.fn(async () => ({ board_id: 'board-1' })) };
+        throw new Error(`Unexpected service call: ${name}`);
+      },
+    };
+    const create = registerAndCaptureHandler('agor_branches_create', {
+      app,
+      userId: 'user-a',
+      baseServiceParams: {},
+    });
+
+    const implicit = await create({
+      repoId: 'repo-1',
+      branchName: 'plain',
+      boardId: 'board-1',
+      autoSuffix: false,
+    });
+    await create({
+      repoId: 'repo-1',
+      branchName: 'explicit',
+      boardId: 'board-1',
+      sourceBranch: 'master',
+      autoSuffix: false,
+    });
+
+    expect(createBranch.mock.calls[0][1]).not.toHaveProperty('sourceBranch');
+    expect(createBranch.mock.calls[1][1]).toMatchObject({ sourceBranch: 'master' });
+    expect(JSON.parse(implicit.content[0].text)._resolution).toMatchObject({
+      outcome: 'resolved',
+      requested_ref: 'master',
+    });
+  });
+
+  it('auto-creates a dedicated board for a teammate when no boardId is given', async () => {
+    const createBranch = vi.fn(async (_repoId: string, data: unknown) => ({
+      branch_id: 'teammate-branch',
+      created_by: 'user-a',
+      ...(data as Record<string, unknown>),
+      base_ref: (data as { sourceBranch?: string }).sourceBranch ?? 'main',
+      base_sha: 'a'.repeat(40),
+    }));
+    const reposGet = vi.fn(async () => ({
+      repo_id: 'repo-1',
+      slug: 'siebel-crm',
+      default_branch: 'main',
+    }));
+    const boardsCreate = vi.fn(async (data: Record<string, unknown>) => ({
+      board_id: 'board-auto',
+      name: data.name,
+      icon: data.icon,
+    }));
+    const boardsGet = vi.fn(async () => {
+      throw new Error('boards.get should not be called when auto-creating a board');
+    });
+    const app = {
+      get: () => ({}),
+      service(name: string) {
+        if (name === 'repos') return { get: reposGet, createBranch };
+        if (name === 'boards') return { get: boardsGet, create: boardsCreate };
+        throw new Error(`Unexpected service call: ${name}`);
+      },
+    };
+
+    const create = registerAndCaptureHandler('agor_branches_create', {
+      app,
+      userId: 'user-a',
+      baseServiceParams: {},
+    });
+
+    const result = await create({
+      repoId: 'repo-1',
+      branchName: 'siebel-crm',
+      autoSuffix: false,
+      teammate: { displayName: 'Siebel CRM', emoji: '🤖' },
+    });
+
+    // A board named after the teammate is created and used for placement.
+    expect(boardsCreate).toHaveBeenCalledWith(
+      expect.objectContaining({ name: 'Siebel CRM', icon: '🤖', created_by: 'user-a' }),
+      {}
+    );
+    expect(createBranch).toHaveBeenCalledWith(
+      'repo-1',
+      expect.objectContaining({ boardId: 'board-auto' }),
+      {}
+    );
+
+    const payload = JSON.parse(result.content[0].text) as {
+      _teammate?: Record<string, unknown>;
+      _board?: Record<string, unknown>;
+      _warning?: string;
+    };
+    expect(payload._board).toMatchObject({ created: true, board_id: 'board-auto' });
+    expect(payload._teammate).toMatchObject({
+      created: true,
+      is_board_primary_teammate: true,
+      primary_board_id: 'board-auto',
+    });
+    expect(payload._warning).toBeUndefined();
+  });
+
+  it('auto-creates a board when createBoard=true is passed explicitly', async () => {
+    const createBranch = vi.fn(async (_repoId: string, data: unknown) => ({
+      branch_id: 'teammate-branch',
+      ...(data as Record<string, unknown>),
+      base_ref: (data as { sourceBranch?: string }).sourceBranch ?? 'main',
+      base_sha: 'a'.repeat(40),
+    }));
+    const reposGet = vi.fn(async () => ({ repo_id: 'repo-1', slug: 's', default_branch: 'main' }));
+    const boardsCreate = vi.fn(async () => ({ board_id: 'board-auto', name: 'Helper' }));
+    const app = {
+      get: () => ({}),
+      service(name: string) {
+        if (name === 'repos') return { get: reposGet, createBranch };
+        if (name === 'boards') return { get: vi.fn(), create: boardsCreate };
+        throw new Error(`Unexpected service call: ${name}`);
+      },
+    };
+
+    const create = registerAndCaptureHandler('agor_branches_create', {
+      app,
+      userId: 'user-a',
+      baseServiceParams: {},
+    });
+
+    await create({
+      repoId: 'repo-1',
+      branchName: 'helper',
+      autoSuffix: false,
+      createBoard: true,
+      teammate: { displayName: 'Helper' },
+    });
+
+    expect(boardsCreate).toHaveBeenCalledTimes(1);
+    expect(createBranch).toHaveBeenCalledWith(
+      'repo-1',
+      expect.objectContaining({ boardId: 'board-auto' }),
+      {}
+    );
+  });
+
+  it('warns (does not block) when the target board already has a different primary teammate', async () => {
+    const createBranch = vi.fn(async (_repoId: string, data: unknown) => ({
+      branch_id: 'teammate-branch',
+      ...(data as Record<string, unknown>),
+      base_ref: (data as { sourceBranch?: string }).sourceBranch ?? 'main',
+      base_sha: 'a'.repeat(40),
+    }));
+    const reposGet = vi.fn(async () => ({ repo_id: 'repo-1', slug: 's', default_branch: 'main' }));
+    const boardsCreate = vi.fn();
+    // resolveBoardId and the warning lookup both call boards.get; the board
+    // already has a *different* primary teammate.
+    const boardsGet = vi.fn(async () => ({
+      board_id: 'board-1',
+      primary_teammate_id: 'other-teammate',
+    }));
+    const app = {
+      get: () => ({}),
+      service(name: string) {
+        if (name === 'repos') return { get: reposGet, createBranch };
+        if (name === 'boards') return { get: boardsGet, create: boardsCreate };
+        throw new Error(`Unexpected service call: ${name}`);
+      },
+    };
+
+    const create = registerAndCaptureHandler('agor_branches_create', {
+      app,
+      userId: 'user-a',
+      baseServiceParams: {},
+    });
+
+    const result = await create({
+      repoId: 'repo-1',
+      branchName: 'second-teammate',
+      boardId: 'board-1',
+      autoSuffix: false,
+      teammate: { displayName: 'Second Teammate' },
+    });
+
+    // Still created on the passed board — the convention is soft, not enforced.
+    expect(boardsCreate).not.toHaveBeenCalled();
+    expect(createBranch).toHaveBeenCalledWith(
+      'repo-1',
+      expect.objectContaining({ boardId: 'board-1' }),
+      {}
+    );
+
+    const payload = JSON.parse(result.content[0].text) as {
+      _teammate?: Record<string, unknown>;
+      _board?: Record<string, unknown>;
+      _warning?: string;
+    };
+    expect(payload._warning).toContain('already has a primary teammate');
+    expect(payload._board).toBeUndefined();
+    expect(payload._teammate).toMatchObject({ is_board_primary_teammate: false });
+  });
+
+  it('rejects passing both boardId and createBoard=true', async () => {
+    const reposGet = vi.fn(async () => ({ repo_id: 'repo-1', slug: 's', default_branch: 'main' }));
+    const app = {
+      get: () => ({}),
+      service(name: string) {
+        if (name === 'repos') return { get: reposGet, createBranch: vi.fn() };
+        if (name === 'boards')
+          return { get: vi.fn(async () => ({ board_id: 'board-1' })), create: vi.fn() };
+        throw new Error(`Unexpected service call: ${name}`);
+      },
+    };
+
+    const create = registerAndCaptureHandler('agor_branches_create', {
+      app,
+      userId: 'user-a',
+      baseServiceParams: {},
+    });
+
+    await expect(
+      create({
+        repoId: 'repo-1',
+        branchName: 'teammate-x',
+        boardId: 'board-1',
+        createBoard: true,
+        autoSuffix: false,
+        teammate: { displayName: 'X' },
+      })
+    ).rejects.toThrow(/either boardId .* or createBoard/i);
+  });
+
+  it('still requires boardId for a normal (non-teammate) branch', async () => {
+    const reposGet = vi.fn(async () => ({ repo_id: 'repo-1', slug: 's', default_branch: 'main' }));
+    const boardsCreate = vi.fn();
+    const app = {
+      get: () => ({}),
+      service(name: string) {
+        if (name === 'repos') return { get: reposGet, createBranch: vi.fn() };
+        if (name === 'boards') return { get: vi.fn(), create: boardsCreate };
+        throw new Error(`Unexpected service call: ${name}`);
+      },
+    };
+
+    const create = registerAndCaptureHandler('agor_branches_create', {
+      app,
+      userId: 'user-a',
+      baseServiceParams: {},
+    });
+
+    await expect(
+      create({ repoId: 'repo-1', branchName: 'plain', autoSuffix: false })
+    ).rejects.toThrow('boardId is required');
+    expect(boardsCreate).not.toHaveBeenCalled();
+  });
+});
+
+describe('branch MCP input schemas', () => {
+  it('exposes an opt-in create wait with a one-second to five-minute timeout', () => {
+    const config = registerAndCaptureConfig('agor_branches_create', {
+      app: {},
+      userId: 'user-1',
+    });
+    const base = { repoId: 'repo-1', branchName: 'feature', boardId: 'board-1' };
+
+    expect(
+      config.inputSchema?.safeParse({
+        ...base,
+        waitForReady: true,
+        waitTimeoutMs: 300_000,
+      }).success
+    ).toBe(true);
+    expect(config.inputSchema?.safeParse({ ...base, waitTimeoutMs: 999 }).success).toBe(false);
+    expect(config.inputSchema?.safeParse({ ...base, waitTimeoutMs: 300_001 }).success).toBe(false);
+    expect(config.inputSchema?.safeParse({ ...base, waitForReady: 'yes' }).success).toBe(false);
+  });
+
+  it('accepts boolean branch attention updates and rejects non-booleans', () => {
+    const config = registerAndCaptureConfig('agor_branches_update', {
+      app: {},
+      userId: 'user-1',
+    });
+
+    expect(
+      config.inputSchema?.safeParse({ branchId: 'branch-1', needsAttention: false }).success
+    ).toBe(true);
+    expect(
+      config.inputSchema?.safeParse({ branchId: 'branch-1', needsAttention: true }).success
+    ).toBe(true);
+    expect(
+      config.inputSchema?.safeParse({ branchId: 'branch-1', needsAttention: 'false' }).success
+    ).toBe(false);
+  });
+
+  it('rejects empty required IDs/names with field-specific messages', () => {
+    const config = registerAndCaptureConfig('agor_branches_create', {
+      app: {},
+      userId: 'user-1',
+    });
+
+    const result = config.inputSchema?.safeParse({
+      repoId: '',
+      branchName: '',
+      boardId: '',
+    });
+
+    expect(result?.success).toBe(false);
+    if (result?.success === false) {
+      expect(result.error.issues.map((issue) => issue.message)).toEqual(
+        expect.arrayContaining([
+          expect.stringMatching(/repoId cannot be empty/i),
+          expect.stringMatching(/branchName cannot be empty/i),
+          expect.stringMatching(/boardId cannot be empty/i),
+        ])
+      );
+    }
+  });
+
+  it('accepts a valid teammate object and rejects an empty teammate displayName', () => {
+    const config = registerAndCaptureConfig('agor_branches_create', {
+      app: {},
+      userId: 'user-1',
+    });
+
+    expect(
+      config.inputSchema?.safeParse({
+        repoId: 'repo-1',
+        branchName: 'siebel-crm',
+        boardId: 'board-1',
+        teammate: { displayName: 'Siebel CRM', emoji: '🤖' },
+      }).success
+    ).toBe(true);
+
+    expect(
+      config.inputSchema?.safeParse({
+        repoId: 'repo-1',
+        branchName: 'siebel-crm',
+        boardId: 'board-1',
+        teammate: { displayName: '   ' },
+      }).success
+    ).toBe(false);
+  });
+
+  it('allows omitting boardId (teammate flow) and accepts a boolean createBoard', () => {
+    const config = registerAndCaptureConfig('agor_branches_create', {
+      app: {},
+      userId: 'user-1',
+    });
+
+    // boardId is now optional at the schema level (required-ness for non-teammate
+    // branches is enforced in the handler).
+    expect(
+      config.inputSchema?.safeParse({
+        repoId: 'repo-1',
+        branchName: 'siebel-crm',
+        createBoard: true,
+        teammate: { displayName: 'Siebel CRM' },
+      }).success
+    ).toBe(true);
+
+    expect(
+      config.inputSchema?.safeParse({
+        repoId: 'repo-1',
+        branchName: 'siebel-crm',
+        createBoard: 'yes',
+      }).success
+    ).toBe(false);
+  });
+
+  it('rejects malformed pagination values before handler execution', () => {
+    const config = registerAndCaptureConfig('agor_branches_cleanup_candidates', {
+      app: {},
+      userId: 'user-1',
+    });
+
+    expect(config.inputSchema?.safeParse({ limit: 0 }).success).toBe(false);
+    expect(config.inputSchema?.safeParse({ skip: -1 }).success).toBe(false);
+    expect(config.inputSchema?.safeParse({ limit: 1, skip: 0 }).success).toBe(true);
+  });
+});
+
+describe('agor_branches_set_zone', () => {
+  it('recommends omitted-target self callbacks while preserving alternate destinations', () => {
+    const config = registerAndCaptureConfig('agor_branches_set_zone', {
+      app: {},
+      userId: 'user-1',
+    });
+
+    expect(config.description).toContain(
+      'agor_sessions_create with enableCallback:true and omit callbackSessionId for the current caller'
+    );
+    expect(config.description).toContain('agor_sessions_prompt callback');
+    expect(config.description).toContain('intentional authorized alternate destination');
+  });
+
+  it('accepts zoneId null and clears the existing board object zone pin', async () => {
+    const baseServiceParams = {
+      authenticated: true,
+      provider: 'mcp',
+      user: { user_id: 'user-1', role: 'member' },
+    };
+    const branch = {
+      branch_id: 'branch-1',
+      board_id: 'board-1',
+      name: 'Branch 1',
+    };
+    const branchesGet = vi.fn(async () => branch);
+    const findByBranchId = vi.fn(async () => ({
+      object_id: 'obj-branch-1',
+      branch_id: 'branch-1',
+      zone_id: 'zone-review',
+    }));
+    const boardObjectsPatch = vi.fn(async () => ({
+      object_id: 'obj-branch-1',
+      branch_id: 'branch-1',
+      zone_id: undefined,
+    }));
+    const app = {
+      get: () => ({}),
+      service(name: string) {
+        if (name === 'branches') return { get: branchesGet };
+        if (name === 'board-objects') {
+          return {
+            findByBranchId,
+            patch: boardObjectsPatch,
+          };
+        }
+        throw new Error(`Unexpected service call: ${name}`);
+      },
+    };
+
+    const setZone = registerAndCaptureHandler('agor_branches_set_zone', {
+      app,
+      userId: 'user-1',
+      baseServiceParams,
+    });
+
+    const result = await setZone({ branchId: 'branch-1', zoneId: null });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(branchesGet).toHaveBeenCalledOnce();
+    expect(branchesGet).toHaveBeenCalledWith('branch-1', baseServiceParams);
+    expect(findByBranchId).toHaveBeenCalledWith('branch-1', baseServiceParams);
+    expect(boardObjectsPatch).toHaveBeenCalledWith(
+      'obj-branch-1',
+      { zone_id: null },
+      baseServiceParams
+    );
+    expect(parsed.zone_id).toBeNull();
+    expect(parsed.note).toMatch(/cleared/i);
+  });
+
+  it('rejects trigger arguments when clearing the zone pin', async () => {
+    const baseServiceParams = {
+      authenticated: true,
+      provider: 'mcp',
+      user: { user_id: 'user-1', role: 'member' },
+    };
+    const branchesGet = vi.fn(async () => ({
+      branch_id: 'branch-1',
+      board_id: 'board-1',
+      name: 'Branch 1',
+    }));
+    const findByBranchId = vi.fn();
+    const app = {
+      get: () => ({}),
+      service(name: string) {
+        if (name === 'branches') return { get: branchesGet };
+        if (name === 'board-objects') {
+          return {
+            findByBranchId,
+            patch: vi.fn(),
+          };
+        }
+        throw new Error(`Unexpected service call: ${name}`);
+      },
+    };
+
+    const setZone = registerAndCaptureHandler('agor_branches_set_zone', {
+      app,
+      userId: 'user-1',
+      baseServiceParams,
+    });
+
+    await expect(
+      setZone({ branchId: 'branch-1', zoneId: null, triggerTemplate: true })
+    ).rejects.toThrow(/cannot be used when zoneId is null/i);
+    await expect(
+      setZone({ branchId: 'branch-1', zoneId: null, targetSessionId: 'bad-session' })
+    ).rejects.toThrow(/cannot be used when zoneId is null/i);
+    expect(findByBranchId).not.toHaveBeenCalled();
+  });
+
+  it('replaces a synthetic out-of-bounds placement with contained zone-relative coordinates', async () => {
+    const baseServiceParams = {
+      authenticated: true,
+      provider: 'mcp',
+      user: { user_id: 'user-1', role: 'member' },
+    };
+    const branch = {
+      branch_id: 'branch-1',
+      board_id: 'board-1',
+      name: 'Branch 1',
+    };
+    const zone = {
+      type: 'zone',
+      x: 2400,
+      y: 80,
+      width: 740,
+      height: 720,
+      label: 'Review',
+    };
+    let persistedBoardObject = {
+      object_id: 'obj-branch-1',
+      board_id: 'board-1',
+      branch_id: 'branch-1',
+      zone_id: 'zone-review',
+      position: { x: 24, y: 1600 },
+    };
+    const boardObjectsPatch = vi.fn(
+      async (
+        _objectId: string,
+        update: { position: { x: number; y: number }; zone_id: string }
+      ) => {
+        persistedBoardObject = { ...persistedBoardObject, ...update };
+        return persistedBoardObject;
+      }
+    );
+    const app = {
+      get: () => ({}),
+      service(name: string) {
+        if (name === 'branches') return { get: vi.fn(async () => branch) };
+        if (name === 'boards') {
+          return {
+            get: vi.fn(async () => ({
+              board_id: 'board-1',
+              objects: { 'zone-review': zone },
+            })),
+          };
+        }
+        if (name === 'board-objects') {
+          return {
+            findByBranchId: vi.fn(async () => persistedBoardObject),
+            patch: boardObjectsPatch,
+          };
+        }
+        throw new Error(`Unexpected service call: ${name}`);
+      },
+    };
+
+    const setZone = registerAndCaptureHandler('agor_branches_set_zone', {
+      app,
+      userId: 'user-1',
+      baseServiceParams,
+    });
+    vi.spyOn(Math, 'random').mockReturnValue(0);
+
+    const result = await setZone({ branchId: 'branch-1', zoneId: 'zone-review' });
+    const parsed = JSON.parse(result.content[0].text);
+
+    // Placement and auto-arrange may choose different slots, but both use
+    // zone-relative coordinates. The non-zero origin is never added here.
+    expect(boardObjectsPatch).toHaveBeenCalledWith(
+      'obj-branch-1',
+      { position: { x: 80, y: 80 }, zone_id: 'zone-review' },
+      baseServiceParams
+    );
+    expect(persistedBoardObject.position).toEqual({ x: 80, y: 80 });
+    expect(parsed.position).toEqual({ x: 80, y: 80 });
+    expect(parsed.position).not.toEqual({ x: 24, y: 1600 });
+    expect(parsed.position.x + 500).toBeLessThanOrEqual(zone.width);
+    expect(parsed.position.y + 200).toBeLessThanOrEqual(zone.height);
+  });
+
+  it('triggers a show_picker zone prompt when the target session belongs to the moved branch', async () => {
+    const baseServiceParams = {
+      authenticated: true,
+      provider: 'mcp',
+      user: { user_id: 'user-1', role: 'member' },
+    };
+    const branch = {
+      branch_id: 'branch-1',
+      board_id: 'board-1',
+      name: 'Branch 1',
+    };
+    const targetSession = {
+      session_id: 'session-1',
+      branch_id: 'branch-1',
+      description: 'Existing branch session',
+      custom_context: {},
+    };
+    const zone = {
+      type: 'zone',
+      x: 2400,
+      y: 80,
+      width: 740,
+      height: 720,
+      label: 'Evidence/QA',
+      trigger: {
+        behavior: 'show_picker',
+        template: 'Run {{branch.name}} in {{zone.label}}',
+      },
+    };
+    const branchesGet = vi.fn(async () => branch);
+    const sessionsGet = vi.fn(async () => targetSession);
+    const boardsGet = vi.fn(async () => ({
+      board_id: 'board-1',
+      objects: {
+        'zone-validate': zone,
+      },
+    }));
+    const findByBranchId = vi.fn(async () => ({
+      object_id: 'obj-branch-1',
+      branch_id: 'branch-1',
+    }));
+    const boardObjectsPatch = vi.fn(async () => ({
+      object_id: 'obj-branch-1',
+      branch_id: 'branch-1',
+      zone_id: 'zone-validate',
+    }));
+    const promptCreate = vi.fn(async () => ({
+      task_id: 'task-1',
+      status: 'running',
+    }));
+    const app = {
+      get: () => ({}),
+      service(name: string) {
+        if (name === 'branches') return { get: branchesGet };
+        if (name === 'sessions') return { get: sessionsGet };
+        if (name === 'boards') return { get: boardsGet };
+        if (name === 'board-objects') {
+          return {
+            findByBranchId,
+            patch: boardObjectsPatch,
+          };
+        }
+        if (name === '/sessions/:id/prompt') return { create: promptCreate };
+        throw new Error(`Unexpected service call: ${name}`);
+      },
+    };
+
+    const setZone = registerAndCaptureHandler('agor_branches_set_zone', {
+      app,
+      userId: 'user-1',
+      baseServiceParams,
+    });
+
+    const random = vi.spyOn(Math, 'random').mockReturnValue(0);
+    const result = await setZone({
+      branchId: 'branch-1',
+      zoneId: 'zone-validate',
+      triggerTemplate: true,
+      targetSessionId: 'session-1',
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(branchesGet).toHaveBeenCalledOnce();
+    expect(sessionsGet).toHaveBeenCalledWith('session-1', baseServiceParams);
+    expect(boardObjectsPatch).toHaveBeenCalledWith(
+      'obj-branch-1',
+      expect.objectContaining({
+        // Zone origin is intentionally non-zero: set_zone persists React Flow
+        // child coordinates, never canvas-absolute coordinates.
+        position: { x: 80, y: 80 },
+        zone_id: 'zone-validate',
+      }),
+      baseServiceParams
+    );
+    expect(promptCreate).toHaveBeenCalledWith(
+      {
+        prompt: 'Run Branch 1 in Evidence/QA',
+        stream: true,
+        metadata: { system_authored: true },
+      },
+      { ...baseServiceParams, provider: undefined, route: { id: 'session-1' } }
+    );
+    expect(parsed.trigger.sessionId).toBe('session-1');
+    random.mockRestore();
+  });
+
+  it.each([undefined, 2])(
+    'surfaces always_new skipped defaults (%s) without exposing IDs',
+    async (skipped) => {
+      const branch = { branch_id: 'branch-1', board_id: 'board-1', name: 'Branch 1' };
+      const zone = {
+        type: 'zone',
+        x: 0,
+        y: 0,
+        width: 740,
+        height: 720,
+        label: 'Review',
+        trigger: { behavior: 'always_new', template: 'Review {{branch.name}}' },
+      };
+      const createSession = vi.fn(async () => ({
+        session_id: 'session-new',
+        agentic_tool: 'claude-code',
+        ...(skipped && { mcp_defaults_skipped: skipped }),
+      }));
+      const prompt = vi.fn(async () => ({ task_id: 'task-new', status: 'running' }));
+      const app = {
+        get: () => ({}),
+        service(name: string) {
+          if (name === 'branches') return { get: async () => branch };
+          if (name === 'boards')
+            return { get: async () => ({ board_id: 'board-1', objects: { review: zone } }) };
+          if (name === 'board-objects')
+            return {
+              findByBranchId: async () => ({ object_id: 'object-1' }),
+              patch: async () => ({}),
+            };
+          if (name === 'users') return { get: async () => ({ user_id: 'user-1' }) };
+          if (name === 'sessions') return { create: createSession };
+          if (name === '/sessions/:id/prompt') return { create: prompt };
+          throw new Error(`Unexpected service call: ${name}`);
+        },
+      };
+      const setZone = registerAndCaptureHandler('agor_branches_set_zone', {
+        app,
+        userId: 'user-1',
+      });
+      const result = await setZone({ branchId: 'branch-1', zoneId: 'review' });
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.trigger).toMatchObject({ sessionId: 'session-new', taskId: 'task-new' });
+      expect(createSession).toHaveBeenCalledOnce();
+      expect(prompt).toHaveBeenCalledOnce();
+      if (skipped) {
+        expect(parsed.trigger.mcp_defaults_skipped).toBe(skipped);
+        expect(parsed.trigger.note).toContain(
+          'Warning: 2 unavailable default MCP server(s) were skipped'
+        );
+        expect(parsed.trigger.note).toContain('Review branch MCP Servers or your user defaults');
+      } else {
+        expect(parsed.trigger).not.toHaveProperty('mcp_defaults_skipped');
+        expect(parsed.trigger.note).not.toContain('Warning:');
+      }
+    }
+  );
+
+  it('rejects show_picker zone triggers when the target session belongs to another branch', async () => {
+    const baseServiceParams = {
+      authenticated: true,
+      provider: 'mcp',
+      user: { user_id: 'user-1', role: 'member' },
+    };
+    const branch = {
+      branch_id: 'branch-1',
+      board_id: 'board-1',
+      name: 'Branch 1',
+    };
+    const targetSession = {
+      session_id: 'session-2',
+      branch_id: 'branch-2',
+      description: 'Other branch session',
+      custom_context: {},
+    };
+    const branchesGet = vi.fn(async () => branch);
+    const sessionsGet = vi.fn(async () => targetSession);
+    const boardsGet = vi.fn();
+    const findByBranchId = vi.fn();
+    const boardObjectsPatch = vi.fn();
+    const promptCreate = vi.fn();
+    const app = {
+      get: () => ({}),
+      service(name: string) {
+        if (name === 'branches') return { get: branchesGet };
+        if (name === 'sessions') return { get: sessionsGet };
+        if (name === 'boards') return { get: boardsGet };
+        if (name === 'board-objects') {
+          return {
+            findByBranchId,
+            patch: boardObjectsPatch,
+          };
+        }
+        if (name === '/sessions/:id/prompt') return { create: promptCreate };
+        throw new Error(`Unexpected service call: ${name}`);
+      },
+    };
+
+    const setZone = registerAndCaptureHandler('agor_branches_set_zone', {
+      app,
+      userId: 'user-1',
+      baseServiceParams,
+    });
+
+    await expect(
+      setZone({
+        branchId: 'branch-1',
+        zoneId: 'zone-validate',
+        triggerTemplate: true,
+        targetSessionId: 'session-2',
+      })
+    ).rejects.toThrow(/belongs to branch branch2.*moving branch branch1/i);
+
+    expect(boardsGet).not.toHaveBeenCalled();
+    expect(findByBranchId).not.toHaveBeenCalled();
+    expect(boardObjectsPatch).not.toHaveBeenCalled();
+    expect(promptCreate).not.toHaveBeenCalled();
+  });
+
+  it('labels the always_new trigger prompt with its tool and keeps the trusted stamp', async () => {
+    const stamp = {
+      authenticated_by: 'session_token' as const,
+      origin_user_id: 'user-1',
+      origin_user_label: 'user@example.test',
+      origin_session_id: '01a0d369-82f3-7458-8265-861a4752b7b2',
+      origin_branch_id: 'branch-origin',
+      origin_agentic_tool: 'claude-code',
+    };
+    const baseServiceParams = {
+      authenticated: true,
+      provider: 'mcp',
+      user: { user_id: 'user-1', role: 'member' },
+      _promptProvenance: stamp,
+    };
+    const branch = { branch_id: 'branch-1', board_id: 'board-1', name: 'branch-1' };
+    const zone = {
+      type: 'zone',
+      x: 0,
+      y: 0,
+      width: 400,
+      height: 400,
+      label: 'Review',
+      trigger: { template: 'Review {{branch.name}}', behavior: 'always_new' },
+    };
+    const promptCreate = vi.fn(async () => ({ task_id: 'task-1', status: 'running' }));
+    const app = {
+      get: () => ({}),
+      service(name: string) {
+        if (name === 'branches') return { get: vi.fn(async () => branch) };
+        if (name === 'boards') {
+          return {
+            get: vi.fn(async () => ({ board_id: 'board-1', objects: { 'zone-review': zone } })),
+          };
+        }
+        if (name === 'board-objects') {
+          return {
+            findByBranchId: vi.fn(async () => null),
+            create: vi.fn(async (data: Record<string, unknown>) => ({
+              object_id: 'obj-1',
+              ...data,
+            })),
+          };
+        }
+        if (name === 'users') return { get: vi.fn(async () => ({ user_id: 'user-1' })) };
+        if (name === 'sessions') {
+          return {
+            create: vi.fn(async () => ({ session_id: 'session-new', agentic_tool: 'claude-code' })),
+          };
+        }
+        if (name === '/sessions/:id/prompt') return { create: promptCreate };
+        throw new Error(`Unexpected service call: ${name}`);
+      },
+    };
+
+    const setZone = registerAndCaptureHandler('agor_branches_set_zone', {
+      app,
+      userId: 'user-1',
+      baseServiceParams,
+    });
+    await setZone({ branchId: 'branch-1', zoneId: 'zone-review' });
+
+    expect(promptCreate).toHaveBeenCalledOnce();
+    const [data, params] = promptCreate.mock.calls[0] as unknown as [
+      { prompt: string },
+      { provider?: string; _promptProvenance?: McpPromptProvenanceStamp },
+    ];
+    expect(params.provider).toBeUndefined();
+    expect(params._promptProvenance).toEqual({
+      ...stamp,
+      tool: 'agor_branches_set_zone',
+      mode: 'always_new',
+    });
+
+    // What the prompt route would admit from exactly these params.
+    const admitted = resolvePromptProvenance({
+      stamp: params._promptProvenance as McpPromptProvenanceStamp,
+      body: data.prompt,
+      escapedSentinels: 0,
+    });
+    expect(admitted.metadata).toMatchObject({
+      origin_session_id: stamp.origin_session_id,
+      tool: 'agor_branches_set_zone',
+      mode: 'always_new',
+    });
+    expect(admitted.prompt).toContain('via agor_branches_set_zone (always_new)');
+  });
+});
+
+describe('agor_branches_list', () => {
+  const baseServiceParams = {
+    authenticated: true,
+    provider: 'mcp',
+    user: { user_id: 'user-1', role: 'member' },
+  };
+
+  function makeApp(findResult: unknown) {
+    return {
+      service(name: string) {
+        if (name === 'branches') {
+          return {
+            find: vi.fn(async (params?: { query?: Record<string, unknown> }) => {
+              const zoneId = params?.query?.zone_id;
+              if (!zoneId || Array.isArray(findResult)) return findResult;
+
+              // Simulate BranchesService-level filtering. The MCP tool should
+              // forward zone_id to the service instead of filtering the current
+              // page itself.
+              const result = findResult as {
+                data: Record<string, unknown>[];
+                total: number;
+                limit: number;
+                skip: number;
+              };
+              const filtered = result.data.filter((branch) => branch.zone_id === zoneId);
+              return { ...result, data: filtered, total: filtered.length };
+            }),
+          };
+        }
+        throw new Error(`Unexpected service call: ${name}`);
+      },
+    };
+  }
+
+  it('uses a bounded default page and supports offsets', async () => {
+    const findFn = vi.fn(async () => ({
+      data: [],
+      total: 596,
+      limit: 50,
+      skip: 0,
+    }));
+    const app = {
+      get: () => ({}),
+      service(name: string) {
+        if (name === 'branches') return { find: findFn };
+        throw new Error(`Unexpected service call: ${name}`);
+      },
+    };
+    const list = registerAndCaptureHandler('agor_branches_list', {
+      app,
+      userId: 'user-1',
+      baseServiceParams,
+    });
+
+    await list({});
+    await list({ limit: 25, offset: 50 });
+
+    expect(findFn).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        query: expect.objectContaining({ archived: false, $limit: 50, $skip: 0 }),
+      })
+    );
+    expect(findFn).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        query: expect.objectContaining({ archived: false, $limit: 25, $skip: 50 }),
+      })
+    );
+  });
+
+  it('rejects branch list pages above 100 rows', () => {
+    const config = registerAndCaptureConfig('agor_branches_list', {
+      app: {},
+      userId: 'user-1',
+    });
+
+    expect(config.inputSchema?.safeParse({ limit: 100 }).success).toBe(true);
+    expect(config.inputSchema?.safeParse({ limit: 101 }).success).toBe(false);
+  });
+
+  it('includes zone_id and zone_label from enriched branches', async () => {
+    const enrichedBranches = {
+      data: [
+        {
+          branch_id: 'branch-1',
+          name: 'my-feature',
+          archived: false,
+          board_id: 'board-1',
+          zone_id: 'zone-1776863814461',
+          zone_label: 'in progress',
+          board_object_id: 'obj-1',
+        },
+        {
+          branch_id: 'branch-2',
+          name: 'other-feature',
+          archived: false,
+          board_id: 'board-1',
+          // No zone — branch on board but not in a zone
+        },
+      ],
+      total: 2,
+      limit: 50,
+      skip: 0,
+    };
+    const list = registerAndCaptureHandler('agor_branches_list', {
+      app: makeApp(enrichedBranches),
+      userId: 'user-1',
+      baseServiceParams,
+    });
+
+    const result = await list({});
+    expect(result.isError).toBeFalsy();
+    const parsed = JSON.parse(result.content[0].text);
+
+    const branch1 = parsed.data[0];
+    expect(branch1.zone_id).toBe('zone-1776863814461');
+    expect(branch1.zone_label).toBe('in progress');
+
+    const branch2 = parsed.data[1];
+    expect(branch2.zone_id).toBeUndefined();
+  });
+
+  it('passes zone_id to the service query so filtering is pagination-correct', async () => {
+    const findFn = vi.fn(async () => ({
+      data: [{ branch_id: 'branch-1', zone_id: 'zone-review' }],
+      total: 1,
+      limit: 50,
+      skip: 0,
+    }));
+    const app = {
+      get: () => ({}),
+      service(name: string) {
+        if (name === 'branches') return { find: findFn };
+        throw new Error(`Unexpected service call: ${name}`);
+      },
+    };
+    const list = registerAndCaptureHandler('agor_branches_list', {
+      app,
+      userId: 'user-1',
+      baseServiceParams,
+    });
+
+    await list({ zoneId: 'zone-review' });
+
+    expect(findFn).toHaveBeenCalledWith(
+      expect.objectContaining({ query: expect.objectContaining({ zone_id: 'zone-review' }) })
+    );
+  });
+
+  it('filters by zoneId when provided', async () => {
+    const enrichedBranches = {
+      data: [
+        {
+          branch_id: 'branch-1',
+          name: 'feature-a',
+          archived: false,
+          zone_id: 'zone-review',
+          zone_label: 'Review',
+        },
+        {
+          branch_id: 'branch-2',
+          name: 'feature-b',
+          archived: false,
+          zone_id: 'zone-done',
+          zone_label: 'Done',
+        },
+        {
+          branch_id: 'branch-3',
+          name: 'feature-c',
+          archived: false,
+          // no zone
+        },
+      ],
+      total: 3,
+      limit: 50,
+      skip: 0,
+    };
+    const list = registerAndCaptureHandler('agor_branches_list', {
+      app: makeApp(enrichedBranches),
+      userId: 'user-1',
+      baseServiceParams,
+    });
+
+    const result = await list({ zoneId: 'zone-review' });
+    expect(result.isError).toBeFalsy();
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.data).toHaveLength(1);
+    expect(parsed.data[0].branch_id).toBe('branch-1');
+    expect(parsed.total).toBe(1);
+  });
+
+  it('returns empty data when zoneId matches no branches', async () => {
+    const enrichedBranches = {
+      data: [{ branch_id: 'branch-1', name: 'feature-a', zone_id: 'zone-other' }],
+      total: 1,
+      limit: 50,
+      skip: 0,
+    };
+    const list = registerAndCaptureHandler('agor_branches_list', {
+      app: makeApp(enrichedBranches),
+      userId: 'user-1',
+      baseServiceParams,
+    });
+
+    const result = await list({ zoneId: 'zone-review' });
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.data).toHaveLength(0);
+    expect(parsed.total).toBe(0);
+  });
+});
+
+describe('agor_branches_cleanup_candidates', () => {
+  const baseServiceParams = {
+    authenticated: true,
+    provider: 'mcp',
+    user: { user_id: 'user-1', role: 'member' },
+  };
+
+  const repo = {
+    repo_id: 'repo-1',
+    slug: 'preset-io/agor',
+    name: 'Agor',
+  };
+
+  function makeBranch(overrides: Record<string, unknown>) {
+    return {
+      branch_id: overrides.branch_id ?? 'branch-1',
+      repo_id: overrides.repo_id ?? 'repo-1',
+      name: overrides.name ?? 'old-feature',
+      ref: overrides.ref ?? 'old-feature',
+      archived: true,
+      archived_at: overrides.archived_at ?? '2026-05-20T00:00:00.000Z',
+      archived_by: 'user-1',
+      last_used: '2026-05-19T00:00:00.000Z',
+      filesystem_status: overrides.filesystem_status,
+      storage_mode: overrides.storage_mode ?? 'worktree',
+      path:
+        overrides.path ??
+        getBranchPath('preset-io/agor', String(overrides.branch_id ?? 'branch-1')),
+      pull_request_url: overrides.pull_request_url,
+      issue_url: overrides.issue_url,
+      notes: overrides.notes,
+      others_can: overrides.others_can ?? 'session',
+      custom_context: overrides.custom_context,
+      ...overrides,
+    };
+  }
+
+  function makeCleanupApp(branches: unknown[], options?: { repoGetFails?: boolean }) {
+    const branchesFind = vi.fn(async (params?: { query?: Record<string, unknown> }) => {
+      const skip = Number(params?.query?.$skip ?? 0);
+      const limit = Number(params?.query?.$limit ?? branches.length);
+      return {
+        data: branches.slice(skip, skip + limit),
+        total: branches.length,
+        limit,
+        skip,
+      };
+    });
+    const reposGet = vi.fn(async () => {
+      if (options?.repoGetFails) throw new Error('repo unavailable');
+      return repo;
+    });
+    vi.spyOn(CapabilityPolicyRepository.prototype, 'getBranchSharingModes').mockResolvedValue(
+      new Map(
+        branches.map((value) => {
+          const branch = value as { branch_id: string };
+          return [branch.branch_id, branch.branch_id === 'private' ? 'private' : 'shared'];
+        })
+      )
+    );
+
+    return {
+      branchesFind,
+      reposGet,
+      app: {
+        get: () => ({}),
+        sessionTokenService: {
+          generateCommandToken: vi.fn(async () => 'delegated-user-token'),
+        },
+        service(name: string) {
+          if (name === 'branches') return { find: branchesFind };
+          if (name === 'repos') return { get: reposGet };
+          throw new Error(`Unexpected service call: ${name}`);
+        },
+      },
+    };
+  }
+
+  it('applies safe defaults: archived only, older than 7 days, not deleted, not teammate/private', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-03T00:00:00.000Z'));
+
+    const { app, branchesFind } = makeCleanupApp([
+      makeBranch({ branch_id: 'candidate-ready', filesystem_status: undefined }),
+      makeBranch({ branch_id: 'candidate-preserved', filesystem_status: 'preserved' }),
+      makeBranch({ branch_id: 'candidate-cleaned', filesystem_status: 'cleaned' }),
+      makeBranch({
+        branch_id: 'too-recent',
+        archived_at: '2026-05-30T00:00:00.000Z',
+        filesystem_status: 'ready',
+      }),
+      makeBranch({ branch_id: 'deleted', filesystem_status: 'deleted' }),
+      makeBranch({
+        branch_id: 'teammate',
+        filesystem_status: 'ready',
+        custom_context: { teammate: { kind: 'teammate', displayName: 'Helper' } },
+      }),
+      makeBranch({ branch_id: 'private', filesystem_status: 'ready', others_can: 'none' }),
+      makeBranch({ branch_id: 'active', archived: false, filesystem_status: 'ready' }),
+    ]);
+
+    const cleanupCandidates = registerAndCaptureHandler('agor_branches_cleanup_candidates', {
+      app,
+      userId: 'user-1',
+      baseServiceParams,
+    });
+
+    const result = await cleanupCandidates({});
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(branchesFind).toHaveBeenCalledWith({
+      query: { archived: true, $limit: 10000, $skip: 0, $sort: { archived_at: 1 } },
+      ...baseServiceParams,
+    });
+    expect(
+      parsed.candidates.map((candidate: { branch_id: string }) => candidate.branch_id)
+    ).toEqual(['candidate-ready', 'candidate-preserved', 'candidate-cleaned']);
+    expect(parsed.safety).toMatchObject({
+      read_only: true,
+      archived_only: true,
+      archived_older_than_days: 7,
+      filesystem_statuses: ['ready', 'preserved', 'cleaned'],
+      exclude_teammates: true,
+      exclude_private: true,
+    });
+    expect(parsed.candidates[0]).toMatchObject({
+      repo_slug: 'preset-io/agor',
+      filesystem_status: 'ready',
+      path_exists: true,
+    });
+    expect(parsed.scanned).toMatchObject({
+      archived_branches: 8,
+      source_pages: 1,
+      source_page_limit: 10000,
+    });
+  });
+
+  it('never probes a stored path outside the tenant branch root', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-03T00:00:00.000Z'));
+    vi.mocked(requestExecutor).mockClear();
+    const { app } = makeCleanupApp([
+      makeBranch({ branch_id: 'managed', filesystem_status: 'cleaned' }),
+      makeBranch({
+        branch_id: 'foreign',
+        filesystem_status: 'cleaned',
+        path: '/home/agor/.agor/tenants/globex/worktrees/victim-private',
+      }),
+    ]);
+    const cleanupCandidates = registerAndCaptureHandler('agor_branches_cleanup_candidates', {
+      app,
+      userId: 'user-1',
+      baseServiceParams,
+    });
+
+    const parsed = JSON.parse(
+      (await cleanupCandidates({ archivedOlderThanDays: 1, filesystemStatuses: ['cleaned'] }))
+        .content[0].text
+    );
+
+    expect(vi.mocked(requestExecutor)).toHaveBeenCalledWith(
+      expect.objectContaining({ params: { branchIds: ['managed'] } }),
+      expect.anything()
+    );
+    expect(parsed.candidates).toContainEqual(
+      expect.objectContaining({
+        branch_id: 'foreign',
+        path_exists: null,
+        path_error: 'outside_managed_branch_root',
+      })
+    );
+    const deletable = JSON.parse(
+      (
+        await cleanupCandidates({
+          archivedOlderThanDays: 1,
+          filesystemStatuses: ['cleaned'],
+          pathExists: false,
+        })
+      ).content[0].text
+    );
+    expect(deletable.candidates.map((c: { branch_id: string }) => c.branch_id)).not.toContain(
+      'foreign'
+    );
+  });
+
+  it('supports explicit filters and pagination after safety filtering', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-03T00:00:00.000Z'));
+
+    const { app } = makeCleanupApp([
+      makeBranch({
+        branch_id: 'missing-clone-a',
+        storage_mode: 'clone',
+        filesystem_status: 'cleaned',
+      }),
+      makeBranch({
+        branch_id: 'missing-clone-b',
+        storage_mode: 'clone',
+        filesystem_status: 'cleaned',
+      }),
+      makeBranch({
+        branch_id: 'existing-clone',
+        storage_mode: 'clone',
+        filesystem_status: 'cleaned',
+      }),
+      makeBranch({
+        branch_id: 'missing-worktree',
+        storage_mode: 'worktree',
+        filesystem_status: 'cleaned',
+      }),
+    ]);
+
+    const cleanupCandidates = registerAndCaptureHandler('agor_branches_cleanup_candidates', {
+      app,
+      userId: 'user-1',
+      baseServiceParams,
+    });
+
+    const result = await cleanupCandidates({
+      archivedOlderThanDays: 1,
+      filesystemStatuses: ['cleaned'],
+      storageMode: 'clone',
+      pathExists: false,
+      skip: 1,
+      limit: 1,
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.total).toBe(2);
+    expect(parsed.skip).toBe(1);
+    expect(parsed.limit).toBe(1);
+    expect(parsed.candidates).toHaveLength(1);
+    expect(parsed.candidates[0]).toMatchObject({
+      branch_id: 'missing-clone-b',
+      storage_mode: 'clone',
+      filesystem_status: 'cleaned',
+      path_exists: false,
+    });
+  });
+
+  it('scans multiple source pages before applying cleanup filters and pagination', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-03T00:00:00.000Z'));
+
+    const nonCandidates = Array.from({ length: 10000 }, (_, index) =>
+      makeBranch({
+        branch_id: `deleted-${index}`,
+        filesystem_status: 'deleted',
+      })
+    );
+    const { app, branchesFind } = makeCleanupApp([
+      ...nonCandidates,
+      makeBranch({ branch_id: 'page-two-candidate', filesystem_status: 'ready' }),
+    ]);
+
+    const cleanupCandidates = registerAndCaptureHandler('agor_branches_cleanup_candidates', {
+      app,
+      userId: 'user-1',
+      baseServiceParams,
+    });
+
+    const result = await cleanupCandidates({ limit: 1 });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(branchesFind).toHaveBeenCalledTimes(2);
+    expect(branchesFind).toHaveBeenNthCalledWith(2, {
+      query: { archived: true, $limit: 10000, $skip: 10000, $sort: { archived_at: 1 } },
+      ...baseServiceParams,
+    });
+    expect(parsed.total).toBe(1);
+    expect(parsed.candidates[0].branch_id).toBe('page-two-candidate');
+    expect(parsed.scanned.source_pages).toBe(2);
+  });
+
+  it('excludes malformed archived_at values instead of treating them as old', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-03T00:00:00.000Z'));
+
+    const { app } = makeCleanupApp([
+      makeBranch({ branch_id: 'bad-date', archived_at: 'not-a-date', filesystem_status: 'ready' }),
+      makeBranch({ branch_id: 'good-date', filesystem_status: 'ready' }),
+    ]);
+
+    const cleanupCandidates = registerAndCaptureHandler('agor_branches_cleanup_candidates', {
+      app,
+      userId: 'user-1',
+      baseServiceParams,
+    });
+
+    const result = await cleanupCandidates({});
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(
+      parsed.candidates.map((candidate: { branch_id: string }) => candidate.branch_id)
+    ).toEqual(['good-date']);
+  });
+
+  it('supports explicit archivedBefore and opt-in inclusion of teammate/private branches', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-03T00:00:00.000Z'));
+
+    const { app } = makeCleanupApp([
+      makeBranch({
+        branch_id: 'teammate',
+        filesystem_status: 'ready',
+        custom_context: { teammate: { kind: 'teammate', displayName: 'Helper' } },
+      }),
+      makeBranch({ branch_id: 'private', filesystem_status: 'ready', others_can: 'none' }),
+      makeBranch({
+        branch_id: 'after-cutoff',
+        archived_at: '2026-05-22T00:00:00.000Z',
+        filesystem_status: 'ready',
+      }),
+    ]);
+
+    const cleanupCandidates = registerAndCaptureHandler('agor_branches_cleanup_candidates', {
+      app,
+      userId: 'user-1',
+      baseServiceParams,
+    });
+
+    const result = await cleanupCandidates({
+      archivedBefore: '2026-05-21T00:00:00.000Z',
+      excludeTeammates: false,
+      excludePrivate: false,
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(
+      parsed.candidates.map((candidate: { branch_id: string }) => candidate.branch_id)
+    ).toEqual(['teammate', 'private']);
+    expect(parsed.safety).toMatchObject({
+      cutoff_source: 'archivedBefore',
+      archived_older_than_days: null,
+      exclude_teammates: false,
+      exclude_private: false,
+    });
+  });
+
+  it('falls back to null repo metadata when repo enrichment fails', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-03T00:00:00.000Z'));
+
+    const { app } = makeCleanupApp(
+      [makeBranch({ branch_id: 'candidate', filesystem_status: 'ready' })],
+      { repoGetFails: true }
+    );
+
+    const cleanupCandidates = registerAndCaptureHandler('agor_branches_cleanup_candidates', {
+      app,
+      userId: 'user-1',
+      baseServiceParams,
+    });
+
+    const result = await cleanupCandidates({});
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.candidates[0]).toMatchObject({
+      branch_id: 'candidate',
+      repo_slug: null,
+      repo_name: null,
+    });
+  });
+
+  it('rejects ambiguous filesystem status inputs', async () => {
+    const { app } = makeCleanupApp([]);
+    const cleanupCandidates = registerAndCaptureHandler('agor_branches_cleanup_candidates', {
+      app,
+      userId: 'user-1',
+      baseServiceParams,
+    });
+
+    await expect(
+      cleanupCandidates({ filesystemStatus: 'ready', filesystemStatuses: ['cleaned'] })
+    ).rejects.toThrow(/either filesystemStatus or filesystemStatuses/i);
+  });
+
+  it('rejects non-old cleanup cutoffs', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-03T00:00:00.000Z'));
+
+    const { app } = makeCleanupApp([]);
+    const cleanupCandidates = registerAndCaptureHandler('agor_branches_cleanup_candidates', {
+      app,
+      userId: 'user-1',
+      baseServiceParams,
+    });
+
+    await expect(cleanupCandidates({ archivedOlderThanDays: 0 })).rejects.toThrow(
+      /at least 1 day/i
+    );
+    await expect(cleanupCandidates({ archivedBefore: '2026-06-04T00:00:00.000Z' })).rejects.toThrow(
+      /must not be in the future/i
+    );
+  });
+});
+
+describe('agor_teammates_list', () => {
+  it('delegates to the targeted teammate repository query instead of paginating branches first', async () => {
+    const baseServiceParams = {
+      authenticated: true,
+      provider: 'mcp',
+      user: { user_id: 'user-1', role: 'member' },
+    };
+    const hodorLikeBranch = {
+      branch_id: 'teammate-branch-1',
+      repo_id: 'repo-1',
+      name: 'private-hodor-like',
+      board_id: 'board-1',
+      last_used: '2026-06-24T00:00:00.000Z',
+      archived: false,
+      storage_mode: 'clone',
+      custom_context: {
+        teammate: {
+          kind: 'teammate',
+          displayName: 'Hodor-like',
+          emoji: '🚪',
+          kb: {
+            primary_namespace_id: 'namespace-1',
+            primary_namespace_slug: 'team-kb',
+            memory_path_template: 'memory/{{YYYY-MM-DD}}.md',
+            default_visibility: 'public',
+            global_access: 'write',
+          },
+        },
+      },
+    };
+    const findTeammateBranches = vi
+      .spyOn(BranchRepository.prototype, 'findTeammateBranches')
+      .mockResolvedValue([hodorLikeBranch] as Awaited<
+        ReturnType<BranchRepository['findTeammateBranches']>
+      >);
+    const app = {
+      get: () => ({}),
+      service(name: string) {
+        throw new Error(`Unexpected service call: ${name}`);
+      },
+    };
+
+    const listTeammates = registerAndCaptureHandler('agor_teammates_list', {
+      app,
+      userId: 'user-1',
+      baseServiceParams,
+    });
+
+    const result = await listTeammates({ limit: 100 });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(findTeammateBranches).toHaveBeenCalledWith({
+      archived: false,
+      limit: 101,
+      offset: 0,
+      userId: 'user-1',
+    });
+    expect(parsed.total).toBe(1);
+    expect(parsed.teammates).toEqual([
+      expect.objectContaining({
+        branch_id: 'teammate-branch-1',
+        name: 'private-hodor-like',
+        display_name: 'Hodor-like',
+        emoji: '🚪',
+        board_id: 'board-1',
+      }),
+    ]);
+  });
+
+  it('shapes schedule-only legacy teammate backfill rows returned by the repository', async () => {
+    const baseServiceParams = {
+      authenticated: true,
+      provider: 'mcp',
+      user: { user_id: 'user-1', role: 'member' },
+    };
+    const scheduledLegacyBranch = {
+      branch_id: 'legacy-scheduled-branch',
+      repo_id: 'repo-1',
+      name: 'datagor-like',
+      notes: 'Legacy teammate bootstrapped before custom_context marker backfill.',
+      board_id: 'board-1',
+      last_used: '2026-06-24T00:00:00.000Z',
+      archived: false,
+      storage_mode: 'clone',
+    };
+    vi.spyOn(BranchRepository.prototype, 'findTeammateBranches').mockResolvedValue([
+      scheduledLegacyBranch,
+    ] as Awaited<ReturnType<BranchRepository['findTeammateBranches']>>);
+    const app = {
+      get: () => ({}),
+      service(name: string) {
+        throw new Error(`Unexpected service call: ${name}`);
+      },
+    };
+
+    const listTeammates = registerAndCaptureHandler('agor_teammates_list', {
+      app,
+      userId: 'user-1',
+      baseServiceParams,
+    });
+
+    const result = await listTeammates({});
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.total).toBe(1);
+    expect(parsed.teammates[0]).toEqual(
+      expect.objectContaining({
+        branch_id: 'legacy-scheduled-branch',
+        name: 'datagor-like',
+        display_name: 'datagor-like',
+        description: 'Legacy teammate bootstrapped before custom_context marker backfill.',
+      })
+    );
+  });
+
+  it('does not scope teammate discovery for superadmins when superadmin bypass is enabled', async () => {
+    const findTeammateBranches = vi
+      .spyOn(BranchRepository.prototype, 'findTeammateBranches')
+      .mockResolvedValue([]);
+    const app = {
+      get: () => ({ execution: { allow_superadmin: true } }),
+      service(name: string) {
+        throw new Error(`Unexpected service call: ${name}`);
+      },
+    };
+
+    const listTeammates = registerAndCaptureHandler('agor_teammates_list', {
+      app,
+      userId: 'superadmin-1',
+      authenticatedUser: {
+        user_id: 'superadmin-1',
+        email: 'superadmin@example.test',
+        role: 'superadmin',
+      },
+    });
+
+    await listTeammates({});
+
+    expect(findTeammateBranches).toHaveBeenCalledWith({ archived: false, limit: 26, offset: 0 });
+  });
+
+  it('scopes teammate discovery for superadmins when superadmin bypass is disabled', async () => {
+    const findTeammateBranches = vi
+      .spyOn(BranchRepository.prototype, 'findTeammateBranches')
+      .mockResolvedValue([]);
+    const app = {
+      get: () => ({ execution: { allow_superadmin: false } }),
+      service(name: string) {
+        throw new Error(`Unexpected service call: ${name}`);
+      },
+    };
+
+    const listTeammates = registerAndCaptureHandler('agor_teammates_list', {
+      app,
+      userId: 'superadmin-1',
+      authenticatedUser: {
+        user_id: 'superadmin-1',
+        email: 'superadmin@example.test',
+        role: 'superadmin',
+      },
+    });
+
+    await listTeammates({});
+
+    expect(findTeammateBranches).toHaveBeenCalledWith({
+      archived: false,
+      userId: 'superadmin-1',
+      limit: 26,
+      offset: 0,
+    });
+  });
+});
+
+describe('agor_branches_retry_provisioning', () => {
+  it('is discoverable (registered with an input schema)', () => {
+    const config = registerAndCaptureConfig('agor_branches_retry_provisioning', {
+      app: {
+        service() {
+          throw new Error('should not touch services during registration');
+        },
+      },
+      userId: 'user-1',
+    });
+    expect(config.inputSchema).toBeDefined();
+    // branchId is required — an empty payload must fail schema validation.
+    const parsed = config.inputSchema?.safeParse({});
+    expect(parsed?.success).toBe(false);
+  });
+
+  it('resolves the branch id and calls the shared retryBranchProvisioning service', async () => {
+    const baseServiceParams = {
+      authenticated: true,
+      provider: 'mcp',
+      user: { user_id: 'user-1', role: 'member' },
+    };
+    // resolveBranchId → branches.get; the service resolves the short id to a
+    // full id, which is what must be forwarded to retryBranchProvisioning.
+    const branchesGet = vi.fn(async () => ({ branch_id: 'branch-full-1' }));
+    const retryBranchProvisioning = vi.fn(async (branchId: string) => ({
+      branch_id: branchId,
+      filesystem_status: 'ready',
+      error_message: null,
+      path: '/worktrees/sample-app/feature-x',
+    }));
+    const app = {
+      service(name: string) {
+        if (name === 'branches') return { get: branchesGet };
+        if (name === 'repos') return { retryBranchProvisioning };
+        throw new Error(`Unexpected service call: ${name}`);
+      },
+    };
+
+    const retry = registerAndCaptureHandler('agor_branches_retry_provisioning', {
+      app,
+      userId: 'user-1',
+      baseServiceParams,
+    });
+
+    const result = await retry({ branchId: 'branch-short' });
+
+    expect(branchesGet).toHaveBeenCalledWith('branch-short', baseServiceParams);
+    expect(retryBranchProvisioning).toHaveBeenCalledWith('branch-full-1', baseServiceParams);
+    const payload = JSON.parse(result.content[0].text) as {
+      branch_id: string;
+      filesystem_status: string;
+    };
+    expect(payload.branch_id).toBe('branch-full-1');
+    expect(payload.filesystem_status).toBe('ready');
+  });
+});
+
+describe('agor_branches_clean', () => {
+  it('uses the authenticated clean route and returns acceptance without claiming completion', async () => {
+    const branchId = '01900000-0000-7000-8000-000000000001';
+    const accepted = { branch_id: branchId, operation_id: 'operation', status: 'accepted' };
+    const create = vi.fn().mockResolvedValue(accepted);
+    const baseServiceParams = { provider: 'mcp', user: { user_id: 'manager', role: 'member' } };
+    const app = {
+      service: (path: string) => {
+        if (path === 'branches') return { get: vi.fn().mockResolvedValue({ branch_id: branchId }) };
+        if (path === '/branches/:id/clean') return { create };
+        throw new Error(path);
+      },
+    };
+    const clean = registerAndCaptureHandler('agor_branches_clean', { app, baseServiceParams });
+    const result = await clean({ branchId });
+    expect(create).toHaveBeenCalledWith({}, { ...baseServiceParams, route: { id: branchId } });
+    expect(JSON.stringify(result)).toContain('accepted');
+    expect(JSON.stringify(result)).not.toContain('cleaned successfully');
+  });
+});
+
+describe('management ownership transfer tool', () => {
+  it('forwards the actual caller and tenant to the explicit transfer service', async () => {
+    const patch = vi.fn().mockResolvedValue({ scope: 'management_only' });
+    const service = vi.fn().mockReturnValue({ patch });
+    const baseServiceParams = {
+      provider: 'mcp',
+      authenticated: true,
+      user: { user_id: 'caller', role: 'member' },
+      tenant: { tenant_id: 'tenant-a', source: 'auth_claim' },
+    };
+    const handler = registerAndCaptureHandler('agor_branches_transfer_ownership', {
+      app: { service },
+      userId: 'caller',
+      baseServiceParams,
+    });
+    await handler({
+      branchId: 'resource-id',
+      expectedOwnerUserId: 'old-owner',
+      targetUserId: 'new-owner',
+    });
+    expect(service).toHaveBeenCalledWith('branches/:id/ownership');
+    expect(patch).toHaveBeenCalledWith(
+      null,
+      {
+        expected_owner_user_id: 'old-owner',
+        target_user_id: 'new-owner',
+      },
+      { ...baseServiceParams, route: { id: 'resource-id' } }
+    );
+  });
+});
+
+it('MCP branch get preserves server runtime support separately from permissions', async () => {
+  const capabilities = {
+    archive_preserve: { supported: true },
+    archive_clean: { supported: true },
+    archive_remove: { supported: true },
+    permanent_delete: { supported: false, reason: 'Operator storage opt-in required' },
+  };
+  const branch = { branch_id: 'branch-1', maintenance_capabilities: capabilities };
+  const get = vi.fn(async () => branch);
+  const permissions = { find: vi.fn(async () => ({ can: 'all' })) };
+  const baseServiceParams = { tenant: { tenant_id: 'tenant-a' }, user: { user_id: 'caller' } };
+  const handler = registerAndCaptureHandler('agor_branches_get', {
+    userId: 'caller',
+    baseServiceParams,
+    app: { service: (name: string) => (name === 'branches' ? { get } : permissions) },
+  });
+  const result = await handler({ branchId: 'branch-1' });
+  expect(JSON.parse(result.content[0]!.text)).toMatchObject({
+    maintenance_capabilities: capabilities,
+  });
+  expect(get).toHaveBeenCalledWith('branch-1', expect.objectContaining(baseServiceParams));
+});

@@ -1,0 +1,974 @@
+import type { UserID } from '@agor-live/client';
+import { act, renderHook, waitFor } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { consumePromptDraftSeed, stagePromptDraftSeed } from '../utils/promptDrafts';
+import {
+  AUTH_REVALIDATE_REQUESTED_EVENT,
+  TOKENS_REFRESHED_EVENT,
+} from '../utils/singleFlightRefresh';
+import { ACCESS_TOKEN_KEY, REFRESH_TOKEN_KEY } from '../utils/tokenRefresh';
+import { useAuth } from './useAuth';
+
+const authenticate = vi.fn();
+const launchCreate = vi.fn();
+const refreshCreate = vi.fn();
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((done, fail) => {
+    resolve = done;
+    reject = fail;
+  });
+  return { promise, resolve, reject };
+}
+
+function authorityOperation(isCurrent: () => boolean) {
+  const listeners = new Set<() => void>();
+  return {
+    isCurrent,
+    onInvalidate(listener: () => void) {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+    invalidate() {
+      for (const listener of [...listeners]) listener();
+      listeners.clear();
+    },
+  };
+}
+
+vi.mock('@agor-live/client', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@agor-live/client')>();
+  return {
+    ...actual,
+    createRestClient: vi.fn(async () => ({
+      authenticate,
+      service: vi.fn((name: string) => {
+        if (name === 'auth/launch') return { create: launchCreate };
+        if (name === 'authentication/refresh') return { create: refreshCreate };
+        throw new Error(`unexpected service: ${name}`);
+      }),
+    })),
+  };
+});
+
+describe('useAuth launch-code fallback', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    sessionStorage.clear();
+    authenticate.mockReset();
+    launchCreate.mockReset();
+    refreshCreate.mockReset();
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    window.history.replaceState({}, '', '/ui/?launch_code=stale-code');
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    localStorage.clear();
+    sessionStorage.clear();
+    window.history.replaceState({}, '', '/ui/');
+  });
+
+  it('notifies socket clients when launch sign-in stores fresh tokens', async () => {
+    launchCreate.mockResolvedValue({
+      accessToken: 'launch-access',
+      refreshToken: 'launch-refresh',
+      user: { user_id: 'u1', email: 'person@example.test' },
+    });
+
+    const listener = vi.fn();
+    window.addEventListener(TOKENS_REFRESHED_EVENT, listener);
+
+    try {
+      const { result } = renderHook(() => useAuth());
+
+      await waitFor(() => expect(result.current.authenticated).toBe(true));
+
+      expect(result.current.authenticationGeneration).toBeGreaterThan(0);
+      expect(listener).toHaveBeenCalledTimes(1);
+      expect((listener.mock.calls[0][0] as CustomEvent).detail).toMatchObject({
+        accessToken: 'launch-access',
+        refreshToken: 'launch-refresh',
+        user: { user_id: 'u1', email: 'person@example.test' },
+      });
+      expect(localStorage.getItem(ACCESS_TOKEN_KEY)).toBe('launch-access');
+      expect(localStorage.getItem(REFRESH_TOKEN_KEY)).toBe('launch-refresh');
+    } finally {
+      window.removeEventListener(TOKENS_REFRESHED_EVENT, listener);
+    }
+  });
+
+  it('cleans a held Marketplace handoff on logout without a SessionPanel mounted', async () => {
+    window.history.replaceState({}, '', '/ui/');
+    const { result } = renderHook(() => useAuth());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    act(() => {
+      window.dispatchEvent(
+        new CustomEvent(TOKENS_REFRESHED_EVENT, {
+          detail: {
+            accessToken: 'alice-access',
+            refreshToken: 'alice-refresh',
+            user: { user_id: 'alice', email: 'alice@example.test', role: 'member' },
+          },
+        })
+      );
+    });
+    await waitFor(() => expect(result.current.user?.user_id).toBe('alice'));
+
+    stagePromptDraftSeed('alice', 'session-logout', 'Try it');
+    await act(async () => {
+      await result.current.logout();
+    });
+    expect(consumePromptDraftSeed('alice', 'session-logout')).toBe('');
+  });
+
+  it('cleans only the departing identity on central auth replacement', async () => {
+    window.history.replaceState({}, '', '/ui/');
+    const { result } = renderHook(() => useAuth());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    act(() => {
+      window.dispatchEvent(
+        new CustomEvent(TOKENS_REFRESHED_EVENT, {
+          detail: {
+            accessToken: 'alice-access',
+            refreshToken: 'alice-refresh',
+            user: { user_id: 'alice', email: 'alice@example.test', role: 'member' },
+          },
+        })
+      );
+    });
+    await waitFor(() => expect(result.current.user?.user_id).toBe('alice'));
+
+    stagePromptDraftSeed('alice', 'session-alice-transition', 'Alice prompt');
+    act(() => {
+      window.dispatchEvent(
+        new CustomEvent(TOKENS_REFRESHED_EVENT, {
+          detail: {
+            accessToken: 'bob-access',
+            refreshToken: 'bob-refresh',
+            user: { user_id: 'bob', email: 'bob@example.test', role: 'member' },
+          },
+        })
+      );
+    });
+    await waitFor(() => expect(result.current.user?.user_id).toBe('bob'));
+
+    expect(consumePromptDraftSeed('alice', 'session-alice-transition')).toBe('');
+  });
+
+  it('preserves stored tokens and restores the normal session when launch sign-in fails', async () => {
+    localStorage.setItem(ACCESS_TOKEN_KEY, 'stored-access');
+    localStorage.setItem(REFRESH_TOKEN_KEY, 'stored-refresh');
+    launchCreate.mockRejectedValue(new Error('launch code consumed'));
+    authenticate.mockResolvedValue({
+      accessToken: 'stored-access',
+      user: { user_id: 'u1', email: 'person@example.test' },
+    });
+
+    const { result } = renderHook(() => useAuth());
+
+    await waitFor(() => expect(result.current.authenticated).toBe(true));
+
+    expect(launchCreate).toHaveBeenCalledWith({ launchCode: 'stale-code' });
+    expect(authenticate).toHaveBeenCalledWith({ strategy: 'jwt', accessToken: 'stored-access' });
+    expect(localStorage.getItem(ACCESS_TOKEN_KEY)).toBe('stored-access');
+    expect(localStorage.getItem(REFRESH_TOKEN_KEY)).toBe('stored-refresh');
+    expect(window.location.search).toBe('');
+    expect(result.current.error).toBeNull();
+  });
+
+  it('surfaces a helpful launch failure when no stored session is available', async () => {
+    launchCreate.mockRejectedValue(new Error('launch code consumed'));
+
+    const { result } = renderHook(() => useAuth());
+
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    expect(result.current.authenticated).toBe(false);
+    expect(result.current.error).toContain('Launch sign-in failed');
+    expect(window.location.search).toBe('');
+  });
+
+  it('replaces REST JSON parse failures during local login with a helpful message', async () => {
+    authenticate.mockRejectedValue(new Error('JSON parsing error'));
+
+    const { result } = renderHook(() => useAuth());
+
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    let ok = true;
+    await act(async () => {
+      ok = await result.current.login('person@example.test', 'password-123');
+    });
+
+    expect(ok).toBe(false);
+    expect(result.current.error).toContain('unexpected response');
+    expect(result.current.error).toContain('daemon URL');
+    expect(result.current.error).not.toContain('JSON parsing error');
+  });
+
+  it('notifies socket clients when local login replaces invalidated password-change tokens', async () => {
+    window.history.replaceState({}, '', '/ui/');
+    authenticate.mockResolvedValue({
+      accessToken: 'new-access',
+      refreshToken: 'new-refresh',
+      user: { user_id: 'u1', email: 'person@example.test' },
+    });
+
+    const listener = vi.fn();
+    window.addEventListener(TOKENS_REFRESHED_EVENT, listener);
+
+    try {
+      const { result } = renderHook(() => useAuth());
+
+      await waitFor(() => expect(result.current.loading).toBe(false));
+
+      await act(async () => {
+        await expect(result.current.login('person@example.test', 'password-123')).resolves.toBe(
+          true
+        );
+      });
+
+      expect(listener).toHaveBeenCalledTimes(1);
+      expect((listener.mock.calls[0][0] as CustomEvent).detail).toMatchObject({
+        accessToken: 'new-access',
+        refreshToken: 'new-refresh',
+        user: { user_id: 'u1', email: 'person@example.test' },
+      });
+    } finally {
+      window.removeEventListener(TOKENS_REFRESHED_EVENT, listener);
+    }
+  });
+
+  it('advances auth generation for explicit login/logout but not same-user token refresh', async () => {
+    window.history.replaceState({}, '', '/ui/');
+    const user = { user_id: 'u1', email: 'person@example.test' };
+    authenticate.mockResolvedValue({
+      accessToken: 'new-access',
+      refreshToken: 'new-refresh',
+      user,
+    });
+    const { result } = renderHook(() => useAuth());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    const initialGeneration = result.current.authenticationGeneration;
+
+    await act(async () => {
+      await result.current.login('person@example.test', 'password-123');
+    });
+    const loggedInGeneration = result.current.authenticationGeneration;
+    expect(loggedInGeneration).toBeGreaterThan(initialGeneration);
+    expect(result.current.isAuthenticationGenerationCurrent(loggedInGeneration)).toBe(true);
+    expect(result.current.isAuthenticationOwnerCurrent('u1' as UserID, loggedInGeneration)).toBe(
+      true
+    );
+    expect(result.current.isAuthenticationOwnerCurrent('u2' as UserID, loggedInGeneration)).toBe(
+      false
+    );
+
+    act(() => {
+      window.dispatchEvent(
+        new CustomEvent(TOKENS_REFRESHED_EVENT, {
+          detail: { accessToken: 'refreshed-access', refreshToken: 'new-refresh', user },
+        })
+      );
+    });
+    expect(result.current.authenticationGeneration).toBe(loggedInGeneration);
+
+    act(() => {
+      window.dispatchEvent(
+        new CustomEvent(TOKENS_REFRESHED_EVENT, {
+          detail: {
+            accessToken: 'replacement-access',
+            refreshToken: 'replacement-refresh',
+            user: { user_id: 'u2', email: 'other@example.test' },
+          },
+        })
+      );
+    });
+    const replacedGeneration = result.current.authenticationGeneration;
+    expect(replacedGeneration).toBeGreaterThan(loggedInGeneration);
+    expect(result.current.isAuthenticationOwnerCurrent('u1' as UserID, replacedGeneration)).toBe(
+      false
+    );
+    expect(result.current.isAuthenticationOwnerCurrent('u2' as UserID, replacedGeneration)).toBe(
+      true
+    );
+
+    await act(async () => {
+      await result.current.logout();
+    });
+    expect(result.current.authenticationGeneration).toBeGreaterThan(replacedGeneration);
+    expect(result.current.isAuthenticationGenerationCurrent(loggedInGeneration)).toBe(false);
+    expect(result.current.isAuthenticationOwnerCurrent('u1' as UserID, loggedInGeneration)).toBe(
+      false
+    );
+  });
+
+  it('advances generation when the final login authority is committed', async () => {
+    window.history.replaceState({}, '', '/ui/');
+    let resolveLogin: ((result: unknown) => void) | undefined;
+    authenticate.mockReturnValue(
+      new Promise((resolve) => {
+        resolveLogin = resolve;
+      })
+    );
+    const { result } = renderHook(() => useAuth());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    let loginPromise: Promise<boolean> | undefined;
+    act(() => {
+      loginPromise = result.current.login('person@example.test', 'password-123');
+    });
+    await waitFor(() => expect(result.current.loading).toBe(true));
+    const invalidatedGeneration = result.current.authenticationGeneration;
+
+    await act(async () => {
+      resolveLogin?.({
+        accessToken: 'committed-access',
+        refreshToken: 'committed-refresh',
+        user: { user_id: 'u1', email: 'person@example.test' },
+      });
+      await loginPromise;
+    });
+
+    expect(result.current.authenticated).toBe(true);
+    expect(result.current.authenticationGeneration).toBeGreaterThan(invalidatedGeneration);
+  });
+
+  it.each(['success', 'failure'] as const)(
+    'does not let a delayed A local-login %s overwrite B tokens or auth state',
+    async (outcome) => {
+      window.history.replaceState({}, '', '/ui/');
+      const pendingAuth = deferred<{
+        accessToken: string;
+        refreshToken: string;
+        user: { user_id: string; email: string; role?: string };
+      }>();
+      const refreshed = vi.fn();
+      window.addEventListener(TOKENS_REFRESHED_EVENT, refreshed);
+
+      try {
+        const { result } = renderHook(() => useAuth());
+        await waitFor(() => expect(result.current.loading).toBe(false));
+        let authorityA = true;
+        localStorage.setItem(ACCESS_TOKEN_KEY, 'admin-a-access');
+        localStorage.setItem(REFRESH_TOKEN_KEY, 'admin-a-refresh');
+        act(() => {
+          window.dispatchEvent(
+            new CustomEvent(TOKENS_REFRESHED_EVENT, {
+              detail: {
+                accessToken: 'admin-a-access',
+                refreshToken: 'admin-a-refresh',
+                user: {
+                  user_id: 'admin-a',
+                  email: 'admin-a@example.test',
+                  role: 'admin',
+                },
+              },
+            })
+          );
+        });
+        const operation = authorityOperation(() => authorityA);
+        const authorityCycle = result.current.captureAuthorityCycle(operation);
+        expect(authorityCycle).not.toBeNull();
+        authenticate.mockImplementationOnce(() => pendingAuth.promise);
+        let login!: ReturnType<typeof result.current.loginForAuthorityCycle>;
+        act(() => {
+          login = result.current.loginForAuthorityCycle(
+            'admin-a@example.test',
+            'new-password',
+            authorityCycle!
+          );
+        });
+
+        authorityA = false;
+        operation.invalidate();
+        localStorage.setItem(ACCESS_TOKEN_KEY, 'admin-b-access');
+        localStorage.setItem(REFRESH_TOKEN_KEY, 'admin-b-refresh');
+        act(() => {
+          window.dispatchEvent(
+            new CustomEvent(TOKENS_REFRESHED_EVENT, {
+              detail: {
+                accessToken: 'admin-b-access',
+                refreshToken: 'admin-b-refresh',
+                user: { user_id: 'admin-b', email: 'admin-b@example.test', role: 'admin' },
+              },
+            })
+          );
+        });
+
+        if (outcome === 'success') {
+          pendingAuth.resolve({
+            accessToken: 'stale-admin-a-access',
+            refreshToken: 'stale-admin-a-refresh',
+            user: { user_id: 'admin-a', email: 'admin-a@example.test', role: 'admin' },
+          });
+        } else {
+          pendingAuth.reject(new Error('stale A credentials failed'));
+        }
+        await act(async () => {
+          await expect(login).resolves.toEqual({ status: 'obsolete' });
+        });
+
+        expect(localStorage.getItem(ACCESS_TOKEN_KEY)).toBe('admin-b-access');
+        expect(localStorage.getItem(REFRESH_TOKEN_KEY)).toBe('admin-b-refresh');
+        expect(result.current.user?.user_id).toBe('admin-b');
+        expect(result.current.loading).toBe(false);
+        expect(result.current.error).toBeNull();
+        // Only the explicit A fixture and B replacement were announced. A's
+        // stale disposable REST result never dispatches a third event.
+        expect(refreshed).toHaveBeenCalledTimes(2);
+      } finally {
+        window.removeEventListener(TOKENS_REFRESHED_EVENT, refreshed);
+      }
+    }
+  );
+
+  it('deterministically releases loading when a captured reconnect cycle becomes obsolete', async () => {
+    window.history.replaceState({}, '', '/ui/');
+    const { result } = renderHook(() => useAuth());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    localStorage.setItem(ACCESS_TOKEN_KEY, 'admin-a-access');
+    localStorage.setItem(REFRESH_TOKEN_KEY, 'admin-a-refresh');
+    act(() => {
+      window.dispatchEvent(
+        new CustomEvent(TOKENS_REFRESHED_EVENT, {
+          detail: {
+            accessToken: 'admin-a-access',
+            refreshToken: 'admin-a-refresh',
+            user: { user_id: 'admin-a', email: 'admin-a@example.test', role: 'admin' },
+          },
+        })
+      );
+    });
+    let connectionReady = true;
+    const operation = authorityOperation(() => connectionReady);
+    const authorityCycle = result.current.captureAuthorityCycle(operation);
+    expect(authorityCycle).not.toBeNull();
+    const pendingAuth = deferred<{
+      accessToken: string;
+      refreshToken: string;
+      user: { user_id: string; email: string; role: string };
+    }>();
+    authenticate.mockImplementationOnce(() => pendingAuth.promise);
+
+    let login!: ReturnType<typeof result.current.loginForAuthorityCycle>;
+    act(() => {
+      login = result.current.loginForAuthorityCycle(
+        'admin-a@example.test',
+        'new-password',
+        authorityCycle!
+      );
+    });
+    await waitFor(() => expect(result.current.loading).toBe(true));
+    connectionReady = false;
+    act(() => {
+      operation.invalidate();
+    });
+
+    await act(async () => {
+      await expect(login).resolves.toEqual({ status: 'obsolete' });
+    });
+    // The held REST authentication has not resolved. Cancellation itself owns
+    // and releases the global loading gate.
+    expect(result.current.loading).toBe(false);
+    expect(result.current.user?.user_id).toBe('admin-a');
+    expect(localStorage.getItem(ACCESS_TOKEN_KEY)).toBe('admin-a-access');
+
+    pendingAuth.resolve({
+      accessToken: 'obsolete-access',
+      refreshToken: 'obsolete-refresh',
+      user: { user_id: 'admin-a', email: 'admin-a@example.test', role: 'admin' },
+    });
+    await act(() => pendingAuth.promise);
+    expect(localStorage.getItem(ACCESS_TOKEN_KEY)).toBe('admin-a-access');
+  });
+
+  it('keeps a password-change login alive when credential reconciliation runs mid-login', async () => {
+    window.history.replaceState({}, '', '/ui/');
+    const { result } = renderHook(() => useAuth());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    const userA = { user_id: 'admin-a', email: 'admin-a@example.test', role: 'admin' };
+    localStorage.setItem(ACCESS_TOKEN_KEY, 'admin-a-access');
+    localStorage.setItem(REFRESH_TOKEN_KEY, 'admin-a-refresh');
+    act(() => {
+      window.dispatchEvent(
+        new CustomEvent(TOKENS_REFRESHED_EVENT, {
+          detail: {
+            accessToken: 'admin-a-access',
+            refreshToken: 'admin-a-refresh',
+            user: userA,
+          },
+        })
+      );
+    });
+    const operation = authorityOperation(() => true);
+    const authorityCycle = result.current.captureAuthorityCycle(operation);
+    expect(authorityCycle).not.toBeNull();
+    const pendingAuth = deferred<{
+      accessToken: string;
+      refreshToken: string;
+      user: typeof userA;
+    }>();
+    authenticate.mockImplementationOnce(() => pendingAuth.promise);
+
+    let login!: ReturnType<typeof result.current.loginForAuthorityCycle>;
+    act(() => {
+      login = result.current.loginForAuthorityCycle(
+        'admin-a@example.test',
+        'new-password',
+        authorityCycle!
+      );
+    });
+    await waitFor(() => expect(result.current.loading).toBe(true));
+
+    // The socket / proactive-refresh / visibility path reconciles stored
+    // credentials while the login is out and tab authority is still current.
+    authenticate.mockResolvedValue({ accessToken: 'admin-a-access', user: userA });
+    let reconciliation!: Awaited<ReturnType<typeof result.current.reconcileStoredCredentials>>;
+    await act(async () => {
+      reconciliation = await result.current.reconcileStoredCredentials();
+    });
+    // The in-flight local login owns the next authority: reconciliation must
+    // neither cancel the login nor report the tab settled.
+    expect(reconciliation.status).toBe('unresolved');
+    expect(result.current.loading).toBe(true);
+
+    pendingAuth.resolve({
+      accessToken: 'admin-a-new-access',
+      refreshToken: 'admin-a-new-refresh',
+      user: userA,
+    });
+    await act(async () => {
+      await expect(login).resolves.toMatchObject({ status: 'signed-in' });
+    });
+    expect(localStorage.getItem(ACCESS_TOKEN_KEY)).toBe('admin-a-new-access');
+    expect(localStorage.getItem(REFRESH_TOKEN_KEY)).toBe('admin-a-new-refresh');
+    expect(result.current.accessToken).toBe('admin-a-new-access');
+    expect(result.current.loading).toBe(false);
+  });
+
+  it('does not let a delayed guarded current-user refresh install an obsolete row', async () => {
+    window.history.replaceState({}, '', '/ui/');
+    localStorage.setItem(ACCESS_TOKEN_KEY, 'admin-a-access');
+    localStorage.setItem(REFRESH_TOKEN_KEY, 'admin-a-refresh');
+    authenticate.mockResolvedValueOnce({
+      accessToken: 'admin-a-access',
+      user: { user_id: 'admin-a', email: 'admin-a@example.test' },
+    });
+
+    const { result } = renderHook(() => useAuth());
+    await waitFor(() => expect(result.current.user?.user_id).toBe('admin-a'));
+
+    const pendingRefresh = deferred<{
+      accessToken: string;
+      user: { user_id: string; email: string; role?: string };
+    }>();
+    authenticate.mockImplementationOnce(() => pendingRefresh.promise);
+    let authorityA = true;
+    let refresh!: Promise<boolean>;
+    act(() => {
+      refresh = result.current.refreshCurrentUserForAuthorityCycle(() => authorityA);
+    });
+
+    authorityA = false;
+    localStorage.setItem(ACCESS_TOKEN_KEY, 'admin-b-access');
+    localStorage.setItem(REFRESH_TOKEN_KEY, 'admin-b-refresh');
+    act(() => {
+      window.dispatchEvent(
+        new CustomEvent(TOKENS_REFRESHED_EVENT, {
+          detail: {
+            accessToken: 'admin-b-access',
+            refreshToken: 'admin-b-refresh',
+            user: { user_id: 'admin-b', email: 'admin-b@example.test' },
+          },
+        })
+      );
+    });
+    pendingRefresh.resolve({
+      accessToken: 'admin-a-access',
+      user: { user_id: 'admin-a', email: 'stale-admin-a@example.test' },
+    });
+
+    await act(async () => {
+      await expect(refresh).resolves.toBe(false);
+    });
+    expect(result.current.user?.user_id).toBe('admin-b');
+    expect(result.current.user?.email).toBe('admin-b@example.test');
+    expect(localStorage.getItem(ACCESS_TOKEN_KEY)).toBe('admin-b-access');
+  });
+
+  it('refreshes a self-updated onboarding gate without replacing the authority generation', async () => {
+    window.history.replaceState({}, '', '/ui/');
+    localStorage.setItem(ACCESS_TOKEN_KEY, 'member-access');
+    localStorage.setItem(REFRESH_TOKEN_KEY, 'member-refresh');
+    authenticate.mockResolvedValueOnce({
+      accessToken: 'member-access',
+      user: {
+        user_id: 'member-a',
+        email: 'member-a@example.test',
+        role: 'member',
+        onboarding_completed: false,
+      },
+    });
+
+    const { result } = renderHook(() => useAuth());
+    await waitFor(() => expect(result.current.user?.user_id).toBe('member-a'));
+    const authenticationGeneration = result.current.authenticationGeneration;
+
+    authenticate.mockResolvedValueOnce({
+      accessToken: 'member-access',
+      user: {
+        user_id: 'member-a',
+        email: 'member-a@example.test',
+        role: 'member',
+        onboarding_completed: true,
+      },
+    });
+
+    await act(async () => {
+      await expect(result.current.refreshCurrentUserForAuthorityCycle(() => true)).resolves.toBe(
+        true
+      );
+    });
+
+    expect(result.current.user?.onboarding_completed).toBe(true);
+    expect(result.current.authenticationGeneration).toBe(authenticationGeneration);
+    expect(authenticate).toHaveBeenLastCalledWith({
+      strategy: 'jwt',
+      accessToken: 'member-access',
+    });
+  });
+
+  it('preserves stored tokens when stored-session auth gets a non-auth transport response', async () => {
+    window.history.replaceState({}, '', '/ui/');
+    localStorage.setItem(ACCESS_TOKEN_KEY, 'stored-access');
+    localStorage.setItem(REFRESH_TOKEN_KEY, 'stored-refresh');
+    authenticate.mockRejectedValue(new Error('JSON parsing error'));
+    refreshCreate.mockRejectedValue(new Error('JSON parsing error'));
+
+    const { result } = renderHook(() => useAuth());
+
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    expect(result.current.authenticated).toBe(false);
+    expect(localStorage.getItem(ACCESS_TOKEN_KEY)).toBe('stored-access');
+    expect(localStorage.getItem(REFRESH_TOKEN_KEY)).toBe('stored-refresh');
+  });
+
+  it('preserves stored tokens when launch fallback auth gets a non-auth transport response', async () => {
+    localStorage.setItem(ACCESS_TOKEN_KEY, 'stored-access');
+    localStorage.setItem(REFRESH_TOKEN_KEY, 'stored-refresh');
+    launchCreate.mockRejectedValue(new Error('launch code consumed'));
+    authenticate.mockRejectedValue(new Error('JSON parsing error'));
+    refreshCreate.mockRejectedValue(new Error('JSON parsing error'));
+
+    const { result } = renderHook(() => useAuth());
+
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    expect(result.current.authenticated).toBe(false);
+    expect(result.current.error).toContain('Launch sign-in failed');
+    expect(localStorage.getItem(ACCESS_TOKEN_KEY)).toBe('stored-access');
+    expect(localStorage.getItem(REFRESH_TOKEN_KEY)).toBe('stored-refresh');
+  });
+});
+
+describe('same-authority network revalidation', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    localStorage.clear();
+  });
+
+  it('keeps loaded auth state while revalidating and after transient retries are exhausted', async () => {
+    window.history.replaceState({}, '', '/');
+    authenticate.mockReset();
+    localStorage.setItem(ACCESS_TOKEN_KEY, 'token');
+    const user = { user_id: 'user-a', role: 'member', email: 'a@example.test' };
+    authenticate.mockResolvedValueOnce({ accessToken: 'token', user });
+    const { result } = renderHook(() => useAuth());
+    await waitFor(() => expect(result.current.authenticated).toBe(true));
+    const generation = result.current.authenticationGeneration;
+    const probe = deferred<never>();
+    authenticate.mockReturnValueOnce(probe.promise);
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    let pending!: Promise<void>;
+    vi.useFakeTimers();
+    act(() => {
+      pending = result.current.reAuthenticate();
+    });
+    expect(result.current.loading).toBe(false);
+    expect(result.current.user).toEqual(user);
+    await act(async () => {
+      authenticate.mockRejectedValue(new Error('network error'));
+      probe.reject(new Error('network error'));
+      await vi.advanceTimersByTimeAsync(40_000);
+      await pending;
+    });
+    expect(result.current.authenticated).toBe(true);
+    expect(result.current.user).toEqual(user);
+    expect(result.current.authenticationGeneration).toBe(generation);
+    expect(localStorage.getItem(ACCESS_TOKEN_KEY)).toBe('token');
+  });
+  async function startRevalidation(token: string) {
+    window.history.replaceState({}, '', '/');
+    authenticate.mockReset();
+    localStorage.clear();
+    localStorage.setItem(ACCESS_TOKEN_KEY, token);
+    localStorage.setItem(REFRESH_TOKEN_KEY, 'refresh-a');
+    const userA = { user_id: 'user-a', role: 'member', email: 'a@example.test' };
+    authenticate.mockResolvedValueOnce({ accessToken: token, user: userA });
+    const hook = renderHook(() => useAuth());
+    await waitFor(() => expect(hook.result.current.authenticated).toBe(true));
+    const probe = deferred<{ accessToken: string; user: typeof userA }>();
+    authenticate.mockReturnValueOnce(probe.promise);
+    let pending!: Promise<void>;
+    act(() => {
+      pending = hook.result.current.reAuthenticate();
+    });
+    expect(hook.result.current.loading).toBe(false);
+    return { ...hook, userA, probe, pending };
+  }
+
+  it('settles to signed-out when a client asks for revalidation after credentials vanished', async () => {
+    window.history.replaceState({}, '', '/');
+    localStorage.setItem(ACCESS_TOKEN_KEY, 'token-a');
+    localStorage.setItem(REFRESH_TOKEN_KEY, 'refresh-a');
+    authenticate.mockResolvedValueOnce({
+      accessToken: 'token-a',
+      user: { user_id: 'user-a', role: 'member', email: 'a@example.test' },
+    });
+    const { result } = renderHook(() => useAuth());
+    await waitFor(() => expect(result.current.authenticated).toBe(true));
+    // Another tab signed out: storage is cleared, but this tab gets no event.
+    localStorage.clear();
+    act(() => {
+      window.dispatchEvent(new CustomEvent(AUTH_REVALIDATE_REQUESTED_EVENT));
+    });
+    await waitFor(() => expect(result.current.authenticated).toBe(false));
+    expect(result.current.user).toBeNull();
+    expect(result.current.loading).toBe(false);
+  });
+
+  it('does not let a stale revalidation undo a logout', async () => {
+    const { result, probe, pending, userA } = await startRevalidation('token-a');
+    await act(async () => {
+      await result.current.logout();
+    });
+    expect(result.current.authenticated).toBe(false);
+    await act(async () => {
+      probe.resolve({ accessToken: 'token-a', user: userA });
+      await pending;
+    });
+    expect(result.current.authenticated).toBe(false);
+    expect(result.current.user).toBeNull();
+    expect(result.current.accessToken).toBeNull();
+    expect(localStorage.getItem(ACCESS_TOKEN_KEY)).toBeNull();
+  });
+
+  it('does not let a stale revalidation overwrite a newly signed-in identity', async () => {
+    const { result, probe, pending, userA } = await startRevalidation('token-a');
+    const userB = { user_id: 'user-b', role: 'member', email: 'b@example.test' };
+    authenticate.mockResolvedValueOnce({
+      accessToken: 'token-b',
+      refreshToken: 'refresh-b',
+      user: userB,
+    });
+    await act(async () => {
+      await result.current.login('b@example.test', 'pw');
+    });
+    expect(result.current.user).toEqual(userB);
+    await act(async () => {
+      probe.resolve({ accessToken: 'token-a', user: userA });
+      await pending;
+    });
+    expect(result.current.user).toEqual(userB);
+    expect(result.current.accessToken).toBe('token-b');
+    expect(localStorage.getItem(ACCESS_TOKEN_KEY)).toBe('token-b');
+  });
+
+  it('does not let a stale failed revalidation clear a newly signed-in identity', async () => {
+    const { result, probe, pending } = await startRevalidation('token-a');
+    const userB = { user_id: 'user-b', role: 'member', email: 'b@example.test' };
+    authenticate.mockResolvedValueOnce({
+      accessToken: 'token-b',
+      refreshToken: 'refresh-b',
+      user: userB,
+    });
+    await act(async () => {
+      await result.current.login('b@example.test', 'pw');
+    });
+    await act(async () => {
+      probe.reject(
+        Object.assign(new Error('jwt expired'), { code: 401, name: 'NotAuthenticated' })
+      );
+      await pending;
+    });
+    expect(result.current.user).toEqual(userB);
+    expect(localStorage.getItem(ACCESS_TOKEN_KEY)).toBe('token-b');
+  });
+  it('does not store tokens from a refresh POST that outlives a logout', async () => {
+    window.history.replaceState({}, '', '/');
+    authenticate.mockReset();
+    refreshCreate.mockReset();
+    localStorage.clear();
+    localStorage.setItem(REFRESH_TOKEN_KEY, 'refresh-a');
+    const userA = { user_id: 'user-a', role: 'member', email: 'a@example.test' };
+    const post = deferred<{ accessToken: string; refreshToken: string; user: typeof userA }>();
+    refreshCreate.mockReturnValueOnce(post.promise);
+    const refreshed = vi.fn();
+    window.addEventListener(TOKENS_REFRESHED_EVENT, refreshed);
+    const { result } = renderHook(() => useAuth());
+    await waitFor(() => expect(refreshCreate).toHaveBeenCalled());
+    await act(async () => {
+      await result.current.logout();
+    });
+    await act(async () => {
+      post.resolve({ accessToken: 'late-access', refreshToken: 'late-refresh', user: userA });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    window.removeEventListener(TOKENS_REFRESHED_EVENT, refreshed);
+    expect(localStorage.getItem(ACCESS_TOKEN_KEY)).toBeNull();
+    expect(localStorage.getItem(REFRESH_TOKEN_KEY)).toBeNull();
+    expect(refreshed).not.toHaveBeenCalled();
+    expect(result.current.authenticated).toBe(false);
+    expect(result.current.user).toBeNull();
+  });
+
+  describe('refresh superseded while revalidating', () => {
+    const userA = { user_id: 'user-a', role: 'member', email: 'a@example.test' };
+    const userB = { user_id: 'user-b', role: 'member', email: 'b@example.test' };
+
+    function mountWithRefreshOnly(refreshToken: string) {
+      window.history.replaceState({}, '', '/');
+      localStorage.clear();
+      localStorage.setItem(REFRESH_TOKEN_KEY, refreshToken);
+      const post = deferred<{ accessToken: string; refreshToken: string; user: typeof userA }>();
+      refreshCreate.mockReturnValueOnce(post.promise);
+      const hook = renderHook(() => useAuth());
+      return { ...hook, post };
+    }
+
+    async function settlePostAfterRotation(
+      post: ReturnType<typeof mountWithRefreshOnly>['post'],
+      rotated: { access: string; refresh: string }
+    ) {
+      // Another tab rotates the shared refresh token while this tab's POST is out.
+      localStorage.setItem(ACCESS_TOKEN_KEY, rotated.access);
+      localStorage.setItem(REFRESH_TOKEN_KEY, rotated.refresh);
+      await act(async () => {
+        post.resolve({ accessToken: 'discarded', refreshToken: 'discarded', user: userA });
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+    }
+
+    it('clears the mount spinner by continuing with the tokens another tab stored', async () => {
+      const { result, post } = mountWithRefreshOnly('refresh-rotated-1');
+      await waitFor(() => expect(refreshCreate).toHaveBeenCalledTimes(1));
+      expect(result.current.loading).toBe(true);
+      authenticate.mockResolvedValueOnce({ accessToken: 'access-from-tab-b', user: userA });
+
+      await settlePostAfterRotation(post, {
+        access: 'access-from-tab-b',
+        refresh: 'refresh-from-tab-b',
+      });
+
+      await waitFor(() => expect(result.current.loading).toBe(false));
+      expect(authenticate).toHaveBeenCalledWith({
+        strategy: 'jwt',
+        accessToken: 'access-from-tab-b',
+      });
+      expect(result.current.authenticated).toBe(true);
+      expect(result.current.user).toEqual(userA);
+      expect(localStorage.getItem(REFRESH_TOKEN_KEY)).toBe('refresh-from-tab-b');
+    });
+
+    it('refreshes with the newly stored refresh token when the other tab left no usable access token', async () => {
+      const { result, post } = mountWithRefreshOnly('refresh-rotated-2');
+      await waitFor(() => expect(refreshCreate).toHaveBeenCalledTimes(1));
+      refreshCreate.mockResolvedValueOnce({
+        accessToken: 'access-second',
+        refreshToken: 'refresh-second',
+        user: userA,
+      });
+
+      localStorage.setItem(REFRESH_TOKEN_KEY, 'refresh-from-tab-b-2');
+      await act(async () => {
+        post.resolve({ accessToken: 'discarded', refreshToken: 'discarded', user: userA });
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+
+      await waitFor(() => expect(result.current.authenticated).toBe(true));
+      expect(refreshCreate).toHaveBeenLastCalledWith({ refreshToken: 'refresh-from-tab-b-2' });
+      expect(result.current.loading).toBe(false);
+    });
+
+    it('settles unauthenticated, not loading, when the other tab signed out', async () => {
+      const { result, post } = mountWithRefreshOnly('refresh-rotated-3');
+      await waitFor(() => expect(refreshCreate).toHaveBeenCalledTimes(1));
+
+      localStorage.clear();
+      await act(async () => {
+        post.resolve({ accessToken: 'discarded', refreshToken: 'discarded', user: userA });
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+
+      await waitFor(() => expect(result.current.loading).toBe(false));
+      expect(result.current.authenticated).toBe(false);
+    });
+
+    it('still lets a logout during the continuation win', async () => {
+      const { result, post } = mountWithRefreshOnly('refresh-rotated-4');
+      await waitFor(() => expect(refreshCreate).toHaveBeenCalledTimes(1));
+      const continuation = deferred<{ accessToken: string; user: typeof userA }>();
+      authenticate.mockReturnValueOnce(continuation.promise);
+
+      await settlePostAfterRotation(post, { access: 'access-tab-b-4', refresh: 'refresh-tab-b-4' });
+      await waitFor(() => expect(authenticate).toHaveBeenCalled());
+      await act(async () => {
+        await result.current.logout();
+      });
+      await act(async () => {
+        continuation.resolve({ accessToken: 'access-tab-b-4', user: userA });
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+
+      expect(result.current.authenticated).toBe(false);
+      expect(result.current.user).toBeNull();
+      expect(localStorage.getItem(ACCESS_TOKEN_KEY)).toBeNull();
+    });
+
+    it('does not log out a user who signed in with newer tokens when the superseded refresh is rejected', async () => {
+      const { result, post } = mountWithRefreshOnly('refresh-old-401');
+      await waitFor(() => expect(refreshCreate).toHaveBeenCalledTimes(1));
+      authenticate.mockResolvedValueOnce({
+        accessToken: 'token-b',
+        refreshToken: 'refresh-b',
+        user: userB,
+      });
+      await act(async () => {
+        await result.current.login('b@example.test', 'pw');
+      });
+      expect(result.current.user).toEqual(userB);
+
+      await act(async () => {
+        post.reject(
+          Object.assign(new Error('jwt expired'), { code: 401, name: 'NotAuthenticated' })
+        );
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+
+      expect(result.current.authenticated).toBe(true);
+      expect(result.current.user).toEqual(userB);
+      expect(localStorage.getItem(ACCESS_TOKEN_KEY)).toBe('token-b');
+      expect(localStorage.getItem(REFRESH_TOKEN_KEY)).toBe('refresh-b');
+    });
+  });
+});

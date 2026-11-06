@@ -1,0 +1,211 @@
+/**
+ * Utilities for MCP remote-transport HTTP headers.
+ *
+ * Custom headers can be secret-bearing (for service-account access) and may
+ * coexist with Agor-managed auth headers. Authorization is intentionally
+ * reserved for the `auth` config so custom headers cannot accidentally shadow
+ * OAuth/JWT/bearer credentials.
+ */
+
+import { isUserEnvPlaceholder } from '../../mcp/template-patterns';
+import type { MCPAuth } from '../../types/mcp';
+
+export const MCP_HEADER_REDACTED_SENTINEL = '••••••••';
+
+export const RESERVED_MCP_CUSTOM_HEADER_NAMES = new Set([
+  'authorization',
+  // Hop-by-hop / transport-controlled headers. These are managed by fetch,
+  // the MCP SDK transport, or the auth configuration and should not be stored
+  // as custom MCP service-account headers.
+  'connection',
+  'content-length',
+  'cookie',
+  'host',
+  'mcp-session-id',
+  'te',
+  'trailer',
+  'transfer-encoding',
+  'upgrade',
+]);
+
+const HEADER_NAME_RE = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
+
+export function isValidMCPHeaderName(name: string): boolean {
+  return HEADER_NAME_RE.test(name);
+}
+
+export function isReservedMCPCustomHeaderName(name: string): boolean {
+  return RESERVED_MCP_CUSTOM_HEADER_NAMES.has(name.toLowerCase());
+}
+
+export interface DuplicateMCPCustomHeaderName {
+  first: string;
+  duplicate: string;
+}
+
+/**
+ * Find a pair of names which Fetch would collapse into one case-insensitive
+ * header. Keeping both would make JSON insertion order security-relevant: the
+ * wire value becomes a comma-joined sequence whose order can change while a
+ * naively sorted fingerprint stays the same.
+ */
+export function findDuplicateMCPCustomHeaderName(
+  headers?: Record<string, unknown>
+): DuplicateMCPCustomHeaderName | undefined {
+  if (!headers) return undefined;
+  const names = new Map<string, string>();
+  for (const rawName of Object.keys(headers)) {
+    const name = rawName.trim();
+    if (!name) continue;
+    const canonicalName = name.toLowerCase();
+    const first = names.get(canonicalName);
+    if (first !== undefined) return { first, duplicate: rawName };
+    names.set(canonicalName, rawName);
+  }
+  return undefined;
+}
+
+export function normalizeMCPCustomHeaders(
+  headers?: Record<string, string>
+): Record<string, string> | undefined {
+  if (!headers) return undefined;
+
+  const duplicate = findDuplicateMCPCustomHeaderName(headers);
+  if (duplicate) {
+    throw new Error(
+      `Duplicate custom HTTP header names are not allowed: ${duplicate.first} and ${duplicate.duplicate}`
+    );
+  }
+
+  const normalized: Record<string, string> = {};
+  for (const [rawName, rawValue] of Object.entries(headers)) {
+    const name = rawName.trim();
+    if (!name || !isValidMCPHeaderName(name)) continue;
+    if (isReservedMCPCustomHeaderName(name)) continue;
+    if (typeof rawValue !== 'string') continue;
+    normalized[name] = rawValue;
+  }
+
+  return Object.keys(normalized).length > 0 ? normalized : undefined;
+}
+
+/**
+ * Canonical representation shared by outbound normalization, configuration
+ * mutation detection, and OAuth grant fingerprints.
+ */
+export function canonicalMCPCustomHeaderEntries(
+  headers?: Record<string, string>
+): ReadonlyArray<readonly [string, string]> {
+  return Object.entries(normalizeMCPCustomHeaders(headers) ?? {})
+    .map(([name, value]) => [name.toLowerCase(), value] as const)
+    .sort(([aName, aValue], [bName, bValue]) =>
+      aName === bName ? aValue.localeCompare(bValue) : aName.localeCompare(bName)
+    );
+}
+
+export function redactMCPCustomHeaders(
+  headers?: Record<string, string>
+): Record<string, string> | undefined {
+  const normalized = normalizeMCPCustomHeaders(headers);
+  if (!normalized) return undefined;
+  return Object.fromEntries(
+    Object.entries(normalized).map(([key, value]) => [
+      key,
+      // Leave a bare `{{ user.env.NAME }}` placeholder intact so executor-side
+      // session-scoping can resolve it against the user's env; redacting it to
+      // the sentinel would send `••••••••` as the literal header value. Raw
+      // secrets — and partial/multiple/helper expressions that can carry secret
+      // material — are still redacted.
+      isUserEnvPlaceholder(value) ? value : MCP_HEADER_REDACTED_SENTINEL,
+    ])
+  );
+}
+
+/**
+ * INVARIANT: the sentinel is never persisted. See the long-form rationale on
+ * `restoreRedactedMCPEnvSecrets` — a submitted sentinel is a claim of
+ * "unchanged", never a value, so when there is nothing stored to restore (a
+ * stale form whose header a concurrent edit removed) the key is dropped
+ * rather than written. Storing it would send `••••••••` upstream as a literal
+ * header value.
+ */
+export function restoreRedactedMCPCustomHeaders(options: {
+  current?: Record<string, string>;
+  next?: Record<string, string>;
+}): Record<string, string> | undefined {
+  if (!options.next) return undefined;
+
+  const restored: Record<string, string> = {};
+  for (const [key, value] of Object.entries(options.next)) {
+    if (value === MCP_HEADER_REDACTED_SENTINEL) {
+      const stored = options.current?.[key];
+      if (stored !== undefined) restored[key] = stored;
+      continue;
+    }
+    restored[key] = value;
+  }
+
+  return normalizeMCPCustomHeaders(restored);
+}
+
+/**
+ * A literal token prefix: printable ASCII, not starting with a space, bounded.
+ * Written exactly as sent, e.g. `Token ` or PagerDuty's `Token token=`.
+ */
+export const MCP_TOKEN_PREFIX_RE = /^[!-~][ -~]{0,63}$/;
+
+/**
+ * The one header a bearer-type auth sends. `Authorization: Bearer <token>` by
+ * default; a vendor-specific header and/or literal prefix when the row names
+ * one (e.g. `Authorization: Token token=<key>`, `api-key: <key>`).
+ */
+export function renderMCPTokenHeader(auth: {
+  token: string;
+  token_header?: string;
+  token_prefix?: string;
+}): Record<string, string> {
+  const name = auth.token_header ?? 'Authorization';
+  const prefix = auth.token_prefix ?? (auth.token_header === undefined ? 'Bearer ' : '');
+  return { [name]: `${prefix}${auth.token}` };
+}
+
+/**
+ * Whether `headers` carry the credential `auth` prescribes: the bearer row's
+ * token header and prefix (see `renderMCPTokenHeader`), or
+ * `Authorization: Bearer` for JWT and OAuth. Vacuously true without auth.
+ */
+export function hasPrescribedMCPAuthHeader(
+  auth: Pick<MCPAuth, 'type' | 'token_header' | 'token_prefix'> | undefined,
+  headers: Record<string, string> | undefined
+): boolean {
+  if (!auth || auth.type === 'none') return true;
+  const [[name, prefix]] = Object.entries(
+    renderMCPTokenHeader(auth.type === 'bearer' ? { ...auth, token: '' } : { token: '' })
+  );
+  const value = Object.entries(headers ?? {}).find(
+    ([key]) => key.toLowerCase() === name.toLowerCase()
+  )?.[1];
+  if (value === undefined) return false;
+  return (
+    value.toLowerCase().startsWith(prefix.toLowerCase()) && value.slice(prefix.length).trim() !== ''
+  );
+}
+
+export function mergeMCPRemoteHeaders(options: {
+  base?: Record<string, string>;
+  custom?: Record<string, string>;
+  auth?: Record<string, string>;
+}): Record<string, string> | undefined {
+  // Auth wins over a custom header of the same name in any casing; keeping
+  // both would let Fetch join them into one comma-separated value.
+  const authNames = new Set(Object.keys(options.auth ?? {}).map((name) => name.toLowerCase()));
+  const custom = Object.entries(normalizeMCPCustomHeaders(options.custom) ?? {}).filter(
+    ([name]) => !authNames.has(name.toLowerCase())
+  );
+  const merged: Record<string, string> = {
+    ...(options.base ?? {}),
+    ...Object.fromEntries(custom),
+    ...(options.auth ?? {}),
+  };
+  return Object.keys(merged).length > 0 ? merged : undefined;
+}

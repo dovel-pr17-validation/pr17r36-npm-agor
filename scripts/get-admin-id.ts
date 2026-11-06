@@ -1,0 +1,53 @@
+#!/usr/bin/env tsx
+/**
+ * Get Admin User ID
+ *
+ * Queries the database for the admin user's full UUID
+ */
+
+import { loadConfig, resolveBootstrapTenantId } from '@agor/core/config';
+import {
+  createDatabase,
+  createTenantScopedDatabaseProxy,
+  resolveDefaultDatabaseUrl,
+  runWithTenantDatabaseScope,
+  UsersRepository,
+} from '@agor/core/db';
+
+async function main() {
+  // Respect DATABASE_URL and AGOR_DB_DIALECT environment variables
+  let databaseUrl: string;
+  const dialect = process.env.AGOR_DB_DIALECT;
+
+  if (dialect === 'postgresql') {
+    databaseUrl = process.env.DATABASE_URL || 'postgresql://localhost:5432/agor';
+  } else {
+    databaseUrl = process.env.DATABASE_URL || resolveDefaultDatabaseUrl();
+  }
+
+  try {
+    const db = createTenantScopedDatabaseProxy(createDatabase({ url: databaseUrl }));
+    const config = await loadConfig();
+    const tenantId = resolveBootstrapTenantId(config);
+
+    // Find admin user in the active static tenant when configured.
+    const adminUser = await runWithTenantDatabaseScope(db, tenantId, async () => {
+      const userRepo = new UsersRepository(db);
+      return userRepo.findByEmail('admin@agor.live');
+    });
+
+    if (!adminUser) {
+      console.error('Admin user not found');
+      process.exit(1);
+    }
+
+    // Output just the user ID (for shell script to capture)
+    console.log(adminUser.user_id);
+    process.exit(0);
+  } catch (error) {
+    console.error('Failed to query admin user:', error);
+    process.exit(1);
+  }
+}
+
+main();

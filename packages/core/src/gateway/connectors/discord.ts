@@ -1,0 +1,1993 @@
+/**
+ * Discord gateway beta connector.
+ *
+ * The public connector owns Discord-specific validation, filtering, reply
+ * identity, chunking, and target parsing. GatewayService remains responsible
+ * for authentication, tenant-scoped authorization, audit rows, and session
+ * seeds. The transport is deliberately injected through a non-exported seam so
+ * connector tests never need a Discord account or network access.
+ */
+
+import { REST, type RESTOptions } from '@discordjs/rest';
+import { WebSocketManager, WebSocketShardEvents } from '@discordjs/ws';
+import {
+  ApplicationFlags,
+  ChannelType as DiscordChannelType,
+  GatewayCloseCodes,
+  GatewayDispatchEvents,
+  type GatewayDispatchPayload,
+  GatewayIntentBits,
+  PermissionFlagsBits,
+  Routes,
+} from 'discord-api-types/v10';
+import type {
+  ChannelType,
+  DiscordAgentChannelHistoryRequest,
+  DiscordAgentForumPostsRequest,
+  DiscordChannelHistoryResult,
+  DiscordForumPostsResult,
+  DiscordGatewayConfig,
+  DiscordParentChannelKind,
+  DiscordThreadCoordinates,
+  GatewayConnectionTestResult,
+} from '../../types/gateway';
+import {
+  discordChannelInScope,
+  discordOutboundChannelTarget,
+  discordResponseModeAdmits,
+  discordResponseModeMayAdmit,
+  isDiscordDirectMessagesEnabled,
+  isDiscordSnowflake,
+  isDiscordThreadCoordinates,
+  validateDiscordConfig,
+} from '../../types/gateway';
+import { parseGatewayChatCommand } from '../chat-commands';
+import type {
+  GatewayConnector,
+  GatewayInboundCallback,
+  GatewayListenerOptions,
+  GatewayProviderHistoryRequest,
+  GatewayProviderHistoryResult,
+  GatewaySendReceipt,
+  InboundFile,
+  InboundMessage,
+  InboundSkippedFile,
+} from '../connector';
+import type { DiscordDeliveryNonce } from '../discord-identifiers';
+import {
+  buildDiscordDirectMessageMetadata,
+  buildDiscordDirectMessageThreadKey,
+  buildDiscordInboundMetadata,
+  buildDiscordLegacyThreadKey,
+  buildDiscordMessageThreadKey,
+  buildDiscordVerifiedThreadMetadata,
+  DISCORD_METADATA_KEY,
+  parseDiscordAuthorityMetadata,
+  parseDiscordThreadKey,
+} from '../discord-identifiers';
+import { GatewayListenerError } from '../listener-error';
+import { chunkMarkdown, codePointLength } from '../markdown-chunker';
+import { gatewayFailureCode } from '../provider-error';
+import { GATEWAY_READABLE_MIMES, readableMimeForFilename } from '../readable-files';
+import {
+  createDiscordReadBudget,
+  type DiscordReadBudget,
+  fetchDiscordChannelHistory,
+  fetchDiscordForumPosts,
+  fetchDiscordProviderHistory,
+  getDiscordRecordWithinBudget,
+} from './discord-history';
+
+const DISCORD_MESSAGE_LIMIT = 2000;
+/** Prompt text for a message that carries attachments but no words. */
+const DISCORD_ATTACHMENT_ONLY_TEXT = '(attachments only, no text)';
+const DISCORD_CHANNEL_INFO_CACHE_LIMIT = 1_000;
+const DISCORD_TEXT_CHANNEL_TYPE = DiscordChannelType.GuildText;
+const DISCORD_FORUM_CHANNEL_TYPE = DiscordChannelType.GuildForum;
+const DISCORD_PUBLIC_THREAD_TYPES = new Set<number>([
+  DiscordChannelType.AnnouncementThread,
+  DiscordChannelType.PublicThread,
+]);
+const DISCORD_TEXT_MESSAGE_TYPES = new Set([0, 19]);
+/** Dispatches after which the cached guild record (roles, @everyone permissions) may be stale. */
+const DISCORD_GUILD_CHANGE_EVENTS = new Set<string>([
+  GatewayDispatchEvents.GuildUpdate,
+  GatewayDispatchEvents.GuildRoleCreate,
+  GatewayDispatchEvents.GuildRoleUpdate,
+  GatewayDispatchEvents.GuildRoleDelete,
+]);
+/** Dispatches after which a cached channel record may be stale (e.g. made private). */
+const DISCORD_CHANNEL_CHANGE_EVENTS = new Set<string>([
+  GatewayDispatchEvents.ChannelUpdate,
+  GatewayDispatchEvents.ChannelDelete,
+  GatewayDispatchEvents.ThreadUpdate,
+  GatewayDispatchEvents.ThreadDelete,
+]);
+const DISCORD_NONCE_RECOVERY_WINDOW_MS = 5 * 60_000;
+const DISCORD_ADMINISTRATOR_PERMISSION = PermissionFlagsBits.Administrator;
+const DISCORD_ALL_PERMISSIONS = (1n << 64n) - 1n;
+const DISCORD_VIEW_CHANNEL_PERMISSION = PermissionFlagsBits.ViewChannel;
+const DISCORD_SEND_MESSAGES_PERMISSION = PermissionFlagsBits.SendMessages;
+const DISCORD_READ_MESSAGE_HISTORY_PERMISSION = PermissionFlagsBits.ReadMessageHistory;
+const DISCORD_CREATE_PUBLIC_THREADS_PERMISSION = PermissionFlagsBits.CreatePublicThreads;
+const DISCORD_SEND_MESSAGES_IN_THREADS_PERMISSION = PermissionFlagsBits.SendMessagesInThreads;
+const DISCORD_MESSAGE_CONTENT_FLAGS =
+  BigInt(ApplicationFlags.GatewayMessageContent) |
+  BigInt(ApplicationFlags.GatewayMessageContentLimited);
+
+type DiscordHistoryRecordReader = (route: string) => Promise<Record<string, unknown> | null>;
+
+interface DiscordRestTransport {
+  get(route: string, options?: { signal?: AbortSignal }): Promise<unknown>;
+  post(route: string, options?: { body?: unknown }): Promise<unknown>;
+}
+
+interface DiscordGatewayTransport {
+  on(
+    event: WebSocketShardEvents.Dispatch,
+    listener: (payload: GatewayDispatchPayload, shardId: number) => void | Promise<void>
+  ): unknown;
+  on(
+    event: WebSocketShardEvents.Error | WebSocketShardEvents.SocketError,
+    listener: (error: Error, shardId: number) => void | Promise<void>
+  ): unknown;
+  on(
+    event: WebSocketShardEvents.Closed,
+    listener: (code: number, shardId: number) => void | Promise<void>
+  ): unknown;
+  connect(): Promise<void>;
+  destroy(): Promise<void>;
+}
+
+interface DiscordTransport {
+  rest: DiscordRestTransport;
+  /**
+   * REST client for agent history reads. It rejects instead of sleeping on a
+   * rate limit so the row's rate-limit budget applies. Other reads use `rest`,
+   * whose member lookups fail fast while other routes retain library handling.
+   */
+  historyRest: DiscordRestTransport;
+  createGateway(options: {
+    intents: number;
+    checkpoint: Record<string, unknown> | null | undefined;
+    onSessionInfo: (sessionInfo: unknown) => Promise<void>;
+  }): DiscordGatewayTransport;
+}
+
+interface VerifiedDiscordThread {
+  coordinates: DiscordThreadCoordinates;
+  type: number;
+}
+
+export function createDiscordRest(token: string, makeRequest?: RESTOptions['makeRequest']): REST {
+  return new REST({
+    version: '10',
+    rejectOnRateLimit: (data) => /^\/guilds\/[^/]+\/members\/[^/]+$/.test(data.route),
+    ...(makeRequest ? { makeRequest } : {}),
+  }).setToken(token);
+}
+
+/**
+ * A summon's thread or starter message definitively cannot be verified (gone,
+ * moved, or not a public child of the configured parent). Provider outages
+ * and rate limits surface as their own errors instead, so callers can retry those.
+ */
+export class DiscordThreadUnavailableError extends Error {
+  readonly name = 'DiscordThreadUnavailableError';
+}
+
+export class DiscordDirectMessageError extends Error {
+  readonly name = 'DiscordDirectMessageError';
+  constructor(
+    readonly code:
+      | 'discord_direct_messages_disabled'
+      | 'discord_dm_channel_mismatch'
+      | 'discord_dm_target_not_member'
+      | 'discord_dm_unreachable'
+      | 'discord_dm_verification_unavailable',
+    readonly status?: number
+  ) {
+    super(code);
+  }
+
+  /** Only a failed pre-send recipient check is safe to retry: no message POST was attempted. */
+  get retryable(): boolean {
+    return this.code === 'discord_dm_verification_unavailable';
+  }
+}
+
+function defaultDiscordTransport(token: string): DiscordTransport {
+  // Clients are built on first use: connectors are often created only to
+  // validate config or serve one read, and each REST client starts recurring
+  // cache sweeper timers that are never cleared.
+  let rest: REST | undefined;
+  const sharedRest = () => {
+    rest ??= createDiscordRest(token);
+    return rest;
+  };
+  let historyRest: DiscordRestTransport | undefined;
+  return {
+    get rest() {
+      return sharedRest();
+    },
+    // Agent history reads are one-shot, so this client runs no sweeper timers.
+    get historyRest() {
+      historyRest ??= new REST({
+        version: '10',
+        rejectOnRateLimit: () => true,
+        hashSweepInterval: 0,
+        handlerSweepInterval: 0,
+      }).setToken(token);
+      return historyRest;
+    },
+    createGateway: ({ onSessionInfo, intents }) =>
+      new WebSocketManager({
+        token,
+        rest: sharedRest(),
+        intents,
+        shardCount: 1,
+        updateSessionInfo: async (shardId, sessionInfo) => {
+          if (sessionInfo) await onSessionInfo(sessionInfo);
+          void shardId;
+        },
+      }) as unknown as DiscordGatewayTransport,
+  };
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+/** Keep only numeric retry metadata when sanitizing a provider error. */
+function withDeliveryErrorMetadata(error: unknown, message: string): Error {
+  const record = asRecord(error);
+  if (record?.code === 50007 || record?.code === 50278) {
+    return new DiscordDirectMessageError(
+      'discord_dm_unreachable',
+      typeof record.status === 'number' ? record.status : undefined
+    );
+  }
+  const wrapped = new Error(message);
+  if (!record) return wrapped;
+  const status = record.status ?? record.statusCode ?? record.code;
+  if (typeof status === 'number') {
+    (wrapped as Error & { status: number }).status = status;
+  }
+  const retryAfter =
+    record.retry_after_ms ??
+    record.retryAfterMs ??
+    record.retry_after ??
+    record.retryAfter ??
+    asRecord(record.rawError)?.retry_after;
+  if (typeof retryAfter === 'number' && Number.isFinite(retryAfter)) {
+    if (record.retry_after_ms !== undefined || record.retryAfterMs !== undefined) {
+      (wrapped as Error & { retry_after_ms: number }).retry_after_ms = retryAfter;
+    } else {
+      (wrapped as Error & { retry_after: number }).retry_after = retryAfter;
+    }
+  }
+  return wrapped;
+}
+
+function snowflake(value: unknown): string | undefined {
+  return isDiscordSnowflake(value) ? value : undefined;
+}
+
+const DISCORD_ATTACHMENT_CDN_HOST = 'cdn.discordapp.com';
+const DISCORD_ATTACHMENT_PATH = /^\/attachments\/\d{17,20}\/\d{17,20}\/.+$/;
+const DISCORD_SIGNED_ATTACHMENT_QUERY = new Set(['ex', 'is', 'hm']);
+/**
+ * Attachment types handed to the agent: images and text-like files. Mirrors
+ * the daemon's gateway ingestion allowlist, which re-checks each download.
+ */
+/**
+ * Discord attachment URLs are signed CDN URLs, not arbitrary user-provided
+ * download targets. Keep the accepted shape narrow so the daemon can fetch
+ * without forwarding a channel credential or accepting external URL input.
+ */
+export function isAllowedDiscordAttachmentUrl(rawUrl: string): boolean {
+  let url: URL;
+  try {
+    url = new URL(rawUrl);
+  } catch {
+    return false;
+  }
+  if (
+    url.protocol !== 'https:' ||
+    url.hostname.toLowerCase() !== DISCORD_ATTACHMENT_CDN_HOST ||
+    url.username ||
+    url.password ||
+    url.port ||
+    url.hash ||
+    !DISCORD_ATTACHMENT_PATH.test(url.pathname)
+  ) {
+    return false;
+  }
+  const queryKeys = [...url.searchParams.keys()];
+  return (
+    queryKeys.length === DISCORD_SIGNED_ATTACHMENT_QUERY.size &&
+    queryKeys.every((key) => DISCORD_SIGNED_ATTACHMENT_QUERY.has(key)) &&
+    [...DISCORD_SIGNED_ATTACHMENT_QUERY].every((key) => {
+      const value = url.searchParams.get(key);
+      return typeof value === 'string' && value.length > 0;
+    })
+  );
+}
+
+function discordAttachmentMime(contentType: unknown, filename: string): string | undefined {
+  if (contentType !== undefined && contentType !== null && typeof contentType !== 'string') {
+    return undefined;
+  }
+  const normalized =
+    typeof contentType === 'string' ? contentType.split(';')[0].trim().toLowerCase() : '';
+  if (normalized) return GATEWAY_READABLE_MIMES.has(normalized) ? normalized : undefined;
+  return readableMimeForFilename(filename);
+}
+
+/**
+ * Split a live message's attachments into files the agent can read and files
+ * that are skipped (with a reason), so a message is never dropped because of
+ * an attachment and the user can be told what was not read. Returns
+ * undefined only when the attachment list itself is malformed.
+ */
+export function partitionDiscordInboundFiles(
+  rawAttachments: unknown,
+  filesEnabled: boolean
+): { files: InboundFile[]; skipped: InboundSkippedFile[] } | undefined {
+  if (!Array.isArray(rawAttachments)) return undefined;
+  const files: InboundFile[] = [];
+  const skipped: InboundSkippedFile[] = [];
+  for (const rawAttachment of rawAttachments) {
+    const attachment = asRecord(rawAttachment);
+    const id = snowflake(attachment?.id);
+    const filename = attachment?.filename;
+    const size = attachment?.size;
+    const url = attachment?.url;
+    const name =
+      typeof filename === 'string' && filename.length > 0 && filename.length <= 255
+        ? filename
+        : 'attachment';
+    if (
+      !id ||
+      name !== filename ||
+      !Number.isSafeInteger(size) ||
+      (size as number) < 0 ||
+      typeof url !== 'string' ||
+      !isAllowedDiscordAttachmentUrl(url)
+    ) {
+      skipped.push({ name, reason: 'invalid' });
+      continue;
+    }
+    if (!filesEnabled) {
+      skipped.push({ name, reason: 'files_disabled' });
+      continue;
+    }
+    const mimetype = discordAttachmentMime(attachment?.content_type, name);
+    if (!mimetype) {
+      skipped.push({ name, reason: 'unsupported_type' });
+      continue;
+    }
+    files.push({ id, name, mimetype, size: size as number, url_private_download: url });
+  }
+  return { files, skipped };
+}
+
+function hasUnsupportedDiscordRichPayload(message: Record<string, unknown>): boolean {
+  for (const field of ['embeds', 'components', 'sticker_items'] as const) {
+    const value = message[field];
+    if (value !== undefined && (!Array.isArray(value) || value.length > 0)) return true;
+  }
+  return message.poll !== undefined;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function discordMentionRanges(text: string, botUserId: string): Array<[number, number]> {
+  const mention = new RegExp(`<@!?${escapeRegExp(botUserId)}>`, 'g');
+  const ranges: Array<[number, number]> = [];
+  for (const match of text.matchAll(mention)) {
+    if (match.index !== undefined) ranges.push([match.index, match.index + match[0].length]);
+  }
+  return ranges;
+}
+
+/** True when a character offset is inside an inline or fenced Markdown code span. */
+function isDiscordCodeOffset(text: string, offset: number): boolean {
+  let fenced = false;
+  let inline = false;
+  for (let index = 0; index < text.length && index < offset; index += 1) {
+    if (text.startsWith('```', index)) {
+      if (!inline) fenced = !fenced;
+      index += 2;
+      continue;
+    }
+    if (text[index] === '`' && !fenced) inline = !inline;
+  }
+  return fenced || inline;
+}
+
+/**
+ * Discord's structured `mentions` list is the authority for a bot mention;
+ * content matching alone would admit look-alike text.  The content scan then
+ * excludes mentions embedded in inline or fenced code.
+ */
+export function hasStructuredDiscordBotMention(
+  message: Record<string, unknown>,
+  botUserId: string
+): boolean {
+  const mentions = Array.isArray(message.mentions) ? message.mentions.map(asRecord) : [];
+  if (!mentions.some((mention) => mention?.id === botUserId)) return false;
+  const content = typeof message.content === 'string' ? message.content : '';
+  return discordMentionRanges(content, botUserId).some(
+    ([start]) => !isDiscordCodeOffset(content, start)
+  );
+}
+
+/** Remove only structured bot mentions that are outside code spans. */
+function stripStructuredDiscordBotMention(text: string, botUserId: string): string {
+  const ranges = discordMentionRanges(text, botUserId).filter(
+    ([start]) => !isDiscordCodeOffset(text, start)
+  );
+  if (ranges.length === 0) return text.trim();
+  let output = '';
+  let cursor = 0;
+  for (const [start, end] of ranges) {
+    output += text.slice(cursor, start);
+    cursor = end;
+  }
+  return `${output}${text.slice(cursor)}`.replace(/^\s+|\s+$/g, '');
+}
+
+function configuredString(config: DiscordGatewayConfig, key: keyof DiscordGatewayConfig): string {
+  const value = config[key];
+  return typeof value === 'string' ? value : '';
+}
+
+function configuredChannelIds(config: DiscordGatewayConfig): string[] {
+  return Array.isArray(config.allowed_channel_ids)
+    ? config.allowed_channel_ids.filter((id): id is string => typeof id === 'string')
+    : [];
+}
+
+function messageThreadId(channelId: string, messageId: string): string {
+  return buildDiscordMessageThreadKey(channelId, messageId);
+}
+
+function existingThreadId(parentChannelId: string, threadChannelId: string): string {
+  return buildDiscordLegacyThreadKey(parentChannelId, threadChannelId);
+}
+
+function parseThreadId(threadId: string): {
+  channelId: string;
+  messageId?: string;
+  directMessageUserId?: string;
+  parentChannelId?: string;
+  existingThread: boolean;
+  providerThread: boolean;
+} {
+  const parsed = parseDiscordThreadKey(threadId);
+  if (parsed?.kind === 'direct_message') {
+    return {
+      channelId: parsed.channelId,
+      directMessageUserId: parsed.userId,
+      existingThread: false,
+      providerThread: false,
+    };
+  }
+  if (parsed?.kind === 'legacy_thread') {
+    return {
+      channelId: parsed.threadChannelId,
+      parentChannelId: parsed.parentChannelId,
+      existingThread: true,
+      providerThread: false,
+    };
+  }
+  if (parsed?.kind === 'message') {
+    return {
+      channelId: parsed.channelId,
+      messageId: parsed.messageId,
+      existingThread: false,
+      providerThread: false,
+    };
+  }
+  if (parsed?.kind === 'provider_thread') {
+    return { channelId: parsed.channelId, existingThread: true, providerThread: true };
+  }
+  throw new Error(`Invalid Discord thread ID: ${threadId}`);
+}
+
+/** Split text deterministically without ever exceeding Discord's 2000-code-point cap. */
+export function chunkDiscordMessage(text: string, limit = DISCORD_MESSAGE_LIMIT): string[] {
+  return chunkMarkdown(text, { limit, measure: codePointLength, label: 'Discord' });
+}
+
+/** Remove only the bot mention forms Discord emits for a message content. */
+export function stripDiscordBotMention(text: string, botUserId: string): string {
+  return text.replace(new RegExp(`<@!?${botUserId}>`, 'g'), '').replace(/^\s+|\s+$/g, '');
+}
+
+function providerError(error: unknown): string {
+  return gatewayFailureCode(error);
+}
+
+function replyAliases(channelId: string, messageIds: string[]): string[] {
+  return messageIds.map((messageId) => messageThreadId(channelId, messageId));
+}
+
+function toIsoTimestamp(value: unknown): string {
+  if (typeof value === 'string' && !Number.isNaN(Date.parse(value))) return value;
+  return new Date().toISOString();
+}
+
+/** A forum channel: every post is a public thread whose starter lives inside it. */
+function isForumChannel(channel: Record<string, unknown> | null): boolean {
+  return channel?.type === DISCORD_FORUM_CHANNEL_TYPE;
+}
+
+function channelKind(
+  channel: Record<string, unknown> | null
+): DiscordParentChannelKind | undefined {
+  if (channel?.type === DISCORD_TEXT_CHANNEL_TYPE) return 'text';
+  if (isForumChannel(channel)) return 'forum';
+  return undefined;
+}
+
+/** Allowed channels given a `starters`/`all` response mode that are not forums. */
+function nonForumResponseModeChannels(
+  config: DiscordGatewayConfig,
+  channels: Array<{ channelId: string; channel: Record<string, unknown> | null }>
+): string[] {
+  return channels
+    .filter(({ channelId, channel }) => {
+      const mode = config.response_modes?.[channelId];
+      return (mode === 'starters' || mode === 'all') && !isForumChannel(channel);
+    })
+    .map(({ channelId }) => channelId);
+}
+
+/** True when outbound is on and its default target is one of these allowed forum channels. */
+function isForumDefaultOutboundTarget(
+  config: DiscordGatewayConfig,
+  channels: Array<{ channelId: string; channel: Record<string, unknown> | null }>
+): boolean {
+  const target =
+    config.outbound_enabled === true && config.default_outbound_target
+      ? discordOutboundChannelTarget(config.default_outbound_target)
+      : undefined;
+  if (!target) return false;
+  return channels.some(
+    ({ channelId, channel }) =>
+      channelId === target && channel?.id === channelId && isForumChannel(channel)
+  );
+}
+
+/** A public text or forum channel that @everyone can view. */
+function isPublicParentChannel(channel: Record<string, unknown> | null, guildId: string): boolean {
+  if (!channel || !channelKind(channel)) return false;
+  const overwrites = channel.permission_overwrites;
+  if (!Array.isArray(overwrites)) return true;
+  const everyone = overwrites
+    .map(asRecord)
+    .find(
+      (overwrite) =>
+        overwrite?.id === guildId && (overwrite.type === undefined || overwrite.type === 0)
+    );
+  if (!everyone) return true;
+  const deny = everyone.deny;
+  try {
+    const denied =
+      typeof deny === 'string' ? BigInt(deny) : typeof deny === 'number' ? BigInt(deny) : null;
+    return denied !== null && (denied & DISCORD_VIEW_CHANNEL_PERMISSION) === 0n;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Whether @everyone can view a channel, from its guild-level permissions and
+ * the channel's overwrites; a role-gated channel is private even without a deny.
+ */
+function everyoneCanView(
+  guild: Record<string, unknown> | null,
+  channel: Record<string, unknown> | null,
+  guildId: string
+): boolean {
+  const permissions = effectiveChannelPermissions(guild, { roles: [] }, channel, guildId, '');
+  return (permissions & DISCORD_VIEW_CHANNEL_PERMISSION) !== 0n;
+}
+
+function permissionBits(value: unknown): bigint {
+  try {
+    return typeof value === 'string' || typeof value === 'number' ? BigInt(value) : 0n;
+  } catch {
+    return 0n;
+  }
+}
+
+function messageContentCapability(
+  application: Record<string, unknown> | null
+): boolean | undefined {
+  const rawFlags = application?.flags;
+  let flags: bigint;
+  try {
+    if (typeof rawFlags === 'bigint') flags = rawFlags;
+    else if (typeof rawFlags === 'number' && Number.isSafeInteger(rawFlags))
+      flags = BigInt(rawFlags);
+    else if (typeof rawFlags === 'string' && /^\d+$/.test(rawFlags)) flags = BigInt(rawFlags);
+    else return undefined;
+  } catch {
+    return undefined;
+  }
+  return (flags & DISCORD_MESSAGE_CONTENT_FLAGS) !== 0n;
+}
+
+function effectiveChannelPermissions(
+  guild: Record<string, unknown> | null,
+  member: Record<string, unknown> | null,
+  channel: Record<string, unknown> | null,
+  guildId: string,
+  botUserId: string
+): bigint {
+  const direct = permissionBits(member?.permissions);
+  if (direct !== 0n) {
+    return (direct & DISCORD_ADMINISTRATOR_PERMISSION) !== 0n ? DISCORD_ALL_PERMISSIONS : direct;
+  }
+  const roles = Array.isArray(guild?.roles) ? guild.roles.map(asRecord).filter(Boolean) : [];
+  const memberRoles = Array.isArray(member?.roles)
+    ? member.roles.filter((role): role is string => typeof role === 'string')
+    : [];
+  const everyoneRole = roles.find((role) => role?.id === guildId);
+  let permissions = permissionBits(everyoneRole?.permissions);
+  for (const role of roles) {
+    if (typeof role?.id === 'string' && memberRoles.includes(role.id)) {
+      permissions |= permissionBits(role.permissions);
+    }
+  }
+  // Administrator grants every permission and bypasses channel overwrites.
+  if ((permissions & DISCORD_ADMINISTRATOR_PERMISSION) !== 0n) return DISCORD_ALL_PERMISSIONS;
+  const overwrites = Array.isArray(channel?.permission_overwrites)
+    ? channel.permission_overwrites.map(asRecord).filter(Boolean)
+    : [];
+  const everyone = overwrites.find((overwrite) => overwrite?.id === guildId);
+  if (everyone) {
+    permissions &= ~permissionBits(everyone.deny);
+    permissions |= permissionBits(everyone.allow);
+  }
+  const roleOverwrite = overwrites.filter(
+    (overwrite) => typeof overwrite?.id === 'string' && memberRoles.includes(overwrite.id)
+  );
+  const roleDeny = roleOverwrite.reduce(
+    (bits, overwrite) => bits | permissionBits(overwrite?.deny),
+    0n
+  );
+  const roleAllow = roleOverwrite.reduce(
+    (bits, overwrite) => bits | permissionBits(overwrite?.allow),
+    0n
+  );
+  permissions &= ~roleDeny;
+  permissions |= roleAllow;
+  const memberOverwrite = overwrites.find((overwrite) => overwrite?.id === botUserId);
+  if (memberOverwrite) {
+    permissions &= ~permissionBits(memberOverwrite.deny);
+    permissions |= permissionBits(memberOverwrite.allow);
+  }
+  return permissions;
+}
+
+export class DiscordConnector implements GatewayConnector {
+  readonly channelType: ChannelType = 'discord';
+
+  private readonly config: DiscordGatewayConfig;
+  private readonly transport: DiscordTransport;
+  private gateway: DiscordGatewayTransport | null = null;
+  private botUserId: string | null = null;
+  private readonly channelInfoCache = new Map<string, Record<string, unknown>>();
+  private guildInfo: Record<string, unknown> | null = null;
+  private lastSequence = -1;
+  private dispatchChain: Promise<void> = Promise.resolve();
+  private stopped = false;
+
+  constructor(config: Record<string, unknown>, transport?: DiscordTransport) {
+    this.config = config as DiscordGatewayConfig;
+    this.transport =
+      transport ?? defaultDiscordTransport(configuredString(this.config, 'bot_token'));
+  }
+
+  private validate(requireBotToken = true): void {
+    const result = validateDiscordConfig(this.config as Record<string, unknown>, {
+      requireBotToken,
+    });
+    if (!result.ok) throw new Error(`Invalid Discord configuration: ${result.errors.join('; ')}`);
+  }
+
+  private validateForListener(): void {
+    const result = validateDiscordConfig(this.config as Record<string, unknown>, {
+      requireBotToken: true,
+    });
+    if (!result.ok) {
+      throw new GatewayListenerError(
+        'discord_config_invalid',
+        'permanent',
+        `Fix the Discord gateway configuration: ${result.errors.join('; ')}`
+      );
+    }
+  }
+
+  /**
+   * Discord exposes the approved message-content capability on the
+   * application resource when that REST surface includes flags.  Missing or
+   * unparseable flags remain unknown; this probe does not claim to prove
+   * Developer Portal state or gateway delivery.
+   */
+  private async readMessageContentCapability(): Promise<boolean | undefined> {
+    try {
+      return messageContentCapability(
+        await this.getProviderRecord(Routes.oauth2CurrentApplication())
+      );
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async requireMessageContentCapability(): Promise<void> {
+    if ((await this.readMessageContentCapability()) === false) {
+      throw new GatewayListenerError(
+        'discord_message_content_unavailable',
+        'permanent',
+        'Discord application flags do not report the Message Content intent capability.'
+      );
+    }
+  }
+
+  private providerStatus(error: unknown): number | undefined {
+    const record = asRecord(error);
+    const status = record?.status ?? record?.statusCode;
+    return typeof status === 'number' ? status : undefined;
+  }
+
+  private async getProviderRecord(route: string): Promise<Record<string, unknown> | null> {
+    try {
+      return asRecord(await this.transport.rest.get(route));
+    } catch (error) {
+      if (this.providerStatus(error) === 404) return null;
+      throw error;
+    }
+  }
+
+  private async lookupGuildMember(userId: string): Promise<Record<string, unknown> | null> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 3_000);
+    try {
+      return asRecord(
+        await this.transport.rest.get(
+          Routes.guildMember(configuredString(this.config, 'guild_id'), userId),
+          { signal: controller.signal }
+        )
+      );
+    } catch (error) {
+      if (this.providerStatus(error) === 404) return null;
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  private async verifyPublicThread(
+    rawThread: unknown,
+    parentChannelId: string,
+    starterMessageId: string
+  ): Promise<VerifiedDiscordThread> {
+    const candidate = asRecord(rawThread);
+    const threadId = snowflake(candidate?.id);
+    if (!threadId) throw new Error('Discord thread response has an invalid thread id');
+
+    const thread = await this.getProviderRecord(Routes.channel(threadId));
+    const coordinates = {
+      guild_id: thread?.guild_id,
+      parent_channel_id: thread?.parent_id,
+      thread_channel_id: thread?.id,
+      starter_message_id: starterMessageId,
+    };
+    if (
+      !isDiscordThreadCoordinates(coordinates) ||
+      coordinates.guild_id !== configuredString(this.config, 'guild_id') ||
+      coordinates.parent_channel_id !== parentChannelId ||
+      !DISCORD_PUBLIC_THREAD_TYPES.has(thread?.type as number)
+    ) {
+      throw new DiscordThreadUnavailableError(
+        'Discord provider thread is not a verified public child of the configured parent'
+      );
+    }
+
+    // A successful starter lookup is the accessibility proof used by the
+    // listener. Discord keeps a message-started public thread's starter in
+    // the parent channel, even though the thread channel id equals the starter
+    // message id, so callers verify it through the parent route. A forum post's
+    // starter is the first message inside the post itself.
+    return { coordinates, type: thread?.type as number };
+  }
+
+  private async lookupThreadForStarter(
+    parentChannelId: string,
+    starterMessageId: string
+  ): Promise<VerifiedDiscordThread | null> {
+    const starter = await this.getProviderRecord(
+      Routes.channelMessage(parentChannelId, starterMessageId)
+    );
+    if (!starter || starter.id !== starterMessageId || starter.channel_id !== parentChannelId) {
+      throw new Error('Discord summon starter message is inaccessible or malformed');
+    }
+    const existingThread = asRecord(starter.thread);
+    if (!existingThread) return null;
+    return this.verifyPublicThread(existingThread, parentChannelId, starterMessageId);
+  }
+
+  private async reconcilePublicSummonThread(
+    parentChannelId: string,
+    starterMessageId: string
+  ): Promise<VerifiedDiscordThread> {
+    // The starter lookup is intentionally before the one conditional create.
+    // After a daemon crash, Discord's starter message is the durable provider
+    // identity that lets a replacement owner recover without another thread.
+    const existing = await this.lookupThreadForStarter(parentChannelId, starterMessageId);
+    if (existing) return existing;
+
+    const body = {
+      name: `Agor request ${starterMessageId.slice(-8)}`,
+      auto_archive_duration: this.config.thread_auto_archive_minutes ?? 1440,
+    };
+    let created: unknown;
+    try {
+      created = await this.transport.rest.post(Routes.threads(parentChannelId, starterMessageId), {
+        body,
+      });
+    } catch (error) {
+      // Discord may have committed the thread while the request was lost, or
+      // may report a conflict after another owner won.  Always reconcile by
+      // starter identity before surfacing the failure; never blindly retry a
+      // provider create.
+      const afterConflict = await this.lookupThreadForStarter(parentChannelId, starterMessageId);
+      if (afterConflict) return afterConflict;
+      throw new Error(`Discord public thread creation failed: ${gatewayFailureCode(error)}`);
+    }
+
+    const createdRecord = asRecord(created);
+    if (!createdRecord?.id) {
+      const afterAmbiguousResult = await this.lookupThreadForStarter(
+        parentChannelId,
+        starterMessageId
+      );
+      if (afterAmbiguousResult) return afterAmbiguousResult;
+      throw new Error('Discord public thread creation returned malformed coordinates');
+    }
+    try {
+      return await this.verifyPublicThread(createdRecord, parentChannelId, starterMessageId);
+    } catch (error) {
+      const afterAmbiguousResult = await this.lookupThreadForStarter(
+        parentChannelId,
+        starterMessageId
+      );
+      if (afterAmbiguousResult) return afterAmbiguousResult;
+      throw error;
+    }
+  }
+
+  /**
+   * Remember a looked-up channel. Response modes can look up many unrelated
+   * channels and threads, so the oldest lookups are evicted past a bound;
+   * allowlisted parents are re-read on demand.
+   */
+  private cacheChannelInfo(channelId: string, channel: Record<string, unknown>): void {
+    this.channelInfoCache.delete(channelId);
+    this.channelInfoCache.set(channelId, channel);
+    while (this.channelInfoCache.size > DISCORD_CHANNEL_INFO_CACHE_LIMIT) {
+      const oldest = this.channelInfoCache.keys().next().value;
+      if (oldest === undefined) break;
+      this.channelInfoCache.delete(oldest);
+    }
+  }
+
+  /** A cached channel lookup, refreshed as most recently used. */
+  private cachedChannelInfo(channelId: string): Record<string, unknown> | undefined {
+    const channel = this.channelInfoCache.get(channelId);
+    if (channel) this.cacheChannelInfo(channelId, channel);
+    return channel;
+  }
+
+  /**
+   * An allowed parent channel record, from the listener's cache when present.
+   * Listed channels are checked at startup; an unlisted one admitted by
+   * `allow_all_public_channels` must be a public parent in the guild.
+   */
+  private async getAllowedParentChannel(
+    parentChannelId: string
+  ): Promise<Record<string, unknown> | null> {
+    if (!discordChannelInScope(this.config, parentChannelId)) return null;
+    let parent = this.cachedChannelInfo(parentChannelId) ?? null;
+    if (!parent) {
+      parent = await this.getProviderRecord(Routes.channel(parentChannelId));
+      if (parent?.id !== parentChannelId) return null;
+      this.cacheChannelInfo(parentChannelId, parent);
+    }
+    if (configuredChannelIds(this.config).includes(parentChannelId)) return parent;
+    const guildId = configuredString(this.config, 'guild_id');
+    if (parent.guild_id !== guildId || !isPublicParentChannel(parent, guildId)) return null;
+    return everyoneCanView(await this.getGuildInfo(), parent, guildId) ? parent : null;
+  }
+
+  /** The configured guild's record, cached until a guild or role change dispatch. */
+  private async getGuildInfo(): Promise<Record<string, unknown> | null> {
+    this.guildInfo ??= await this.getProviderRecord(
+      Routes.guild(configuredString(this.config, 'guild_id'))
+    );
+    return this.guildInfo;
+  }
+
+  /** Whether a parent channel is allowed; only an unlisted one needs a lookup. */
+  private async isAllowedParentChannel(channelId: string): Promise<boolean> {
+    if (!isDiscordSnowflake(channelId) || !discordChannelInScope(this.config, channelId)) {
+      return false;
+    }
+    if (configuredChannelIds(this.config).includes(channelId)) return true;
+    return (await this.getAllowedParentChannel(channelId)) !== null;
+  }
+
+  private async verifyExistingPublicThread(
+    threadChannelId: string,
+    parentChannelId: string,
+    starterMessageId: string
+  ): Promise<VerifiedDiscordThread> {
+    const thread = await this.getProviderRecord(Routes.channel(threadChannelId));
+    if (!thread) throw new DiscordThreadUnavailableError('Discord public thread is inaccessible');
+    const verified = await this.verifyPublicThread(thread, parentChannelId, starterMessageId);
+    const parent = await this.getAllowedParentChannel(parentChannelId);
+    if (!parent) {
+      throw new DiscordThreadUnavailableError('Discord public thread parent is inaccessible');
+    }
+    const starterChannelId = isForumChannel(parent) ? threadChannelId : parentChannelId;
+    const starter = await this.getProviderRecord(
+      Routes.channelMessage(starterChannelId, starterMessageId)
+    );
+    if (!starter || starter.id !== starterMessageId || starter.channel_id !== starterChannelId) {
+      throw new DiscordThreadUnavailableError(
+        'Discord public thread starter message is inaccessible or malformed'
+      );
+    }
+    return verified;
+  }
+
+  private async prepareInboundDelivery(
+    prepared: {
+      channelId: string;
+      messageId: string;
+      isThread: boolean;
+      parentChannelId?: string;
+    },
+    context?: { skipProviderThreadMaterialization?: boolean }
+  ): Promise<Record<string, unknown>> {
+    if (context?.skipProviderThreadMaterialization) return {};
+
+    const verified = prepared.isThread
+      ? await this.verifyExistingPublicThread(
+          prepared.channelId,
+          prepared.parentChannelId!,
+          prepared.channelId
+        )
+      : await this.reconcilePublicSummonThread(prepared.channelId, prepared.messageId);
+    return buildDiscordVerifiedThreadMetadata(verified.coordinates, verified.type);
+  }
+
+  private async sendChunk(
+    channelId: string,
+    content: string,
+    replyToMessageId?: string,
+    delivery?: { nonce: DiscordDeliveryNonce; enforceNonce: true }
+  ): Promise<{ id: string }> {
+    const body = {
+      content,
+      allowed_mentions: { parse: [] },
+      ...(delivery ? { nonce: delivery.nonce, enforce_nonce: true } : {}),
+      ...(replyToMessageId
+        ? {
+            message_reference: {
+              message_id: replyToMessageId,
+              channel_id: channelId,
+              fail_if_not_exists: false,
+            },
+          }
+        : {}),
+    };
+    let raw: Record<string, unknown> | null;
+    try {
+      raw = asRecord(await this.transport.rest.post(Routes.channelMessages(channelId), { body }));
+    } catch (error) {
+      throw withDeliveryErrorMetadata(error, `Discord API failure: ${gatewayFailureCode(error)}`);
+    }
+    const id = snowflake(raw?.id);
+    if (!id) throw new Error('Discord API response did not include a message id');
+    return { id };
+  }
+
+  private receipt(
+    channelId: string,
+    threadId: string,
+    ids: string[],
+    permalink = true,
+    directMessage = parseDiscordThreadKey(threadId)?.kind === 'direct_message'
+  ): GatewaySendReceipt {
+    const firstId = ids[0];
+    const lastId = ids[ids.length - 1];
+    return {
+      messageId: lastId,
+      messageIds: ids,
+      threadId,
+      replyAliases: directMessage ? [] : replyAliases(channelId, ids),
+      platformChannelId: channelId,
+      platformThreadId: threadId,
+      ...(permalink
+        ? {
+            permalink: `https://discord.com/channels/${directMessage ? '@me' : configuredString(this.config, 'guild_id')}/${channelId}/${firstId}`,
+          }
+        : {}),
+    };
+  }
+
+  async sendMessage(req: {
+    threadId: string;
+    text: string;
+    blocks?: unknown[];
+    metadata?: Record<string, unknown>;
+  }): Promise<GatewaySendReceipt> {
+    this.validate();
+    const parsed = parseThreadId(req.threadId);
+    const metadata = parseDiscordAuthorityMetadata(req.metadata);
+    if (req.metadata !== undefined && !metadata) {
+      throw new Error('Discord outbound metadata contains a malformed authority field');
+    }
+    let parentChannelId = parsed.parentChannelId ?? parsed.channelId;
+    if (parsed.providerThread) {
+      const thread = await this.getProviderRecord(Routes.channel(parsed.channelId));
+      if (
+        !thread ||
+        thread.id !== parsed.channelId ||
+        thread.guild_id !== configuredString(this.config, 'guild_id') ||
+        !DISCORD_PUBLIC_THREAD_TYPES.has(thread.type as number)
+      ) {
+        throw new Error('Discord reply target is not an accessible public thread');
+      }
+      parentChannelId = snowflake(thread.parent_id) ?? '';
+    }
+    if (parsed.directMessageUserId) {
+      if (!isDiscordDirectMessagesEnabled(this.config)) {
+        throw new DiscordDirectMessageError('discord_direct_messages_disabled');
+      }
+      let dm: Record<string, unknown> | null;
+      try {
+        dm = await this.getProviderRecord(Routes.channel(parsed.channelId));
+      } catch (error) {
+        const status = this.providerStatus(error);
+        // A definitive refusal proves the recipient cannot be verified; anything else is transient.
+        if (
+          status !== undefined &&
+          status >= 400 &&
+          status < 500 &&
+          ![408, 409, 425, 429].includes(status)
+        ) {
+          throw new DiscordDirectMessageError('discord_dm_channel_mismatch', status);
+        }
+        throw new DiscordDirectMessageError('discord_dm_verification_unavailable', status);
+      }
+      const recipients = dm?.recipients;
+      if (
+        dm?.id !== parsed.channelId ||
+        dm.type !== 1 ||
+        !Array.isArray(recipients) ||
+        recipients.length !== 1 ||
+        asRecord(recipients[0])?.id !== parsed.directMessageUserId
+      ) {
+        throw new DiscordDirectMessageError('discord_dm_channel_mismatch');
+      }
+    } else if (!(await this.isAllowedParentChannel(parentChannelId))) {
+      throw new Error('Discord replies must remain in an allowed channel');
+    }
+    const explicitReply = metadata?.[DISCORD_METADATA_KEY.replyToMessageId];
+    const replyTo = explicitReply ?? parsed.messageId;
+    const ids: string[] = [];
+    const chunks = chunkDiscordMessage(req.text);
+    const deliveryNonce = metadata?.[DISCORD_METADATA_KEY.deliveryNonce];
+    const enforceNonce = metadata?.[DISCORD_METADATA_KEY.enforceNonce] === true;
+    if (enforceNonce && (!deliveryNonce || chunks.length !== 1)) {
+      throw new Error('Discord delivery nonce requires exactly one bounded message chunk');
+    }
+    const nonceOptions = enforceNonce
+      ? { nonce: deliveryNonce as DiscordDeliveryNonce, enforceNonce: true as const }
+      : undefined;
+    for (const chunk of chunks) {
+      ids.push(
+        (
+          await this.sendChunk(
+            parsed.channelId,
+            chunk,
+            parsed.providerThread || parsed.directMessageUserId ? undefined : replyTo,
+            nonceOptions
+          )
+        ).id
+      );
+    }
+    return this.receipt(parsed.channelId, req.threadId, ids);
+  }
+
+  async recoverMessageByNonce(req: {
+    threadId: string;
+    nonce: string;
+  }): Promise<GatewaySendReceipt | null> {
+    this.validate();
+    const parsed = parseThreadId(req.threadId);
+    const channelId = parsed.channelId;
+    const raw = await this.transport.rest.get(`${Routes.channelMessages(channelId)}?limit=100`);
+    if (!Array.isArray(raw)) return null;
+    const found = raw
+      .map(asRecord)
+      .find(
+        (candidate) =>
+          candidate?.channel_id === channelId &&
+          String(candidate.nonce ?? '') === req.nonce &&
+          typeof candidate.timestamp === 'string' &&
+          !Number.isNaN(Date.parse(candidate.timestamp)) &&
+          Date.now() - Date.parse(candidate.timestamp) >= -60_000 &&
+          Date.now() - Date.parse(candidate.timestamp) <= DISCORD_NONCE_RECOVERY_WINDOW_MS
+      );
+    const messageId = snowflake(found?.id);
+    return messageId ? this.receipt(channelId, req.threadId, [messageId]) : null;
+  }
+
+  /** Read one bounded, verified Discord history interval for daemon catch-up. */
+  async fetchProviderHistory(
+    req: GatewayProviderHistoryRequest
+  ): Promise<GatewayProviderHistoryResult> {
+    this.validate();
+    return fetchDiscordProviderHistory(this.transport.rest, this.config, req);
+  }
+
+  /**
+   * Agent channel-history read (`agent_tools.channel_history`). The target
+   * must be an allowlisted public parent channel or a public thread under one,
+   * and the bot must hold View Channel and Read Message History there: Discord
+   * answers a missing Read Message History with an empty list, not an error,
+   * so an empty result is only trusted after this check. Resolution, access
+   * checks, and pages share one deadline and rate-limit budget.
+   */
+  async fetchChannelHistory(
+    req: DiscordAgentChannelHistoryRequest
+  ): Promise<DiscordChannelHistoryResult> {
+    this.validate();
+    const budget = createDiscordReadBudget(this.config);
+    const get = this.historyRecordReader(budget);
+    let channelId = req.channelId;
+    if (!channelId && req.sessionThreadKey) {
+      const session = await this.resolveHistorySessionChannels(req.sessionThreadKey, get);
+      // A forum has no messages of its own, so a forum post's session reads the post.
+      channelId =
+        session.parentIsForum && session.threadChannelId
+          ? session.threadChannelId
+          : session.parentChannelId;
+    }
+    if (!channelId) throw new Error('A Discord channel or session thread is required.');
+    await this.requireChannelHistoryAccess(channelId, get, 'messages');
+    return fetchDiscordChannelHistory(
+      this.transport.historyRest,
+      this.config,
+      {
+        channelId,
+        ...(req.before ? { before: req.before } : {}),
+        ...(req.after ? { after: req.after } : {}),
+        ...(req.limit !== undefined ? { limit: req.limit } : {}),
+        ...(req.includeBotMessages !== undefined
+          ? { includeBotMessages: req.includeBotMessages }
+          : {}),
+      },
+      budget
+    );
+  }
+
+  /** One budgeted, memoized record reader per agent read, so access checks reuse lookups. */
+  private historyRecordReader(budget: DiscordReadBudget): DiscordHistoryRecordReader {
+    const records = new Map<string, Promise<Record<string, unknown> | null>>();
+    return (route) => {
+      let record = records.get(route);
+      if (!record) {
+        record = getDiscordRecordWithinBudget(this.transport.historyRest, route, budget);
+        records.set(route, record);
+      }
+      return record;
+    };
+  }
+
+  /**
+   * List the posts of an allowlisted forum channel (`agent_tools.channel_history`).
+   * Uses the history tool's access checks and budget; a session in a forum post
+   * defaults to that post's forum.
+   */
+  async listForumPosts(req: DiscordAgentForumPostsRequest): Promise<DiscordForumPostsResult> {
+    this.validate();
+    const budget = createDiscordReadBudget(this.config);
+    const get = this.historyRecordReader(budget);
+    const channelId =
+      req.channelId ??
+      (req.sessionThreadKey
+        ? (await this.resolveHistorySessionChannels(req.sessionThreadKey, get)).parentChannelId
+        : undefined);
+    if (!channelId) throw new Error('A Discord forum channel or session thread is required.');
+    const target = await this.requireChannelHistoryAccess(channelId, get, 'forum');
+    return fetchDiscordForumPosts(
+      this.transport.historyRest,
+      this.config,
+      target,
+      {
+        channelId,
+        ...(req.archived !== undefined ? { archived: req.archived } : {}),
+        ...(req.before ? { before: req.before } : {}),
+        ...(req.limit !== undefined ? { limit: req.limit } : {}),
+      },
+      budget
+    );
+  }
+
+  /** The allowlisted parent channel (and thread, if any) behind a Discord gateway thread key. */
+  private async resolveHistorySessionChannels(
+    threadKey: string,
+    get: DiscordHistoryRecordReader
+  ): Promise<{ parentChannelId: string; threadChannelId?: string; parentIsForum: boolean }> {
+    const parsed = parseDiscordThreadKey(threadKey);
+    let parentChannelId: string | undefined;
+    let threadChannelId: string | undefined;
+    if (parsed?.kind === 'legacy_thread') {
+      parentChannelId = parsed.parentChannelId;
+      threadChannelId = parsed.threadChannelId;
+    } else if (parsed?.kind === 'message') parentChannelId = parsed.channelId;
+    else if (parsed?.kind === 'provider_thread') {
+      const thread = await get(Routes.channel(parsed.channelId));
+      parentChannelId = snowflake(thread?.parent_id);
+      threadChannelId = parsed.channelId;
+    }
+    // Callers pass the result through requireChannelHistoryAccess, which checks an unlisted parent.
+    if (!parentChannelId || !discordChannelInScope(this.config, parentChannelId)) {
+      throw new Error(
+        'Could not resolve an allowed Discord parent channel for this session; pass discordChannelId.'
+      );
+    }
+    const parentIsForum =
+      threadChannelId !== undefined && isForumChannel(await get(Routes.channel(parentChannelId)));
+    return {
+      parentChannelId,
+      ...(threadChannelId ? { threadChannelId } : {}),
+      parentIsForum,
+    };
+  }
+
+  /**
+   * Resolve and authorize a history target of the expected kind (a channel or
+   * thread with messages, or a forum to list), returning its channel record.
+   */
+  private async requireChannelHistoryAccess(
+    channelId: string,
+    get: DiscordHistoryRecordReader,
+    kind: 'messages' | 'forum'
+  ): Promise<Record<string, unknown>> {
+    const guildId = configuredString(this.config, 'guild_id');
+    const denied = () =>
+      new Error(
+        `Discord channel ${channelId} is not an allowed channel, or a public thread under one, for this gateway channel.`
+      );
+    if (!isDiscordSnowflake(channelId)) throw denied();
+    const target = await get(Routes.channel(channelId));
+    if (!target || target.id !== channelId || target.guild_id !== guildId) throw denied();
+    let parent: Record<string, unknown> | null = target;
+    // An in-scope parent that is not listed is held to the public check below.
+    if (!discordChannelInScope(this.config, channelId) || !channelKind(target)) {
+      const parentChannelId = snowflake(target.parent_id);
+      if (
+        !DISCORD_PUBLIC_THREAD_TYPES.has(target.type as number) ||
+        !parentChannelId ||
+        !discordChannelInScope(this.config, parentChannelId)
+      ) {
+        throw denied();
+      }
+      parent = await get(Routes.channel(parentChannelId));
+      if (parent?.id !== parentChannelId || parent.guild_id !== guildId) throw denied();
+    }
+    if (!isPublicParentChannel(parent, guildId)) throw denied();
+    if (
+      !configuredChannelIds(this.config).includes(String(parent?.id)) &&
+      !everyoneCanView(await get(Routes.guild(guildId)), parent, guildId)
+    ) {
+      throw denied();
+    }
+    // Checked after the allowlist so a denial never reveals a channel's kind.
+    if (kind === 'messages' && isForumChannel(target)) {
+      throw new Error(
+        `Discord channel ${channelId} is a forum, which has no messages of its own; pass a post (thread) ID instead.`
+      );
+    }
+    if (kind === 'forum' && !isForumChannel(target)) {
+      throw new Error(
+        `Discord channel ${channelId} is not a forum channel; pass an allowed forum channel ID.`
+      );
+    }
+
+    // Threads inherit their parent's permission overwrites.
+    const botUserId = configuredString(this.config, 'application_id');
+    const [guild, member] = await Promise.all([
+      get(Routes.guild(guildId)),
+      get(Routes.guildMember(guildId, botUserId)),
+    ]);
+    const permissions = effectiveChannelPermissions(guild, member, parent, guildId, botUserId);
+    const required = DISCORD_VIEW_CHANNEL_PERMISSION | DISCORD_READ_MESSAGE_HISTORY_PERMISSION;
+    if ((permissions & required) !== required) {
+      throw new Error(
+        `The Discord bot lacks View Channel or Read Message History on channel ${channelId}; grant both in Discord to read its history.`
+      );
+    }
+    return target;
+  }
+
+  async sendDirectMessage(req: {
+    target: string;
+    text: string;
+    blocks?: unknown[];
+    threadId?: string;
+    metadata?: Record<string, unknown>;
+  }): Promise<GatewaySendReceipt> {
+    this.validate();
+    const match = /^(channel|user):(\d{17,20})$/.exec(req.target.trim());
+    if (!match) {
+      throw new Error(
+        'Invalid Discord outbound target. Expected channel:<snowflake> or user:<snowflake>'
+      );
+    }
+    const directMessage = match[1] === 'user';
+    let channelId = match[2];
+    if (directMessage && !isDiscordDirectMessagesEnabled(this.config)) {
+      throw new DiscordDirectMessageError('discord_direct_messages_disabled');
+    }
+    if (req.threadId) throw new Error('Discord proactive outbound does not accept thread targets');
+    if (directMessage) {
+      if (!(await this.lookupGuildMember(match[2]))) {
+        throw new DiscordDirectMessageError('discord_dm_target_not_member');
+      }
+      let dm: Record<string, unknown> | null;
+      try {
+        dm = asRecord(
+          await this.transport.rest.post(Routes.userChannels(), {
+            body: { recipient_id: match[2] },
+          })
+        );
+      } catch (error) {
+        throw withDeliveryErrorMetadata(error, `Discord API failure: ${gatewayFailureCode(error)}`);
+      }
+      const dmId = snowflake(dm?.id);
+      if (!dmId || dm?.type !== 1) {
+        throw new DiscordDirectMessageError('discord_dm_channel_mismatch');
+      }
+      channelId = dmId;
+    } else if (!configuredChannelIds(this.config).includes(channelId)) {
+      throw new Error('Discord outbound target must be one of the allowed channels');
+    } else if (
+      // Best effort: a failed lookup leaves the provider to refuse a forum target.
+      isForumChannel(await this.getAllowedParentChannel(channelId).catch(() => null))
+    ) {
+      throw new Error(
+        'Discord forum channels cannot receive proactive messages; target an allowed text channel'
+      );
+    }
+    const ids: string[] = [];
+    for (const chunk of chunkDiscordMessage(req.text)) {
+      ids.push((await this.sendChunk(channelId, chunk)).id);
+    }
+    const threadId = messageThreadId(channelId, ids[0]);
+    return this.receipt(channelId, threadId, ids, true, directMessage);
+  }
+
+  formatMessage(markdown: string): string {
+    return markdown;
+  }
+
+  private async isAllowedMessage(message: Record<string, unknown>): Promise<{
+    accepted: boolean;
+    threadId?: string;
+    metadata?: Record<string, unknown>;
+    text?: string;
+    files?: InboundFile[];
+    skippedFiles?: InboundSkippedFile[];
+    prepareDelivery?: InboundMessage['prepareDelivery'];
+  }> {
+    const author = asRecord(message.author);
+    let member = asRecord(message.member);
+    const channelId = snowflake(message.channel_id);
+    const guildId = snowflake(message.guild_id);
+    const messageId = snowflake(message.id);
+    const authorId = snowflake(author?.id);
+    const botUserId = this.botUserId;
+    const directMessage = message.guild_id === undefined || message.guild_id === null;
+    if (!author || !channelId || !messageId || !authorId || !botUserId) {
+      return { accepted: false };
+    }
+    if (directMessage) {
+      if (!isDiscordDirectMessagesEnabled(this.config) || message.channel_type !== 1)
+        return { accepted: false };
+    } else if (guildId !== configuredString(this.config, 'guild_id')) return { accepted: false };
+    if (
+      author.bot === true ||
+      author.system === true ||
+      (message.webhook_id !== undefined && message.webhook_id !== null)
+    ) {
+      return { accepted: false };
+    }
+    if (authorId === botUserId) return { accepted: false };
+    if (typeof message.type !== 'number' || !DISCORD_TEXT_MESSAGE_TYPES.has(message.type)) {
+      return { accepted: false };
+    }
+
+    const rawContent = typeof message.content === 'string' ? message.content : '';
+    const mentioned = hasStructuredDiscordBotMention(message, botUserId);
+    // Drop unmentioned chatter before any further check or channel lookup
+    // unless a forum response mode could admit it.
+    if (
+      !directMessage &&
+      !mentioned &&
+      !parseGatewayChatCommand(rawContent) &&
+      !discordResponseModeMayAdmit(this.config, { channelId, messageId })
+    ) {
+      return { accepted: false };
+    }
+    const rawAttachments = message.attachments;
+    if (rawAttachments !== undefined && !Array.isArray(rawAttachments)) {
+      return { accepted: false };
+    }
+    if (hasUnsupportedDiscordRichPayload(message)) return { accepted: false };
+    // Attachments never drop a message: readable files go to the agent and
+    // the rest are reported as skipped so the user can be told.
+    let files: InboundFile[] | undefined;
+    let skippedFiles: InboundSkippedFile[] | undefined;
+    if (Array.isArray(rawAttachments) && rawAttachments.length > 0) {
+      const partitioned = partitionDiscordInboundFiles(rawAttachments, this.config.files === true);
+      if (!partitioned) return { accepted: false };
+      if (partitioned.files.length > 0) files = partitioned.files;
+      if (partitioned.skipped.length > 0) skippedFiles = partitioned.skipped;
+    }
+    const strippedText = stripStructuredDiscordBotMention(rawContent, botUserId);
+    if (!strippedText && !files && !skippedFiles) return { accepted: false };
+    const text = strippedText || DISCORD_ATTACHMENT_ONLY_TEXT;
+
+    const allowedUsers = Array.isArray(this.config.allowed_user_ids)
+      ? this.config.allowed_user_ids.filter((id): id is string => typeof id === 'string')
+      : [];
+    const allowedRoles = Array.isArray(this.config.allowed_role_ids)
+      ? this.config.allowed_role_ids.filter((id): id is string => typeof id === 'string')
+      : [];
+    if (directMessage) {
+      // No role can admit an unlisted author, so skip the serialized member lookup.
+      if (!allowedUsers.includes(String(author.id)) && allowedRoles.length === 0) {
+        return { accepted: false };
+      }
+      try {
+        member = await this.lookupGuildMember(authorId);
+      } catch (error) {
+        console.warn('[discord] DM membership lookup failed:', providerError(error));
+        return { accepted: false };
+      }
+      if (!member) return { accepted: false };
+    }
+    const roles = Array.isArray(member?.roles)
+      ? member.roles.filter((id): id is string => typeof id === 'string')
+      : [];
+    // Discord never lists @everyone (role ID = guild ID) in member.roles, so an
+    // allowlisted guild ID explicitly admits every current member of the guild.
+    const everyoneAllowed =
+      member !== null && allowedRoles.includes(configuredString(this.config, 'guild_id'));
+    if (
+      !allowedUsers.includes(String(author.id)) &&
+      !everyoneAllowed &&
+      !roles.some((role) => allowedRoles.includes(role))
+    ) {
+      return { accepted: false };
+    }
+
+    if (directMessage) {
+      if (!roles.every(isDiscordSnowflake)) return { accepted: false };
+      return {
+        accepted: true,
+        threadId: buildDiscordDirectMessageThreadKey(channelId, authorId),
+        text,
+        ...(files ? { files } : {}),
+        ...(skippedFiles ? { skippedFiles } : {}),
+        metadata: buildDiscordDirectMessageMetadata({
+          channelId,
+          messageId,
+          authorId,
+          roleIds: roles,
+          botUserId,
+        }),
+      };
+    }
+
+    let isThread = false;
+    let parentId: string | undefined;
+    if (!configuredChannelIds(this.config).includes(channelId)) {
+      let channel = this.cachedChannelInfo(channelId);
+      try {
+        if (!channel) {
+          channel = asRecord(await this.transport.rest.get(Routes.channel(channelId))) ?? undefined;
+          if (channel) this.cacheChannelInfo(channelId, channel);
+        }
+        if (
+          channel &&
+          channel.guild_id === guildId &&
+          DISCORD_PUBLIC_THREAD_TYPES.has(channel.type as number)
+        ) {
+          parentId = snowflake(channel.parent_id);
+          isThread = parentId !== undefined && (await this.isAllowedParentChannel(parentId));
+          if (!isThread) return { accepted: false };
+        } else if (!(await this.isAllowedParentChannel(channelId))) {
+          return { accepted: false };
+        }
+      } catch {
+        return { accepted: false };
+      }
+    }
+    if (
+      !mentioned &&
+      !(isThread && parseGatewayChatCommand(rawContent)) &&
+      !discordResponseModeAdmits(this.config, {
+        channelId,
+        ...(parentId ? { parentChannelId: parentId } : {}),
+        messageId,
+        isThread,
+      })
+    ) {
+      return { accepted: false };
+    }
+
+    const reference = asRecord(message.message_reference);
+    const referencedMessageId = snowflake(reference?.message_id);
+
+    const threadId = isThread
+      ? existingThreadId(parentId!, channelId)
+      : messageThreadId(channelId, referencedMessageId ?? messageId);
+    return {
+      accepted: true,
+      threadId,
+      text,
+      ...(files ? { files } : {}),
+      ...(skippedFiles ? { skippedFiles } : {}),
+      metadata: buildDiscordInboundMetadata({
+        guildId: guildId!,
+        channelId,
+        messageId,
+        authorId,
+        roleIds: roles,
+        botUserId,
+        isThread,
+        ...(isThread && parentId ? { parentChannelId: parentId } : {}),
+        ...(referencedMessageId ? { replyToMessageId: referencedMessageId } : {}),
+        hasMention: mentioned,
+      }),
+      prepareDelivery: async (context) =>
+        this.prepareInboundDelivery(
+          {
+            channelId,
+            messageId,
+            isThread,
+            ...(parentId ? { parentChannelId: parentId } : {}),
+          },
+          context
+        ),
+    };
+  }
+
+  private async dispatchMessage(
+    payload: GatewayDispatchPayload,
+    callback: GatewayInboundCallback
+  ): Promise<{ messageId?: string }> {
+    if (DISCORD_GUILD_CHANGE_EVENTS.has(payload.t)) {
+      this.guildInfo = null;
+      return {};
+    }
+    if (DISCORD_CHANNEL_CHANGE_EVENTS.has(payload.t)) {
+      const changedChannelId = snowflake(asRecord(payload.d)?.id);
+      if (changedChannelId) this.channelInfoCache.delete(changedChannelId);
+      return {};
+    }
+    if (payload.t !== GatewayDispatchEvents.MessageCreate) return {};
+    const message = asRecord(payload.d);
+    if (!message) return {};
+    const result = await this.isAllowedMessage(message);
+    const messageId = snowflake(message.id);
+    if (!result.accepted || !result.threadId || !result.text || !messageId) return { messageId };
+    const inbound: InboundMessage = {
+      providerEventId: `discord:${configuredString(this.config, 'guild_id')}:${result.metadata?.[DISCORD_METADATA_KEY.channelId] ?? ''}:${messageId}`,
+      threadId: result.threadId,
+      text: result.text,
+      userId: String(asRecord(message.author)?.id ?? ''),
+      timestamp: toIsoTimestamp(message.timestamp),
+      ...(result.files && result.files.length > 0 ? { files: result.files } : {}),
+      ...(result.skippedFiles && result.skippedFiles.length > 0
+        ? { skippedFiles: result.skippedFiles }
+        : {}),
+      metadata: result.metadata,
+      prepareDelivery: result.prepareDelivery,
+    };
+    await callback(inbound);
+    return { messageId };
+  }
+
+  async startListening(
+    callback: GatewayInboundCallback,
+    options: GatewayListenerOptions = {}
+  ): Promise<void> {
+    this.validateForListener();
+    this.stopped = false;
+    this.dispatchChain = Promise.resolve();
+    this.guildInfo = null;
+    const bot = asRecord(await this.transport.rest.get(Routes.user('@me')));
+    const botUserId = snowflake(bot?.id);
+    if (!botUserId) {
+      throw new GatewayListenerError(
+        'discord_bot_identity_invalid',
+        'permanent',
+        'The Discord bot token did not return a bot user identity.'
+      );
+    }
+    await this.requireMessageContentCapability();
+    this.botUserId = botUserId;
+    if (botUserId !== configuredString(this.config, 'application_id')) {
+      throw new GatewayListenerError(
+        'discord_application_identity_invalid',
+        'permanent',
+        'The Discord bot user did not match the configured application.'
+      );
+    }
+    const gatewayBot = asRecord(await this.transport.rest.get(Routes.gatewayBot()));
+    const recommendedShards =
+      typeof gatewayBot?.shards === 'number' ? gatewayBot.shards : undefined;
+    if (recommendedShards !== 1) {
+      throw new GatewayListenerError(
+        'discord_sharding_unsupported',
+        'permanent',
+        recommendedShards && recommendedShards > 1
+          ? `Discord recommends ${recommendedShards} shards; this beta supports one shard only.`
+          : 'Discord did not return a valid bot shard recommendation.'
+      );
+    }
+    const allowedChannelIds = configuredChannelIds(this.config);
+    const configuredChannels = await Promise.all(
+      allowedChannelIds.map(async (channelId) =>
+        asRecord(await this.transport.rest.get(Routes.channel(channelId)))
+      )
+    );
+    if (
+      configuredChannels.some(
+        (configuredChannel, index) =>
+          configuredChannel?.id !== allowedChannelIds[index] ||
+          configuredChannel?.guild_id !== configuredString(this.config, 'guild_id') ||
+          !isPublicParentChannel(configuredChannel, configuredString(this.config, 'guild_id'))
+      )
+    ) {
+      throw new GatewayListenerError(
+        'discord_channel_invalid',
+        'permanent',
+        'Every allowed Discord channel must be a public text or forum channel.'
+      );
+    }
+    if (
+      isForumDefaultOutboundTarget(
+        this.config,
+        configuredChannels.map((channel, index) => ({
+          channelId: allowedChannelIds[index]!,
+          channel,
+        }))
+      )
+    ) {
+      throw new GatewayListenerError(
+        'discord_outbound_target_invalid',
+        'permanent',
+        'The default proactive target must be a text channel; forum channels cannot receive proactive messages.'
+      );
+    }
+    if (
+      nonForumResponseModeChannels(
+        this.config,
+        configuredChannels.map((channel, index) => ({
+          channelId: allowedChannelIds[index]!,
+          channel,
+        }))
+      ).length > 0
+    ) {
+      throw new GatewayListenerError(
+        'discord_response_mode_invalid',
+        'permanent',
+        'Response modes (starters or all) apply to forum channels only; set text channels back to mention.'
+      );
+    }
+    configuredChannels.forEach((channel, index) => {
+      if (channel) this.cacheChannelInfo(allowedChannelIds[index], channel);
+    });
+    // Discord transport resume is deliberately process-local. Listener
+    // ownership and event idempotency remain durable, but transport session
+    // state is not written to gateway_channels.
+    this.lastSequence = -1;
+
+    this.gateway = this.transport.createGateway({
+      intents:
+        GatewayIntentBits.Guilds |
+        GatewayIntentBits.GuildMessages |
+        GatewayIntentBits.MessageContent |
+        (isDiscordDirectMessagesEnabled(this.config) ? GatewayIntentBits.DirectMessages : 0),
+      checkpoint: undefined,
+      onSessionInfo: async () => undefined,
+    });
+    const failListener = async (error: unknown): Promise<void> => {
+      if (this.stopped) return;
+      this.stopped = true;
+      const gateway = this.gateway;
+      this.gateway = null;
+      try {
+        if (gateway) await gateway.destroy();
+      } finally {
+        try {
+          await options.onError?.(error);
+        } catch (notifyError) {
+          console.warn(
+            '[discord] Listener failure notification failed:',
+            providerError(notifyError)
+          );
+        }
+      }
+    };
+    this.gateway.on(WebSocketShardEvents.Dispatch, (payload) => {
+      const processDispatch = this.dispatchChain.then(async () => {
+        if (this.stopped) return;
+        // A new session restarts sequences and may follow missed changes, so drop cached records too.
+        if (payload.t === GatewayDispatchEvents.Ready) {
+          this.lastSequence = -1;
+          this.guildInfo = null;
+          this.channelInfoCache.clear();
+        }
+        const sequence = typeof payload.s === 'number' ? payload.s : undefined;
+        if (sequence !== undefined && sequence <= this.lastSequence) return;
+        await this.dispatchMessage(payload, callback);
+        if (sequence !== undefined) this.lastSequence = sequence;
+      });
+      this.dispatchChain = processDispatch.catch(async (error) => {
+        if (this.stopped) return;
+        console.warn('[discord] Dispatch processing failed:', providerError(error));
+        await failListener(error);
+      });
+    });
+    this.gateway.on(WebSocketShardEvents.Error, (error) => {
+      void failListener(
+        new GatewayListenerError(
+          'discord_gateway_error',
+          'transient',
+          `Discord gateway error: ${providerError(error)}`
+        )
+      );
+    });
+    this.gateway.on(WebSocketShardEvents.SocketError, (error) => {
+      void failListener(
+        new GatewayListenerError(
+          'discord_gateway_socket_error',
+          'transient',
+          `Discord gateway socket error: ${providerError(error)}`
+        )
+      );
+    });
+    this.gateway.on(WebSocketShardEvents.Closed, (code) => {
+      const failure =
+        code === GatewayCloseCodes.DisallowedIntents
+          ? new GatewayListenerError(
+              'discord_message_content_unavailable',
+              'permanent',
+              'Enable the privileged Message Content intent for this Discord application, then refresh the channel.'
+            )
+          : new GatewayListenerError(
+              'discord_gateway_closed',
+              'transient',
+              `Discord gateway closed unexpectedly (code ${code}).`
+            );
+      void failListener(failure);
+    });
+    await this.gateway.connect();
+  }
+
+  async stopListening(): Promise<void> {
+    this.stopped = true;
+    const gateway = this.gateway;
+    this.gateway = null;
+    if (gateway) await gateway.destroy();
+  }
+
+  async testConnection(): Promise<GatewayConnectionTestResult> {
+    const validation = validateDiscordConfig(this.config as Record<string, unknown>, {
+      requireBotToken: true,
+    });
+    if (!validation.ok) {
+      return {
+        ok: false,
+        failures: validation.errors.map((reason) => ({ capability: 'config', reason })),
+        notVerifiable: [],
+      };
+    }
+    try {
+      const [bot, guild, gatewayBot] = await Promise.all([
+        asRecord(await this.transport.rest.get(Routes.user('@me'))),
+        asRecord(await this.transport.rest.get(Routes.guild(this.config.guild_id!))),
+        asRecord(await this.transport.rest.get(Routes.gatewayBot())),
+      ]);
+      const messageContent = await this.readMessageContentCapability();
+      const botOk = bot?.id === configuredString(this.config, 'application_id');
+      const guildOk = guild?.id === configuredString(this.config, 'guild_id');
+      const shardCount = typeof gatewayBot?.shards === 'number' ? gatewayBot.shards : 0;
+      const botUserId = snowflake(bot?.id);
+      const member = botUserId
+        ? asRecord(
+            await this.transport.rest.get(
+              Routes.guildMember(configuredString(this.config, 'guild_id'), botUserId)
+            )
+          )
+        : null;
+      const channels = await Promise.all(
+        configuredChannelIds(this.config).map(async (channelId) => ({
+          channelId,
+          channel: asRecord(await this.transport.rest.get(Routes.channel(channelId))),
+        }))
+      );
+      const channelAccess = channels.map(({ channelId, channel }) => {
+        const permissions = effectiveChannelPermissions(
+          guild,
+          member,
+          channel,
+          configuredString(this.config, 'guild_id'),
+          botUserId ?? ''
+        );
+        const publicParent =
+          channel?.id === channelId &&
+          channel?.guild_id === configuredString(this.config, 'guild_id') &&
+          isPublicParentChannel(channel, configuredString(this.config, 'guild_id'));
+        const kind = channel?.id === channelId ? channelKind(channel) : undefined;
+        // Forum posts are created by members; the bot only reads and replies in them.
+        const required =
+          kind === 'forum'
+            ? DISCORD_VIEW_CHANNEL_PERMISSION |
+              DISCORD_READ_MESSAGE_HISTORY_PERMISSION |
+              DISCORD_SEND_MESSAGES_IN_THREADS_PERMISSION
+            : DISCORD_VIEW_CHANNEL_PERMISSION |
+              DISCORD_SEND_MESSAGES_PERMISSION |
+              DISCORD_READ_MESSAGE_HISTORY_PERMISSION |
+              DISCORD_CREATE_PUBLIC_THREADS_PERMISSION |
+              DISCORD_SEND_MESSAGES_IN_THREADS_PERMISSION;
+        return {
+          channelId,
+          ...(kind ? { kind } : {}),
+          ok: publicParent && (permissions & required) === required,
+          permissions: {
+            view: (permissions & DISCORD_VIEW_CHANNEL_PERMISSION) !== 0n,
+            send: (permissions & DISCORD_SEND_MESSAGES_PERMISSION) !== 0n,
+            readHistory: (permissions & DISCORD_READ_MESSAGE_HISTORY_PERMISSION) !== 0n,
+            createPublicThreads: (permissions & DISCORD_CREATE_PUBLIC_THREADS_PERMISSION) !== 0n,
+            sendInThreads: (permissions & DISCORD_SEND_MESSAGES_IN_THREADS_PERMISSION) !== 0n,
+          },
+        };
+      });
+      const forumOutboundTarget = isForumDefaultOutboundTarget(this.config, channels);
+      const failures = [
+        ...(botOk
+          ? []
+          : [{ capability: 'bot_identity', reason: 'Bot user does not match application_id' }]),
+        ...(guildOk
+          ? []
+          : [{ capability: 'guild_access', reason: 'Bot cannot access the configured guild' }]),
+        ...(shardCount === 1
+          ? []
+          : [
+              {
+                capability: 'gateway_shards',
+                reason:
+                  shardCount > 1
+                    ? `Discord recommends ${shardCount} shards; this beta supports one shard only.`
+                    : 'Discord did not return a valid bot shard recommendation.',
+              },
+            ]),
+        ...(channelAccess.every((channel) => channel.ok)
+          ? []
+          : [
+              {
+                capability: 'channel_access',
+                reason:
+                  'One or more allowed channels is not a public text or forum channel, or lacks a required permission: view, history, and thread replies everywhere; send and public-thread creation in text channels.',
+              },
+            ]),
+        ...(nonForumResponseModeChannels(this.config, channels).length > 0
+          ? [
+              {
+                capability: 'response_modes',
+                reason:
+                  'Response modes (starters or all) apply to forum channels only; set text channels back to mention.',
+              },
+            ]
+          : []),
+        ...(forumOutboundTarget
+          ? [
+              {
+                capability: 'outbound_target',
+                reason:
+                  'The default proactive target is a forum channel, which cannot receive proactive messages.',
+              },
+            ]
+          : []),
+        ...(messageContent === false
+          ? [
+              {
+                capability: 'message_content',
+                reason:
+                  'Discord application flags do not report the Message Content intent capability.',
+              },
+            ]
+          : []),
+      ];
+      return {
+        ok: failures.length === 0,
+        bot: {
+          userId: String(bot?.id ?? ''),
+          name: String(bot?.username ?? bot?.global_name ?? ''),
+        },
+        ...(botOk && botUserId ? { verifiedInstallationId: botUserId } : {}),
+        team: { id: String(guild?.id ?? this.config.guild_id), name: String(guild?.name ?? '') },
+        channelAccess,
+        directMessages: { enabled: isDiscordDirectMessagesEnabled(this.config) },
+        ...(messageContent === undefined
+          ? {
+              verification: {
+                status: 'warning' as const,
+                warnings: [
+                  'Discord application flags did not expose a parseable Message Content capability; this result is not verified.',
+                ],
+              },
+            }
+          : { verification: { status: 'verified' as const, warnings: [] } }),
+        failures,
+        notVerifiable: [
+          ...(this.config.allow_all_public_channels === true
+            ? [
+                'All public channels are allowed; this probe samples only the listed channels. Each unlisted channel is checked to be public when a message arrives.',
+              ]
+            : []),
+          ...(isDiscordDirectMessagesEnabled(this.config)
+            ? [
+                'Direct messages are enabled; end-to-end DM delivery cannot be proven by this probe.',
+              ]
+            : []),
+          'End-to-end send/reply permission for every configured channel and thread cannot be proven by this REST-only probe; sampled view, send, history, public-thread creation, and thread-reply bits are reported in channelAccess.',
+          'Whether the bot can receive MESSAGE_CREATE events end to end; the probe does not open a listener or use live credentials beyond these REST calls.',
+          'Whether every configured allowlisted user or role can currently see the channel and is role-matchable at delivery time.',
+          'Whether a Discord message creates or reuses the intended Agor session after gateway filtering, mapping ownership, and prompt admission.',
+          ...(messageContent === undefined
+            ? [
+                'Whether Discord application flags include the approved Message Content capability; the REST application resource did not expose a parseable flags value, so portal approval and gateway delivery remain unproven.',
+              ]
+            : []),
+        ],
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        failures: [{ capability: 'bot_token', reason: providerError(error) }],
+        notVerifiable: [],
+      };
+    }
+  }
+}

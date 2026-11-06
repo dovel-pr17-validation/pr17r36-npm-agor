@@ -1,0 +1,2050 @@
+import { AGENTIC_TOOL_CAPABILITIES } from '@agor/agentic-tools';
+import type {
+  AgenticToolName,
+  AgorClient,
+  Branch,
+  CodexApprovalPolicy,
+  CodexSandboxMode,
+  EffortLevel,
+  PermissionMode,
+  Session,
+  SessionID,
+  SessionStopResult,
+  SpawnConfig,
+  Task,
+  User,
+} from '@agor-live/client';
+import {
+  getDefaultPermissionMode,
+  hasFullSessionDetails,
+  hasMinimumRole,
+  isAgenticToolName,
+  mapToCodexPermissionConfig,
+  ROLES,
+  SessionStatus,
+  TaskStatus,
+} from '@agor-live/client';
+import {
+  AimOutlined,
+  CloseOutlined,
+  CodeOutlined,
+  DownOutlined,
+  EditOutlined,
+  EllipsisOutlined,
+  InboxOutlined,
+  RobotOutlined,
+  SearchOutlined,
+  SettingOutlined,
+  UpOutlined,
+} from '@ant-design/icons';
+import type { InputRef, MenuProps } from 'antd';
+import {
+  Alert,
+  Badge,
+  Button,
+  Dropdown,
+  Flex,
+  Input,
+  Modal,
+  Space,
+  Spin,
+  Tooltip,
+  Typography,
+  theme,
+} from 'antd';
+import React from 'react';
+import { getDaemonUrl } from '../../config/daemon';
+import { useAppActions } from '../../contexts/AppActionsContext';
+import { useRecenterMap } from '../../contexts/CanvasNavigationContext';
+import { useConnectionDisabled } from '../../contexts/ConnectionContext';
+import { useIsTouchInput } from '../../hooks/useCanHover';
+import { useConfirmArchiveSession } from '../../hooks/useConfirmArchiveSession';
+import { useIsMobileViewport } from '../../hooks/useIsMobileViewport';
+import { useSessionGenealogyTargets } from '../../hooks/useSessionGenealogyTargets';
+import { useSessionSearch } from '../../hooks/useSessionSearch';
+import { useSharedReactiveSession } from '../../hooks/useSharedReactiveSession';
+import { useAgorStore } from '../../store/agorStore';
+import {
+  selectMcpServerById,
+  selectUserAuthenticatedMcpServerIds,
+  selectUserById,
+} from '../../store/selectors';
+import { isComposerSendKey } from '../../utils/composerKeys';
+import {
+  formatActionError,
+  notConnectedMessage,
+  unconfirmedMessage,
+  withRawDetail,
+} from '../../utils/connectionErrors';
+import { getContextWindowGradient, selectLatestContextWindow } from '../../utils/contextWindow';
+import { MOBILE_TOUCH_TARGET } from '../../utils/deviceDetection';
+import { mcpServerNeedsAuth } from '../../utils/mcpAuth';
+import { useThemedMessage } from '../../utils/message';
+import {
+  consumePromptDraftSeed,
+  deletePromptDraft,
+  discardPromptDraftSeed,
+  getPromptDraft,
+  readPromptDraftSeed,
+  savePromptDraft,
+} from '../../utils/promptDrafts';
+import { describeSessionStatus } from '../../utils/sessionStatus';
+import { getSessionDisplayTitle, getSessionTitleStyles } from '../../utils/sessionTitle';
+import { AgentSelectionGrid } from '../AgentSelectionGrid/AgentSelectionGrid';
+import { AutocompleteTextarea } from '../AutocompleteTextarea';
+import { FileUpload } from '../FileUpload';
+import { ForkSpawnModal } from '../ForkSpawnModal/ForkSpawnModal';
+import type { ModelConfig } from '../ModelSelector';
+import { getUrlDisplayLabel } from '../Pill/url-helpers';
+import { ToolIcon } from '../ToolIcon';
+import { UserIdentityAvatar } from '../UserIdentityAvatar';
+import {
+  BlockingAttachmentError,
+  buildPromptWithAttachments,
+  formatComposerUploadError,
+  getLatestComposerPromptText,
+  isBlockingComposerAttachment,
+} from './composerAttachments';
+import { appendComposerText } from './composerText';
+import type { SessionAttachmentItem } from './SessionAttachmentsDropdown';
+import { SessionAttachmentsDropdown } from './SessionAttachmentsDropdown';
+import { SessionAttachmentTray } from './SessionAttachmentTray';
+import { SessionComposerDropZone } from './SessionComposerDropZone';
+import { SessionFooter } from './SessionFooter';
+import { SessionPanelContent } from './SessionPanelContent';
+import { buildSpawnPromptContext } from './spawn-prompt-context';
+import {
+  isStopTransportAmbiguous,
+  reconcileStopTransportFailure,
+  requestSessionStop,
+} from './stopReconciliation';
+import { useComposerAttachments } from './useComposerAttachments';
+
+// Re-export PermissionMode from SDK for convenience
+export type { PermissionMode };
+
+// ---------------------------------------------------------------------------
+// PromptInput — thin wrapper around AutocompleteTextarea that keeps the typed
+// text in *local* state so that keystrokes never trigger a parent re-render.
+// The parent reads/clears the value imperatively via a ref.
+// ---------------------------------------------------------------------------
+
+export interface PromptInputHandle {
+  getValue: () => string;
+  /** Empty the composer, or leave only `remainder` (text typed after a send began). */
+  clear: (remainder?: string) => void;
+  insertText: (text: string) => void;
+}
+
+interface PromptInputProps {
+  sessionId: SessionID;
+  getDraft: (id: string) => string;
+  getDraftSeed: (id: string) => string;
+  discardDraftSeed: (id: string) => void;
+  saveDraft: (id: string, value: string) => void;
+  deleteDraft: (id: string, expectedText?: string) => void;
+  /** Fires only on empty↔non-empty transitions, not every keystroke */
+  onHasInputChange: (hasInput: boolean) => void;
+  /** Kept in sync so memoized children can read the latest value */
+  inputValueRef: React.MutableRefObject<string>;
+  /** Called on a send keypress (`isComposerSendKey`) when there is sendable composer content */
+  onSubmit: () => void;
+  hasExternalInput?: boolean;
+  // Forwarded to AutocompleteTextarea
+  placeholder?: string;
+  autoSize?: { minRows?: number; maxRows?: number };
+  client: AgorClient | null;
+  userById: Map<string, User>;
+  onFilesDrop?: (files: File[]) => void;
+  filesDropDisabled?: boolean;
+  showFilesDropOverlay?: boolean;
+  suppressEmptyHighlight?: boolean;
+  slashCommands?: string[];
+  skills?: string[];
+}
+
+const PromptInput = React.forwardRef<PromptInputHandle, PromptInputProps>(
+  (
+    {
+      sessionId,
+      getDraft,
+      getDraftSeed,
+      discardDraftSeed,
+      saveDraft,
+      deleteDraft,
+      onHasInputChange,
+      inputValueRef,
+      onSubmit,
+      hasExternalInput = false,
+      placeholder,
+      autoSize,
+      client,
+      userById,
+      onFilesDrop,
+      filesDropDisabled = false,
+      showFilesDropOverlay = true,
+      suppressEmptyHighlight = false,
+      slashCommands,
+      skills,
+    },
+    ref
+  ) => {
+    const isMobile = useIsMobileViewport();
+    const touchInput = useIsTouchInput();
+    const { token } = theme.useToken();
+    const [value, setValue] = React.useState(() => getDraft(sessionId));
+    const valueRef = React.useRef(value);
+    const textareaElementRef = React.useRef<HTMLTextAreaElement | null>(null);
+    const untouchedSeedRef = React.useRef(false);
+    const bootstrappedSessionRef = React.useRef<string | null>(null);
+
+    // Claim bootstrap only after commit, not in a render initializer (which
+    // React may replay/discard). Untouched starters stay tab-local, so opening
+    // a tryout cannot overwrite another tab's sole persisted user draft.
+    React.useLayoutEffect(() => {
+      if (bootstrappedSessionRef.current === sessionId) return;
+      bootstrappedSessionRef.current = sessionId;
+      const seed = getDraftSeed(sessionId);
+      if (valueRef.current) {
+        discardDraftSeed(sessionId);
+      } else if (seed) {
+        untouchedSeedRef.current = true;
+        valueRef.current = seed;
+        inputValueRef.current = seed;
+        setValue(seed);
+      }
+    }, [sessionId, getDraftSeed, discardDraftSeed, inputValueRef]);
+
+    const persistDraft = React.useCallback(
+      (id: string, text: string) => {
+        if (!untouchedSeedRef.current) saveDraft(id, text);
+      },
+      [saveDraft]
+    );
+
+    // Keep refs in sync (zero-cost, no re-render)
+    valueRef.current = value;
+    inputValueRef.current = value;
+
+    const handlePromptChange = React.useCallback(
+      (nextValue: string) => {
+        untouchedSeedRef.current = false;
+        discardDraftSeed(sessionId);
+        valueRef.current = nextValue;
+        inputValueRef.current = nextValue;
+        setValue(nextValue);
+      },
+      [inputValueRef, discardDraftSeed, sessionId]
+    );
+
+    // Track empty↔non-empty transitions → notify parent (minimal re-renders)
+    const prevHasInput = React.useRef<boolean | null>(null);
+    React.useEffect(() => {
+      const has = !!value.trim();
+      if (has !== prevHasInput.current) {
+        prevHasInput.current = has;
+        onHasInputChange(has);
+      }
+    }, [value, onHasInputChange]);
+
+    // Imperative methods for the parent
+    React.useImperativeHandle(
+      ref,
+      () => ({
+        getValue: () => textareaElementRef.current?.value ?? valueRef.current,
+        clear: (remainder = '') => {
+          untouchedSeedRef.current = false;
+          discardDraftSeed(sessionId);
+          valueRef.current = remainder;
+          inputValueRef.current = remainder;
+          if (textareaElementRef.current) {
+            textareaElementRef.current.value = remainder;
+          }
+          setValue(remainder);
+          // A remainder is re-persisted by the debounced draft save.
+          deleteDraft(sessionId);
+        },
+        insertText: (text: string) => {
+          untouchedSeedRef.current = false;
+          discardDraftSeed(sessionId);
+          setValue((prev) => {
+            const nextValue = appendComposerText(prev, text);
+            valueRef.current = nextValue;
+            inputValueRef.current = nextValue;
+            return nextValue;
+          });
+        },
+      }),
+      [sessionId, deleteDraft, discardDraftSeed, inputValueRef]
+    );
+
+    // Session switch: save old draft, load new one
+    const prevSessionId = React.useRef(sessionId);
+    React.useEffect(() => {
+      if (prevSessionId.current !== sessionId) {
+        persistDraft(prevSessionId.current, valueRef.current);
+        setValue(getDraft(sessionId));
+        prevSessionId.current = sessionId;
+      }
+    }, [sessionId, persistDraft, getDraft]);
+
+    // Debounced draft persistence (300ms)
+    React.useEffect(() => {
+      const timer = setTimeout(() => persistDraft(sessionId, value), 300);
+      return () => clearTimeout(timer);
+    }, [value, sessionId, persistDraft]);
+
+    // Flush draft on unmount so in-flight debounced writes aren't lost.
+    // Uses refs to capture the latest values without adding deps that would
+    // cause the effect to re-run (we only want the cleanup to fire on unmount).
+    const saveDraftRef = React.useRef(persistDraft);
+    saveDraftRef.current = persistDraft;
+    const sessionIdRef = React.useRef(sessionId);
+    sessionIdRef.current = sessionId;
+    React.useEffect(() => {
+      return () => saveDraftRef.current(sessionIdRef.current, valueRef.current);
+    }, []);
+
+    const handleKeyPress = React.useCallback(
+      (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+        if (!isComposerSendKey(e, touchInput)) return;
+        e.preventDefault();
+        if (valueRef.current.trim() || hasExternalInput) {
+          onSubmit();
+        }
+      },
+      [hasExternalInput, onSubmit, touchInput]
+    );
+
+    return (
+      <AutocompleteTextarea
+        ref={textareaElementRef}
+        value={value}
+        onChange={handlePromptChange}
+        placeholder={placeholder}
+        autoSize={autoSize}
+        onKeyPress={handleKeyPress}
+        client={client}
+        sessionId={sessionId}
+        userById={userById}
+        onFilesDrop={onFilesDrop}
+        filesDropDisabled={filesDropDisabled}
+        showFilesDropOverlay={showFilesDropOverlay}
+        suppressEmptyHighlight={suppressEmptyHighlight}
+        slashCommands={slashCommands}
+        skills={skills}
+        enableKnowledgeMentions
+        kbLinkTarget="absolute-route"
+        highlightWhenEmpty
+        // Body-size text like desktop; iOS focus zoom is off via the viewport
+        // (preventIosInputZoom). The shared textarea also applies these metrics
+        // to its mention highlight overlay. Block padding makes one line a full
+        // touch-target tall.
+        textareaStyle={
+          isMobile
+            ? {
+                fontSize: token.fontSize,
+                paddingBlock:
+                  (MOBILE_TOUCH_TARGET - 2 * token.lineWidth - token.fontSize * token.lineHeight) /
+                  2,
+              }
+            : undefined
+        }
+      />
+    );
+  }
+);
+
+PromptInput.displayName = 'PromptInput';
+
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+
+// Stable fallback so renders before the reactive session hydrates don't mint
+// a fresh array — the memos deriving footer props from `tasks` (and through
+// them the memoized SessionFooter) key on its identity.
+const EMPTY_TASKS: Task[] = [];
+export interface SessionPanelProps {
+  client: AgorClient | null;
+  session: Session | null;
+  branch?: Branch | null;
+  currentUserId?: string;
+  sessionMcpServerIds?: string[];
+  sessionMcpLoadFailed?: boolean;
+  onSessionMcpRetry?: () => void;
+  open: boolean;
+  onClose: () => void;
+  uploadPolicy?: import('@agor/core/types').UploadIngressPolicy;
+}
+
+const SessionPanel: React.FC<SessionPanelProps> = ({
+  client,
+  session,
+  branch = null,
+  currentUserId,
+  sessionMcpServerIds = [],
+  sessionMcpLoadFailed = false,
+  onSessionMcpRetry,
+  open,
+  onClose,
+  uploadPolicy,
+}) => {
+  const { token } = theme.useToken();
+  const isMobileShell = useIsMobileViewport();
+  // 44px touch targets for the header controls on the mobile full-screen shell.
+  const mobileHeaderButtonStyle: React.CSSProperties | undefined = isMobileShell
+    ? { minWidth: MOBILE_TOUCH_TARGET, minHeight: MOBILE_TOUCH_TARGET }
+    : undefined;
+  const { showInfo, showError, showWarning } = useThemedMessage();
+  const connectionDisabled = useConnectionDisabled();
+  const recenterMap = useRecenterMap();
+
+  // Subscribe only to the entity families this panel needs via narrow store
+  // selectors. SessionPanel intentionally does NOT subscribe to live (sessions
+  // / branches / boards) slices here, so streaming session patches don't
+  // re-render it; each whole-map selector is a stable module-level reference, so
+  // user and MCP updates are isolated from each other and from repo edits.
+  const userById = useAgorStore(selectUserById);
+  const mcpServerById = useAgorStore(selectMcpServerById);
+  const userAuthenticatedMcpServerIds = useAgorStore(selectUserAuthenticatedMcpServerIds);
+
+  // Get actions from context
+  const {
+    onSendPrompt,
+    onFork,
+    onBtwFork,
+    onOpenSettings,
+    onUpdateSession,
+    onOpenTerminal,
+    onChooseAgenticTool,
+    availableAgents,
+  } = useAppActions();
+
+  const confirmArchive = useConfirmArchiveSession(client);
+
+  // Click-to-edit session title, inline in the header — see render below.
+  // Draft is seeded from the *explicit* title only (not the description
+  // fallback getSessionDisplayTitle shows when unset), so entering edit mode
+  // never accidentally "sets" a title from the first-prompt fallback text.
+  const [editingTitle, setEditingTitle] = React.useState(false);
+  const [titleHovered, setTitleHovered] = React.useState(false);
+  const [titleDraft, setTitleDraft] = React.useState('');
+  const titleInputRef = React.useRef<InputRef | null>(null);
+  const startEditingTitle = React.useCallback(() => {
+    setTitleDraft(session?.title ?? '');
+    setEditingTitle(true);
+  }, [session?.title]);
+  const saveTitle = React.useCallback(() => {
+    setEditingTitle(false);
+    if (!session) return;
+    const trimmed = titleDraft.trim();
+    if (trimmed !== (session.title ?? '')) {
+      onUpdateSession?.(session.session_id, { title: trimmed });
+    }
+  }, [session, titleDraft, onUpdateSession]);
+  React.useEffect(() => {
+    if (editingTitle) titleInputRef.current?.focus();
+  }, [editingTitle]);
+
+  // "Switch tool" — same underlying chooseAgenticTool action the quick-start
+  // empty-state tiles use, just with `replacingSessionId` set. Only offered
+  // on a session with zero tasks (never prompted yet): tool is a per-session
+  // SDK choice baked into every task, so there's no safe way to change it
+  // once a conversation exists — hide the affordance entirely rather than
+  // let it fail or silently drop history. (See `canSwitchTool` /
+  // `handleSwitchTool` below the early-return, once `session` is narrowed.)
+  const [switchToolOpen, setSwitchToolOpen] = React.useState(false);
+  // The tile the user just clicked, not a bare boolean — mirrors
+  // `PendingToolChoicePanel`'s `choosingTool` so the grid highlights the tile
+  // being switched *to* during the async request, not the session's current
+  // (old) tool.
+  const [switchingTool, setSwitchingTool] = React.useState<string | null>(null);
+
+  // App renders this panel without a session key, so a route/back-forward
+  // change swaps `session` in place instead of remounting. Reset the transient
+  // title-edit and switch-tool UI when the session id changes so a draft title
+  // or an open switch modal from the previous session can't bleed into (and
+  // then act on) the next one.
+  const titleStateSessionId = session?.session_id;
+  const prevTitleStateSessionId = React.useRef(titleStateSessionId);
+  React.useEffect(() => {
+    if (prevTitleStateSessionId.current !== titleStateSessionId) {
+      prevTitleStateSessionId.current = titleStateSessionId;
+      setEditingTitle(false);
+      setTitleDraft('');
+      setSwitchToolOpen(false);
+      setSwitchingTool(null);
+    }
+  }, [titleStateSessionId]);
+
+  // Tool capabilities — drives which buttons are shown
+  const activeAgenticTool =
+    session && isAgenticToolName(session.agentic_tool) ? session.agentic_tool : undefined;
+  const hasActiveAgenticTool = Boolean(activeAgenticTool);
+  const toolCaps = activeAgenticTool ? AGENTIC_TOOL_CAPABILITIES[activeAgenticTool] : undefined;
+
+  // Compute which session MCP servers need authentication
+  const unauthedMcpServers = React.useMemo(() => {
+    return sessionMcpServerIds
+      .map((id) => mcpServerById.get(id))
+      .filter((server) => mcpServerNeedsAuth(server, userAuthenticatedMcpServerIds))
+      .map((server) => server!);
+  }, [sessionMcpServerIds, mcpServerById, userAuthenticatedMcpServerIds]);
+
+  // Shared single-draft storage (localStorage-backed to survive refreshes).
+  // Aliased as stable callbacks because they're threaded through props and
+  // effect deps below.
+  const getDraft = React.useCallback(
+    (sessionId: string) => getPromptDraft(currentUserId, sessionId),
+    [currentUserId]
+  );
+  const getDraftSeed = React.useCallback(
+    (sessionId: string) => readPromptDraftSeed(currentUserId, sessionId),
+    [currentUserId]
+  );
+  const discardDraftSeed = React.useCallback(
+    (sessionId: string) => {
+      consumePromptDraftSeed(currentUserId, sessionId);
+    },
+    [currentUserId]
+  );
+  const saveDraft = React.useCallback(
+    (sessionId: string, value: string) => savePromptDraft(currentUserId, sessionId, value),
+    [currentUserId]
+  );
+  const deleteDraft = React.useCallback(
+    (sessionId: string, expectedText?: string) => {
+      deletePromptDraft(currentUserId, sessionId, expectedText);
+      // Admission may complete after navigation. Retire the original seed
+      // without clearing a different caller/session or replacement starter.
+      discardPromptDraftSeed(currentUserId, sessionId, expectedText);
+    },
+    [currentUserId]
+  );
+
+  // Input value lives entirely inside PromptInput (local state).
+  // The parent reads it imperatively via promptRef / inputValueRef — no
+  // parent re-renders on keystrokes.
+  const promptRef = React.useRef<PromptInputHandle>(null);
+  const inputValueRef = React.useRef(session ? getDraft(session.session_id) : '');
+  const [hasInput, setHasInput] = React.useState(() => !!inputValueRef.current.trim());
+  const handleHasInputChange = React.useCallback((v: boolean) => setHasInput(v), []);
+  // getDefaultPermissionMode imported from @agor-live/client — canonical
+  // per-tool defaults live in core's `getDefaultPermissionMode`. The local
+  // shadow that used to live here was stale (missing gemini/opencode/copilot)
+  // and silently drifted from the core definition.
+
+  const initialPermissionMode: PermissionMode =
+    session?.permission_config?.mode ??
+    (session?.agentic_tool && isAgenticToolName(session.agentic_tool)
+      ? getDefaultPermissionMode(session.agentic_tool)
+      : getDefaultPermissionMode('claude-code'));
+  const initialCodexDefaults = mapToCodexPermissionConfig(initialPermissionMode);
+  const [permissionMode, setPermissionMode] = React.useState<PermissionMode>(initialPermissionMode);
+  const [codexSandboxMode, setCodexSandboxMode] = React.useState<CodexSandboxMode>(
+    session?.permission_config?.codex?.sandboxMode ?? initialCodexDefaults.sandboxMode
+  );
+  const [codexApprovalPolicy, setCodexApprovalPolicy] = React.useState<CodexApprovalPolicy>(
+    session?.permission_config?.codex?.approvalPolicy ?? initialCodexDefaults.approvalPolicy
+  );
+  const [effortLevel, setEffortLevel] = React.useState<EffortLevel | undefined>(
+    session?.model_config?.effort ?? toolCaps?.defaultReasoningEffort
+  );
+  const [scrollToBottom, setScrollToBottom] = React.useState<(() => void) | null>(null);
+  const [scrollToTop, setScrollToTop] = React.useState<(() => void) | null>(null);
+  const [forkModalOpen, setForkModalOpen] = React.useState(false);
+  const [spawnModalOpen, setSpawnModalOpen] = React.useState(false);
+  const [uploadModalOpen, setUploadModalOpen] = React.useState(false);
+  const [advancedUploadInitialFiles, setAdvancedUploadInitialFiles] = React.useState<File[]>([]);
+  const [composerDropActive, setComposerDropActive] = React.useState(false);
+  const [stopRequestInFlight, setStopRequestInFlight] = React.useState(false);
+  const currentClientRef = React.useRef(client);
+  currentClientRef.current = client;
+  const [forceFailTarget, setForceFailTarget] = React.useState<{
+    taskId: string;
+    terminationRequestedAt: string;
+    recoveryRevision: string;
+  } | null>(null);
+  const [forceFailConfirmation, setForceFailConfirmation] = React.useState('');
+  const [recoveryFeedback, setRecoveryFeedback] = React.useState<{
+    key: string;
+    text: string;
+  } | null>(null);
+  const forceFailInputRef = React.useRef<InputRef | null>(null);
+  const reactiveSessionId = session?.session_id ?? null;
+  const { state: reactiveSessionState } = useSharedReactiveSession(client, reactiveSessionId, {
+    enabled: open,
+    // The open session: background partition reads wait for its first page.
+    foreground: true,
+    // ConversationView retains the same lean handle. Keeping the cache key
+    // identical collapses duplicate Session bootstrap/reconnect reads while
+    // preserving paged history without eager historical tool hydration.
+    reactiveOptions: { taskHydration: 'lean' },
+  });
+  // Parent, fork, callback and children links resolve without global data.
+  useSessionGenealogyTargets(client, open ? session : null);
+
+  const tasks = reactiveSessionState?.tasks || EMPTY_TASKS;
+  const queuedTasks = reactiveSessionState?.queuedTasks ?? EMPTY_TASKS;
+  const recoveryTask = [...tasks].reverse().find((task) => task.status === TaskStatus.STOPPING);
+  const recoveryKey = `${session?.session_id}:${recoveryTask?.task_id}:${recoveryTask?.termination_request?.recovery_revision}`;
+  const recoveryError = recoveryFeedback?.key === recoveryKey ? recoveryFeedback.text : null;
+  const setRecoveryError = (text: string | null) =>
+    setRecoveryFeedback(text ? { key: recoveryKey, text } : null);
+
+  React.useEffect(() => {
+    if (
+      forceFailTarget &&
+      !tasks.some(
+        (task) =>
+          task.task_id === forceFailTarget.taskId &&
+          task.status === TaskStatus.STOPPING &&
+          task.sdk_failure?.termination === 'unverified' &&
+          task.termination_request?.requested_at === forceFailTarget.terminationRequestedAt &&
+          (task.termination_request.recovery_revision ?? task.termination_request.requested_at) ===
+            forceFailTarget.recoveryRevision
+      )
+    ) {
+      setForceFailTarget(null);
+      setForceFailConfirmation('');
+    }
+  }, [forceFailTarget, tasks]);
+  const attachmentInputRef = React.useRef<HTMLInputElement>(null);
+  const bodyRef = React.useRef<HTMLDivElement | null>(null);
+  // Search observes only the conversation region, not the whole body: the
+  // no-results overlay, footer, and modals are `bodyRef` children, so observing
+  // `bodyRef` would let the overlay's own mount/unmount retrigger the scan.
+  const conversationRef = React.useRef<HTMLDivElement | null>(null);
+  const searchInputRef = React.useRef<HTMLInputElement | null>(null);
+  const {
+    searchOpen,
+    query,
+    setQuery,
+    totalMatches,
+    currentMatch,
+    searchPending,
+    openSearch,
+    closeSearch,
+    goNext,
+    goPrev,
+  } = useSessionSearch(conversationRef);
+  const composerSessionIdentityRef = React.useRef<{
+    ownerId: string | null;
+    sessionId: SessionID | null;
+    generation: number;
+    ownerGeneration: number;
+  }>({
+    ownerId: currentUserId ?? null,
+    sessionId: session?.session_id ?? null,
+    generation: 0,
+    ownerGeneration: 0,
+  });
+  const currentComposerOwnerId = currentUserId ?? null;
+  const currentComposerSessionId = session?.session_id ?? null;
+  if (
+    composerSessionIdentityRef.current.ownerId !== currentComposerOwnerId ||
+    composerSessionIdentityRef.current.sessionId !== currentComposerSessionId
+  ) {
+    composerSessionIdentityRef.current = {
+      ownerId: currentComposerOwnerId,
+      sessionId: currentComposerSessionId,
+      generation: composerSessionIdentityRef.current.generation + 1,
+      ownerGeneration:
+        composerSessionIdentityRef.current.ownerId === currentComposerOwnerId
+          ? composerSessionIdentityRef.current.ownerGeneration
+          : composerSessionIdentityRef.current.ownerGeneration + 1,
+    };
+  }
+  const composerIdentityKey = `${currentComposerOwnerId ?? 'anonymous'}:${composerSessionIdentityRef.current.generation}:${currentComposerSessionId ?? 'none'}`;
+  const {
+    attachments: composerAttachments,
+    attachmentsRef: composerAttachmentsRef,
+    clearAttachments: clearComposerAttachments,
+    hasAttachments: hasComposerAttachments,
+    addAttachments: addComposerAttachments,
+    removeAttachment: removeComposerAttachment,
+    uploadAttachments: uploadComposerAttachments,
+    uploading: composerAttachmentUploading,
+    uploadingRef: composerAttachmentUploadingRef,
+    validationError: composerAttachmentValidationError,
+    setValidationError: setComposerAttachmentValidationError,
+  } = useComposerAttachments({
+    sessionId: session?.session_id ?? null,
+    scopeKey: composerIdentityKey,
+    showError,
+    uploadPolicy,
+  });
+  const composerSendInFlightRef = React.useRef<typeof composerSessionIdentityRef.current | null>(
+    null
+  );
+
+  // Survives the lean transcript trimming the turn that reported it.
+  const latestContextWindow = React.useMemo(
+    () =>
+      selectLatestContextWindow(
+        reactiveSessionState?.latestContextWindow,
+        tasks,
+        session?.agentic_tool
+      ),
+    [reactiveSessionState?.latestContextWindow, tasks, session?.agentic_tool]
+  );
+
+  const attachmentItems = React.useMemo((): SessionAttachmentItem[] => {
+    const acc: SessionAttachmentItem[] = [];
+    if (branch?.issue_url) {
+      acc.push({
+        key: 'issue',
+        name: `Issue: ${getUrlDisplayLabel(branch.issue_url)}`,
+        url: branch.issue_url,
+      });
+    }
+    if (branch?.pull_request_url) {
+      acc.push({
+        key: 'pr',
+        name: `PR: ${getUrlDisplayLabel(branch.pull_request_url)}`,
+        url: branch.pull_request_url,
+      });
+    }
+    return acc;
+  }, [branch?.issue_url, branch?.pull_request_url]);
+
+  const footerGradient = React.useMemo(() => {
+    if (!latestContextWindow) return undefined;
+    return getContextWindowGradient(
+      latestContextWindow.used,
+      latestContextWindow.limit,
+      latestContextWindow.taskMetadata.normalized_sdk_response?.contextUsageSnapshot,
+      {
+        normal: token.colorSuccessBg,
+        warning: token.colorWarningBg,
+        critical: token.colorErrorBg,
+      }
+    );
+  }, [latestContextWindow, token.colorSuccessBg, token.colorWarningBg, token.colorErrorBg]);
+
+  const footerTimerTask = React.useMemo(() => {
+    if (tasks.length === 0) return null;
+
+    for (let index = tasks.length - 1; index >= 0; index -= 1) {
+      const candidate = tasks[index];
+      if (
+        candidate.status === TaskStatus.DISPATCHING ||
+        candidate.status === TaskStatus.RUNNING ||
+        candidate.status === TaskStatus.STOPPING ||
+        candidate.status === TaskStatus.AWAITING_PERMISSION ||
+        candidate.status === TaskStatus.AWAITING_INPUT
+      ) {
+        return candidate;
+      }
+    }
+
+    return tasks[tasks.length - 1];
+  }, [tasks]);
+
+  // Update permission mode when session changes
+  React.useEffect(() => {
+    if (session?.permission_config?.mode) {
+      setPermissionMode(session.permission_config.mode);
+    } else if (session?.agentic_tool && isAgenticToolName(session.agentic_tool)) {
+      setPermissionMode(getDefaultPermissionMode(session.agentic_tool));
+    }
+
+    if (session?.agentic_tool === 'codex' && session?.permission_config?.codex) {
+      setCodexSandboxMode(session.permission_config.codex.sandboxMode);
+      setCodexApprovalPolicy(session.permission_config.codex.approvalPolicy);
+    }
+  }, [session?.permission_config?.mode, session?.permission_config?.codex, session?.agentic_tool]);
+
+  // Keep explicit overrides distinct from runtime-owned defaults (for example Codex config.toml).
+  React.useEffect(() => {
+    setEffortLevel(session?.model_config?.effort ?? toolCaps?.defaultReasoningEffort);
+  }, [session?.model_config?.effort, toolCaps?.defaultReasoningEffort]);
+
+  React.useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && searchOpen) closeSearch();
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [searchOpen, closeSearch]);
+
+  // Reset search when switching sessions — stale ranges/counts belong to the
+  // previous conversation's DOM.
+  const prevSearchSessionIdRef = React.useRef(session?.session_id ?? null);
+  React.useEffect(() => {
+    const id = session?.session_id ?? null;
+    if (prevSearchSessionIdRef.current !== id) {
+      prevSearchSessionIdRef.current = id;
+      closeSearch();
+    }
+  }, [session?.session_id, closeSearch]);
+
+  React.useEffect(() => {
+    if (searchOpen) {
+      setTimeout(() => searchInputRef.current?.focus(), 30);
+    }
+  }, [searchOpen]);
+
+  const isRunning =
+    session?.status === SessionStatus.RUNNING || session?.status === SessionStatus.STOPPING;
+  const isStopping = session?.status === SessionStatus.STOPPING;
+
+  // SessionFooter is memoized, but its handlers close over per-render state
+  // and are defined below the null-session early return, so they can't be
+  // useCallback'd directly. Freeze the identities the footer sees with
+  // lifetime-stable wrappers that delegate to the latest implementations via
+  // a ref (re-pointed each render, right where the impls are defined).
+  const footerHandlersRef = React.useRef<{
+    onModelConfigCommit: (config: ModelConfig) => void;
+    onSendPrompt: () => void;
+    onStop: () => void;
+    onRetryCleanup: () => void;
+    onFork: () => void;
+    onBtwSend: () => void;
+    onSpawnOpen: () => void;
+    onAttachFiles: () => void;
+    onUploadOpen: () => void;
+    onEffortChange: (v: EffortLevel | undefined) => void;
+    onPermissionModeChange: (v: PermissionMode) => void;
+    onCodexPermissionChange: (sandbox: CodexSandboxMode, approval: CodexApprovalPolicy) => void;
+  } | null>(null);
+  const stableFooterHandlers = React.useMemo(
+    () => ({
+      onModelConfigCommit: (config: ModelConfig) =>
+        footerHandlersRef.current?.onModelConfigCommit(config),
+      onSendPrompt: () => footerHandlersRef.current?.onSendPrompt(),
+      onStop: () => footerHandlersRef.current?.onStop(),
+      onRetryCleanup: () => footerHandlersRef.current?.onRetryCleanup(),
+      onFork: () => footerHandlersRef.current?.onFork(),
+      onBtwSend: () => footerHandlersRef.current?.onBtwSend(),
+      onSpawnOpen: () => footerHandlersRef.current?.onSpawnOpen(),
+      onAttachFiles: () => footerHandlersRef.current?.onAttachFiles(),
+      onUploadOpen: () => footerHandlersRef.current?.onUploadOpen(),
+      onEffortChange: (v: EffortLevel | undefined) => footerHandlersRef.current?.onEffortChange(v),
+      onPermissionModeChange: (v: PermissionMode) =>
+        footerHandlersRef.current?.onPermissionModeChange(v),
+      onCodexPermissionChange: (sandbox: CodexSandboxMode, approval: CodexApprovalPolicy) =>
+        footerHandlersRef.current?.onCodexPermissionChange(sandbox, approval),
+    }),
+    []
+  );
+
+  const modelLabel =
+    session?.model_config?.model &&
+    session.agentic_tool === 'opencode' &&
+    session.model_config.provider
+      ? `${session.model_config.provider}/${session.model_config.model}`
+      : session?.model_config?.model;
+  const modelConfig: ModelConfig | undefined = React.useMemo(
+    () =>
+      session?.model_config?.model
+        ? {
+            mode: session.model_config.mode || 'alias',
+            model: session.model_config.model,
+            provider: session.model_config.provider,
+            advisorModel: session.model_config.advisorModel,
+          }
+        : undefined,
+    [
+      session?.model_config?.mode,
+      session?.model_config?.model,
+      session?.model_config?.provider,
+      session?.model_config?.advisorModel,
+    ]
+  );
+
+  // The composer subtree only depends on composer/draft state — memoize it so
+  // ordinary SessionPanel re-renders (reactive-session notifies, store
+  // patches) hand the memoized SessionFooter a reference-stable slot.
+  // Store rows may be lean list rows that withhold the SDK-reported
+  // slash_commands / skills inventories; the reactive session holds the full
+  // record from `sessions.get` (kept current by realtime patches). Fall back to
+  // the store row only when it is itself a full record.
+  const fullSession =
+    reactiveSessionState?.session?.session_id === session?.session_id
+      ? reactiveSessionState?.session
+      : session && hasFullSessionDetails(session)
+        ? session
+        : null;
+  const sessionCustomContext = fullSession?.custom_context as Record<string, unknown> | undefined;
+  const promptInputSlot = React.useMemo(() => {
+    if (!session) return null;
+    return (
+      <SessionComposerDropZone
+        disabled={composerAttachmentUploading}
+        onDragActiveChange={setComposerDropActive}
+        onFilesDrop={addComposerAttachments}
+      >
+        {composerAttachmentValidationError && (
+          <Alert
+            type="error"
+            showIcon
+            message={composerAttachmentValidationError}
+            style={{ marginBottom: 0, borderRadius: token.borderRadius }}
+          />
+        )}
+        <SessionAttachmentTray
+          attachments={composerAttachments}
+          disabled={composerAttachmentUploading}
+          onRemove={removeComposerAttachment}
+        />
+        <PromptInput
+          key={composerIdentityKey}
+          ref={promptRef}
+          sessionId={session.session_id}
+          getDraft={getDraft}
+          getDraftSeed={getDraftSeed}
+          discardDraftSeed={discardDraftSeed}
+          saveDraft={saveDraft}
+          deleteDraft={deleteDraft}
+          onHasInputChange={handleHasInputChange}
+          inputValueRef={inputValueRef}
+          onSubmit={stableFooterHandlers.onSendPrompt}
+          hasExternalInput={hasComposerAttachments}
+          placeholder={
+            isMobileShell
+              ? isRunning
+                ? 'Queue here…'
+                : 'Prompt here…'
+              : isRunning
+                ? 'Queue here… @ for mentions, : for emoji'
+                : 'Prompt here… @ for mentions, : for emoji'
+          }
+          autoSize={{ minRows: 1, maxRows: isMobileShell ? 5 : 10 }}
+          client={client}
+          userById={userById}
+          onFilesDrop={addComposerAttachments}
+          filesDropDisabled={composerAttachmentUploading}
+          showFilesDropOverlay={false}
+          suppressEmptyHighlight={composerDropActive}
+          slashCommands={
+            Array.isArray(sessionCustomContext?.slash_commands)
+              ? sessionCustomContext.slash_commands
+              : undefined
+          }
+          skills={
+            Array.isArray(sessionCustomContext?.skills) ? sessionCustomContext.skills : undefined
+          }
+        />
+        <input
+          ref={attachmentInputRef}
+          type="file"
+          multiple
+          disabled={composerAttachmentUploading}
+          style={{ display: 'none' }}
+          onChange={(event) => {
+            addComposerAttachments(Array.from(event.target.files ?? []));
+            event.target.value = '';
+          }}
+        />
+      </SessionComposerDropZone>
+    );
+  }, [
+    session,
+    sessionCustomContext,
+    composerAttachmentUploading,
+    composerAttachmentValidationError,
+    composerAttachments,
+    composerDropActive,
+    composerIdentityKey,
+    hasComposerAttachments,
+    isMobileShell,
+    isRunning,
+    client,
+    userById,
+    addComposerAttachments,
+    removeComposerAttachment,
+    getDraft,
+    getDraftSeed,
+    discardDraftSeed,
+    saveDraft,
+    deleteDraft,
+    handleHasInputChange,
+    stableFooterHandlers,
+    token.borderRadius,
+  ]);
+
+  // When there's no session, render nothing (panel is collapsed to zero).
+  // When open=false, we still render the component tree (hidden) so that
+  // antd's CSS-in-JS doesn't garbage-collect component styles.
+  if (!session) {
+    return null;
+  }
+  const activeSession = isAgenticToolName(session.agentic_tool)
+    ? (session as Session & { agentic_tool: AgenticToolName })
+    : null;
+
+  const handleArchive = () => {
+    if (!client || connectionDisabled) {
+      showError(notConnectedMessage('archive the session'));
+      return;
+    }
+
+    confirmArchive(session.session_id, { onArchived: onClose });
+  };
+
+  // The mobile canvas lives on a separate Board tab, so there is no map to center from here.
+  const showCenterMap = !!branch && !isMobileShell;
+  const hasBranchActions = showCenterMap || !!(onOpenTerminal && branch);
+  const canSwitchTool =
+    hasActiveAgenticTool && !!branch && !!onChooseAgenticTool && (session.tasks?.length ?? 0) === 0;
+  const handleSwitchTool = async (tool: string) => {
+    if (!branch || !onChooseAgenticTool || switchingTool) return;
+    setSwitchingTool(tool);
+    try {
+      await onChooseAgenticTool(branch.branch_id, tool as AgenticToolName, session.session_id);
+      setSwitchToolOpen(false);
+    } finally {
+      setSwitchingTool(null);
+    }
+  };
+  const moreMenuItems: MenuProps['items'] = [
+    ...(showCenterMap && branch
+      ? [
+          {
+            key: 'center-map',
+            icon: <AimOutlined />,
+            label: 'Center map on branch',
+            onClick: () => recenterMap(branch.branch_id, { boardId: branch.board_id ?? undefined }),
+          },
+        ]
+      : []),
+    ...(onOpenTerminal && branch
+      ? [
+          {
+            key: 'terminal',
+            icon: <CodeOutlined />,
+            label: 'Open terminal',
+            onClick: () => onOpenTerminal([], branch.branch_id),
+          },
+        ]
+      : []),
+    ...(hasBranchActions ? [{ type: 'divider' as const }] : []),
+    ...(onOpenSettings
+      ? [
+          {
+            key: 'settings',
+            icon: <SettingOutlined />,
+            label: 'Session settings',
+            onClick: () => onOpenSettings(session.session_id),
+          },
+        ]
+      : []),
+    ...(canSwitchTool
+      ? [
+          {
+            key: 'switch-tool',
+            icon: <RobotOutlined />,
+            label: 'Switch tool…',
+            onClick: () => setSwitchToolOpen(true),
+          },
+        ]
+      : []),
+    {
+      key: 'archive',
+      icon: <InboxOutlined />,
+      label: connectionDisabled ? 'Archive (disconnected)' : 'Archive session',
+      disabled: connectionDisabled || !client,
+      onClick: handleArchive,
+    },
+  ];
+
+  const openAdvancedUpload = (initialFiles: File[] = []) => {
+    if (composerAttachmentUploadingRef.current) return;
+    setAdvancedUploadInitialFiles(initialFiles);
+    setUploadModalOpen(true);
+  };
+
+  const handleSendPrompt = async () => {
+    const sendStartComposerIdentity = composerSessionIdentityRef.current;
+    if (
+      composerSendInFlightRef.current === sendStartComposerIdentity ||
+      composerAttachmentUploadingRef.current ||
+      connectionDisabled
+    ) {
+      return;
+    }
+
+    composerSendInFlightRef.current = sendStartComposerIdentity;
+    let uploadingFiles: File[] | null = null;
+    try {
+      const sendStartSessionId = session.session_id;
+      const value = promptRef.current?.getValue() ?? '';
+      const attachmentsAtSendStart = composerAttachmentsRef.current;
+      const hasAttachments = attachmentsAtSendStart.length > 0;
+      if (!value.trim() && !hasAttachments) return;
+
+      const blockingAttachment = attachmentsAtSendStart.find(isBlockingComposerAttachment);
+      if (blockingAttachment) {
+        showError(new BlockingAttachmentError(blockingAttachment).message);
+        return;
+      }
+
+      if (!onSendPrompt) {
+        showError("You can't send messages from this view.");
+        return;
+      }
+
+      uploadingFiles = attachmentsAtSendStart
+        .filter((attachment) => attachment.status !== 'uploaded')
+        .map((attachment) => attachment.file);
+      const uploadedFiles = await uploadComposerAttachments(
+        attachmentsAtSendStart,
+        sendStartSessionId
+      );
+      uploadingFiles = null;
+      const currentComposerIdentity = composerSessionIdentityRef.current;
+      if (
+        currentComposerIdentity.ownerId !== sendStartComposerIdentity.ownerId ||
+        currentComposerIdentity.ownerGeneration !== sendStartComposerIdentity.ownerGeneration
+      ) {
+        return;
+      }
+      const promptAttachments = uploadedFiles;
+      const composerStillOwnsSend =
+        composerSessionIdentityRef.current === sendStartComposerIdentity;
+      // Re-read from the imperative textarea handle after upload only if the
+      // same composer instance still owns this send. When the user switches
+      // sessions during a delayed upload, promptRef points at the newly active
+      // composer; reading/clearing it would mix the new prompt into the old
+      // session. In that case we send the original snapshot to the original
+      // session and preserve the active composer's text/attachments.
+      const latestValue = composerStillOwnsSend
+        ? getLatestComposerPromptText({
+            promptHandle: promptRef.current,
+            inputValueRefValue: inputValueRef.current,
+            sendStartValue: value,
+          })
+        : value;
+      const promptToSend = buildPromptWithAttachments(latestValue, promptAttachments);
+      if (!promptToSend.trim()) return;
+
+      // Single entry point: /prompt. The daemon decides run-vs-queue based on
+      // session state and reports it back via `task.status`. The 'queued'
+      // WebSocket event populates the queue panel for queued prompts.
+      const sendResult = await onSendPrompt?.(sendStartSessionId, promptToSend, permissionMode);
+      if (sendResult === false) return;
+
+      // Admission can outlive this composer. Re-check ownership after the
+      // await rather than reusing the pre-admission snapshot: a later caller
+      // may have typed identical text and selected different attachments.
+      const composerOwnsAdmissionCompletion =
+        composerSessionIdentityRef.current === sendStartComposerIdentity;
+      const textAfterAdmission = composerOwnsAdmissionCompletion
+        ? promptRef.current?.getValue()
+        : undefined;
+      // Typing on after Enter appends to the sent text while admission is
+      // pending. Remove the sent part and keep what was added, so a quick
+      // follow-up never leaves the already-sent prompt in the box.
+      if (textAfterAdmission?.startsWith(latestValue)) {
+        const typedAfterSend = textAfterAdmission.slice(latestValue.length);
+        promptRef.current?.clear(latestValue ? typedAfterSend.trimStart() : typedAfterSend);
+        clearComposerAttachments();
+        setComposerAttachmentValidationError(null);
+      } else {
+        // The composer moved or its text changed while admission was pending.
+        // Clear only an exactly matching persisted snapshot; never erase the
+        // replacement text now visible to the user.
+        deleteDraft(sendStartSessionId, latestValue);
+      }
+
+      // Re-engage the bottom lock so a scrolled-up user follows their just-sent
+      // message and the streaming reply (behavior 3). `scrollToBottom` is the
+      // function ConversationView exposed via onScrollRef.
+      if (composerOwnsAdmissionCompletion) scrollToBottom?.();
+    } catch (error) {
+      if (composerSessionIdentityRef.current !== sendStartComposerIdentity) return;
+      // The message and files stay in the composer.
+      showError(
+        error instanceof BlockingAttachmentError
+          ? error.message
+          : uploadingFiles
+            ? formatComposerUploadError(uploadingFiles, error)
+            : formatActionError('send your message', error, { idempotent: false })
+      );
+    } finally {
+      if (composerSendInFlightRef.current === sendStartComposerIdentity) {
+        composerSendInFlightRef.current = null;
+      }
+    }
+  };
+
+  const canReopenSession =
+    !!currentUserId &&
+    (branch?.primary_owner_user_id === currentUserId ||
+      hasMinimumRole(userById.get(currentUserId)?.role, ROLES.ADMIN));
+  const handleRetryCleanup = async () => {
+    const request = recoveryTask?.termination_request;
+    if (
+      !client ||
+      !session ||
+      !recoveryTask ||
+      !request ||
+      connectionDisabled ||
+      stopRequestInFlight
+    )
+      return;
+    setRecoveryError(null);
+    setStopRequestInFlight(true);
+    try {
+      const result = await requestSessionStop(
+        client,
+        session.session_id,
+        recoveryTask.task_id,
+        undefined,
+        {
+          retry_cleanup: true,
+          expected_task_id: recoveryTask.task_id,
+          termination_requested_at: request.requested_at,
+          recovery_revision: request.recovery_revision ?? request.requested_at,
+        }
+      );
+      if (result.outcome === 'condition_changed')
+        setRecoveryError(
+          'Recovery has already changed. Check the latest status before trying again.'
+        );
+    } catch (error) {
+      const code =
+        typeof error === 'object' && error !== null && 'code' in error ? error.code : undefined;
+      setRecoveryError(
+        isStopTransportAmbiguous(error)
+          ? 'We could not confirm the cleanup request. Reconnect and check the status before retrying.'
+          : code === 401
+            ? 'Sign in again before retrying cleanup.'
+            : code === 403
+              ? 'You do not have permission to retry cleanup. Ask the session owner or a branch manager for help.'
+              : 'The cleanup request was not accepted. Check the latest status before trying again.'
+      );
+    } finally {
+      setStopRequestInFlight(false);
+    }
+  };
+
+  const handleStop = async () => {
+    if (!session || !client || connectionDisabled || stopRequestInFlight) return;
+
+    const unverifiedTask = [...tasks]
+      .reverse()
+      .find(
+        (task) =>
+          task.status === TaskStatus.STOPPING && task.sdk_failure?.termination === 'unverified'
+      );
+    if (unverifiedTask?.termination_request) {
+      setForceFailConfirmation('');
+      setForceFailTarget({
+        taskId: unverifiedTask.task_id,
+        terminationRequestedAt: unverifiedTask.termination_request.requested_at,
+        recoveryRevision:
+          unverifiedTask.termination_request.recovery_revision ??
+          unverifiedTask.termination_request.requested_at,
+      });
+      return;
+    }
+
+    // Show feedback immediately if this is a retry
+    if (isStopping) {
+      showInfo('Retrying stop request...');
+    }
+
+    const stopSessionId = session.session_id;
+    const stopTarget = [...tasks]
+      .reverse()
+      .find(
+        (task) =>
+          task.status === TaskStatus.DISPATCHING ||
+          task.status === TaskStatus.RUNNING ||
+          task.status === TaskStatus.STOPPING ||
+          task.status === TaskStatus.AWAITING_PERMISSION ||
+          task.status === TaskStatus.AWAITING_INPUT
+      );
+    if (!stopTarget) {
+      showInfo("Couldn't find running work to stop. Refresh to see the latest state.");
+      return;
+    }
+
+    setStopRequestInFlight(true);
+    try {
+      const result: SessionStopResult = await requestSessionStop(
+        client,
+        stopSessionId,
+        stopTarget.task_id
+      );
+      if (result.success === false) {
+        showInfo(result.reason ?? 'Stop requested; waiting for executor termination.');
+      }
+    } catch (error) {
+      const reconciliation = isStopTransportAmbiguous(error)
+        ? await reconcileStopTransportFailure(
+            () => currentClientRef.current,
+            stopSessionId,
+            stopTarget.task_id
+          )
+        : { outcome: 'unresolved' as const };
+      if (reconciliation.outcome === 'accepted' || reconciliation.outcome === 'ended') {
+        showInfo(reconciliation.reason);
+      } else if (isStopTransportAmbiguous(error)) {
+        showError(withRawDetail(unconfirmedMessage('stop the agent', { idempotent: true }), error));
+      } else {
+        showError(formatActionError('stop the agent', error, { idempotent: true }));
+      }
+    } finally {
+      setStopRequestInFlight(false);
+    }
+  };
+
+  const handleForceFail = async () => {
+    if (
+      !session ||
+      !client ||
+      !forceFailTarget ||
+      forceFailConfirmation !== 'STOP' ||
+      stopRequestInFlight
+    ) {
+      return;
+    }
+    setStopRequestInFlight(true);
+    try {
+      await client.service(`sessions/${session.session_id}/stop`).create({
+        force_unverified: true,
+        confirmation: 'STOP',
+        task_id: forceFailTarget.taskId,
+        termination_requested_at: forceFailTarget.terminationRequestedAt,
+        recovery_revision: forceFailTarget.recoveryRevision,
+      });
+      setForceFailTarget(null);
+      setForceFailConfirmation('');
+    } catch (error) {
+      setRecoveryError(
+        withRawDetail(
+          "Couldn't reopen this session. Ask a branch owner or administrator to help.",
+          error
+        )
+      );
+    } finally {
+      setStopRequestInFlight(false);
+    }
+  };
+
+  const handleFork = async () => {
+    if (!session) return;
+    if (composerAttachmentsRef.current.length > 0) {
+      showWarning('Remove attachments to fork. Attachments only work with Send.');
+      return;
+    }
+    const value = promptRef.current?.getValue() ?? '';
+    const promptToSend = value.trim();
+    if (!promptToSend) {
+      setForkModalOpen(true);
+      return;
+    }
+    try {
+      await onFork?.(session.session_id, promptToSend);
+      // Only clear the compose box + draft on success, so a failed fork
+      // leaves the typed prompt intact for the user to retry.
+      promptRef.current?.clear();
+    } catch {
+      // The fork handler shows why; the message stays in the compose box.
+    }
+  };
+
+  const handleForkModalConfirm = async (config: string | Partial<SpawnConfig>) => {
+    if (!session) return;
+    const prompt = typeof config === 'string' ? config : (config.prompt ?? '');
+    if (!prompt) return;
+    await onFork?.(session.session_id, prompt);
+  };
+
+  const handleBtwSend = async () => {
+    if (composerAttachmentsRef.current.length > 0) {
+      showWarning('Remove attachments to ask a side question. Attachments only work with Send.');
+      return;
+    }
+    const value = promptRef.current?.getValue() ?? '';
+    if (!value.trim() || connectionDisabled) return;
+    const promptToSend = value.trim();
+    try {
+      await onBtwFork?.(session.session_id, promptToSend);
+      promptRef.current?.clear();
+    } catch {
+      // The side-question handler shows why; the message stays in the compose box.
+    }
+  };
+
+  const handleSpawnOpen = () => {
+    if (composerAttachmentsRef.current.length > 0) {
+      showWarning('Remove attachments to start a subsession. Attachments only work with Send.');
+      return;
+    }
+    setSpawnModalOpen(true);
+  };
+
+  const handleSpawnModalConfirm = async (config: string | Partial<SpawnConfig>) => {
+    if (!session || !client) return;
+
+    // Daemon owns the spawn-subsession meta-prompt template. The UI sends raw
+    // `{userPrompt, config}` to /sessions/:id/spawn-prompt, which renders the
+    // meta-prompt and forwards it to /sessions/:id/prompt in one round trip.
+    //
+    // `parentPermissionMode` is the *parent* session's permission mode for the
+    // forwarding prompt; the spawn config's `permissionMode` is rendered into
+    // the meta-prompt as the *child* session's intended mode. They're distinct
+    // — don't reuse one for the other.
+    const spawnConfig = buildSpawnPromptContext(config);
+
+    await client
+      .service(`sessions/${session.session_id}/spawn-prompt`)
+      .create({ ...spawnConfig, parentPermissionMode: permissionMode });
+
+    setSpawnModalOpen(false);
+    promptRef.current?.clear();
+  };
+
+  const handlePermissionModeChange = (newMode: PermissionMode) => {
+    setPermissionMode(newMode);
+
+    if (session && onUpdateSession) {
+      onUpdateSession(session.session_id, {
+        permission_config: {
+          ...session.permission_config,
+          mode: newMode,
+        },
+      });
+    }
+  };
+
+  const handleCodexPermissionChange = (
+    sandbox: CodexSandboxMode,
+    approval: CodexApprovalPolicy
+  ) => {
+    setCodexSandboxMode(sandbox);
+    setCodexApprovalPolicy(approval);
+
+    if (session && onUpdateSession) {
+      onUpdateSession(session.session_id, {
+        permission_config: {
+          ...session.permission_config,
+          codex: {
+            ...session.permission_config?.codex,
+            sandboxMode: sandbox,
+            approvalPolicy: approval,
+          },
+        },
+      });
+    }
+  };
+
+  const handleEffortChange = (newEffort: EffortLevel | undefined) => {
+    setEffortLevel(newEffort);
+
+    if (session?.model_config && onUpdateSession) {
+      const nextModelConfig = {
+        ...session.model_config,
+        updated_at: new Date().toISOString(),
+      };
+      if (newEffort) nextModelConfig.effort = newEffort;
+      else delete nextModelConfig.effort;
+      onUpdateSession(session.session_id, { model_config: nextModelConfig });
+    }
+  };
+
+  const handleModelConfigCommit = (newConfig: ModelConfig) => {
+    if (session && onUpdateSession) {
+      const nextConfig: NonNullable<Session['model_config']> = {
+        ...session.model_config,
+        mode: newConfig.mode,
+        model: newConfig.model,
+        ...(newConfig.provider ? { provider: newConfig.provider } : {}),
+        updated_at: new Date().toISOString(),
+      };
+      // Honor the advisor selector's clear action. `model_config` is
+      // column-replaced on patch, so we must DELETE the key when the user clears
+      // it (allowClear → undefined) — the spread above would otherwise silently
+      // carry the previous value forward (root cause of "no way to turn it off").
+      if (newConfig.advisorModel) {
+        nextConfig.advisorModel = newConfig.advisorModel;
+      } else {
+        delete nextConfig.advisorModel;
+      }
+      onUpdateSession(session.session_id, { model_config: nextConfig });
+    }
+  };
+
+  const creator =
+    session.created_by && session.created_by !== currentUserId
+      ? userById.get(session.created_by)
+      : undefined;
+  const creatorName = creator
+    ? creator.name || creator.email.split('@')[0]
+    : session.created_by === 'anonymous'
+      ? 'Anonymous'
+      : 'Unknown user';
+
+  const getStatusColor = () => {
+    switch (session.status) {
+      case 'running':
+        return 'processing';
+      case 'completed':
+        return 'success';
+      case 'failed':
+        return 'error';
+      case 'timed_out':
+        return 'warning';
+      default:
+        return 'default';
+    }
+  };
+
+  // Re-point the stable footer wrappers at this render's implementations.
+  // Render-phase ref write (instead of the usual useLayoutEffect) because the
+  // impls above only exist when `session` is non-null, past the early return.
+  footerHandlersRef.current = {
+    onModelConfigCommit: handleModelConfigCommit,
+    onSendPrompt: handleSendPrompt,
+    onStop: handleStop,
+    onRetryCleanup: handleRetryCleanup,
+    onFork: handleFork,
+    onBtwSend: handleBtwSend,
+    onSpawnOpen: handleSpawnOpen,
+    onAttachFiles: () => attachmentInputRef.current?.click(),
+    onUploadOpen: () => openAdvancedUpload(),
+    onEffortChange: handleEffortChange,
+    onPermissionModeChange: handlePermissionModeChange,
+    onCodexPermissionChange: handleCodexPermissionChange,
+  };
+
+  const sessionFooter = activeSession ? (
+    <SessionFooter
+      session={activeSession}
+      currentUserId={currentUserId}
+      footerTimerTask={footerTimerTask}
+      latestContextWindow={latestContextWindow}
+      footerGradient={footerGradient}
+      sessionMcpServerIds={sessionMcpServerIds}
+      sessionMcpLoadFailed={sessionMcpLoadFailed}
+      onSessionMcpRetry={onSessionMcpRetry}
+      unauthedMcpServers={unauthedMcpServers}
+      mcpServerById={mcpServerById}
+      userAuthenticatedMcpServerIds={userAuthenticatedMcpServerIds}
+      isRunning={isRunning}
+      isStopping={isStopping}
+      stopRequestInFlight={stopRequestInFlight}
+      recoveryTask={recoveryTask}
+      recoveryError={recoveryError}
+      canReopenSession={canReopenSession}
+      onRetryCleanup={stableFooterHandlers.onRetryCleanup}
+      hasInput={hasInput || hasComposerAttachments}
+      composerAttachmentsPresent={hasComposerAttachments}
+      composerAttachmentUploading={composerAttachmentUploading}
+      connectionDisabled={connectionDisabled}
+      toolCaps={toolCaps}
+      effortLevel={effortLevel}
+      permissionMode={permissionMode}
+      codexSandboxMode={codexSandboxMode}
+      codexApprovalPolicy={codexApprovalPolicy}
+      queuedTasks={queuedTasks}
+      client={client}
+      modelLabel={modelLabel}
+      modelConfig={modelConfig}
+      onModelConfigCommit={stableFooterHandlers.onModelConfigCommit}
+      onOpenSessionSettings={onOpenSettings}
+      onSendPrompt={stableFooterHandlers.onSendPrompt}
+      onStop={stableFooterHandlers.onStop}
+      onFork={stableFooterHandlers.onFork}
+      onBtwSend={stableFooterHandlers.onBtwSend}
+      onSpawnOpen={stableFooterHandlers.onSpawnOpen}
+      onAttachFiles={stableFooterHandlers.onAttachFiles}
+      onUploadOpen={stableFooterHandlers.onUploadOpen}
+      onEffortChange={stableFooterHandlers.onEffortChange}
+      onPermissionModeChange={stableFooterHandlers.onPermissionModeChange}
+      onCodexPermissionChange={stableFooterHandlers.onCodexPermissionChange}
+      promptInputSlot={promptInputSlot}
+    />
+  ) : null;
+
+  return (
+    <div
+      style={{
+        width: '100%',
+        height: '100%',
+        display: open ? 'flex' : 'none',
+        flexDirection: 'column',
+        background: token.colorBgElevated,
+        // No adjacent canvas on the mobile full-screen shell, so drop the left seam.
+        borderLeft: isMobileShell ? undefined : `1px solid ${token.colorBorder}`,
+      }}
+    >
+      {/* Header */}
+      <div
+        style={{
+          flexShrink: 0,
+          padding: `${token.paddingSM}px ${token.padding}px`,
+          borderBottom: `1px solid ${token.colorBorder}`,
+          background: token.colorBgContainer,
+        }}
+      >
+        {/* Row 1: icon + title + badge + actions, center-aligned */}
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <div
+            style={{
+              display: 'flex',
+              gap: token.marginXS,
+              alignItems: 'center',
+              flex: 1,
+              minWidth: 0,
+            }}
+          >
+            {/* Mobile: a full-screen session reads as a dismissible overlay, so a
+                leading Close (X) is the right metaphor. Desktop keeps its
+                trailing Close on the right (below). */}
+            {isMobileShell && (
+              <Tooltip title="Close">
+                <Button
+                  type="text"
+                  aria-label="Close"
+                  icon={<CloseOutlined />}
+                  onClick={onClose}
+                  style={{ ...mobileHeaderButtonStyle, marginLeft: -token.sizeUnit }}
+                />
+              </Tooltip>
+            )}
+            <div style={{ flexShrink: 0 }}>
+              <ToolIcon tool={session.agentic_tool} size={24} />
+            </div>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              {editingTitle ? (
+                <Input
+                  ref={titleInputRef}
+                  value={titleDraft}
+                  onChange={(e) => setTitleDraft(e.target.value)}
+                  onBlur={saveTitle}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      saveTitle();
+                    } else if (e.key === 'Escape') {
+                      e.preventDefault();
+                      setEditingTitle(false);
+                    }
+                  }}
+                  placeholder="Untitled session"
+                  variant="borderless"
+                  style={{
+                    fontSize: token.fontSizeLG,
+                    fontWeight: token.fontWeightStrong,
+                    padding: 0,
+                  }}
+                />
+              ) : (
+                <Tooltip title="Click to rename">
+                  <button
+                    type="button"
+                    onClick={startEditingTitle}
+                    onMouseEnter={() => setTitleHovered(true)}
+                    onMouseLeave={() => setTitleHovered(false)}
+                    style={{
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: 6,
+                      maxWidth: '100%',
+                      cursor: 'text',
+                      borderRadius: token.borderRadiusSM,
+                      padding: '2px 6px',
+                      margin: '-2px -6px',
+                      background: titleHovered ? token.colorFillTertiary : 'transparent',
+                      transition: 'background 0.15s',
+                      border: 'none',
+                      font: 'inherit',
+                      color: 'inherit',
+                      textAlign: 'left',
+                    }}
+                  >
+                    <Typography.Text
+                      strong
+                      style={{
+                        fontSize: token.fontSizeLG,
+                        ...getSessionTitleStyles(isMobileShell ? 1 : 2),
+                      }}
+                    >
+                      {session.title || session.description
+                        ? getSessionDisplayTitle(session, { includeAgentFallback: false })
+                        : 'Untitled session'}
+                    </Typography.Text>
+                    <EditOutlined
+                      style={{
+                        fontSize: 12,
+                        color: token.colorTextTertiary,
+                        opacity: titleHovered ? 1 : 0,
+                        transition: 'opacity 0.15s',
+                        flexShrink: 0,
+                      }}
+                    />
+                  </button>
+                </Tooltip>
+              )}
+              <Flex align="center" gap={token.marginXXS} wrap>
+                <Badge status={getStatusColor()} />
+                <Typography.Text type="secondary" style={{ fontSize: token.fontSizeSM }}>
+                  {describeSessionStatus(session).label}
+                </Typography.Text>
+                {session.created_by && session.created_by !== currentUserId && (
+                  <>
+                    <Typography.Text type="secondary" style={{ fontSize: token.fontSizeSM }}>
+                      ·
+                    </Typography.Text>
+                    <Tooltip title={`Created by ${creatorName}`}>
+                      <Flex align="center" gap={token.marginXXS}>
+                        <UserIdentityAvatar user={creator} size={16} style={{ flexShrink: 0 }} />
+                        <Typography.Text type="secondary" style={{ fontSize: token.fontSizeSM }}>
+                          {creatorName}
+                        </Typography.Text>
+                      </Flex>
+                    </Tooltip>
+                  </>
+                )}
+              </Flex>
+            </div>
+          </div>
+          <Space size={4}>
+            <SessionAttachmentsDropdown items={attachmentItems} />
+            <Dropdown menu={{ items: moreMenuItems }} trigger={['click']} placement="bottomRight">
+              <Tooltip title="More actions">
+                <Button
+                  type="text"
+                  aria-label="More actions"
+                  icon={<EllipsisOutlined />}
+                  style={mobileHeaderButtonStyle}
+                />
+              </Tooltip>
+            </Dropdown>
+            <Tooltip title="Search session">
+              <Button
+                type="text"
+                aria-label="Search session"
+                icon={<SearchOutlined />}
+                onClick={openSearch}
+                style={mobileHeaderButtonStyle}
+              />
+            </Tooltip>
+            {/* Desktop closes from the right; mobile closes from the leading X above. */}
+            {!isMobileShell && (
+              <Tooltip title="Close Panel">
+                <Button
+                  type="text"
+                  aria-label="Close panel"
+                  icon={<CloseOutlined />}
+                  onClick={onClose}
+                  style={{ marginLeft: token.sizeUnit }}
+                />
+              </Tooltip>
+            )}
+          </Space>
+        </div>
+        {/* Row 2: search bar — always in DOM, animates in/out */}
+        <div
+          style={{
+            overflow: 'hidden',
+            maxHeight: searchOpen ? '36px' : '0px',
+            opacity: searchOpen ? 1 : 0,
+            marginTop: searchOpen ? '4px' : '0px',
+            transition: 'max-height 0.15s ease, opacity 0.12s ease, margin-top 0.15s ease',
+          }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            <SearchOutlined style={{ color: token.colorPrimary, fontSize: 14, flexShrink: 0 }} />
+            <Input
+              ref={(el) => {
+                searchInputRef.current = el?.input ?? null;
+              }}
+              value={query}
+              onChange={(e) => {
+                setQuery(e.target.value);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') e.shiftKey ? goPrev() : goNext();
+                if (e.key === 'Escape') closeSearch();
+              }}
+              placeholder="Search session..."
+              variant="borderless"
+              style={{ flex: 1, padding: 0 }}
+              size="small"
+            />
+            {query && (
+              <Typography.Text
+                type="secondary"
+                style={{
+                  fontSize: 12,
+                  whiteSpace: 'nowrap',
+                  minWidth: 44,
+                  textAlign: 'right',
+                  fontVariantNumeric: 'tabular-nums',
+                }}
+              >
+                {totalMatches > 0 ? `${currentMatch + 1} / ${totalMatches}` : ''}
+              </Typography.Text>
+            )}
+            {!query && !isMobileShell && (
+              <Typography.Text type="secondary" style={{ fontSize: token.fontSizeSM }}>
+                Esc to close
+              </Typography.Text>
+            )}
+            {totalMatches > 1 && (
+              <Space size={2}>
+                <Tooltip title="Previous (Shift+Enter)">
+                  <Button
+                    type="text"
+                    size="small"
+                    aria-label="Previous match"
+                    icon={<UpOutlined />}
+                    onClick={goPrev}
+                  />
+                </Tooltip>
+                <Tooltip title="Next (Enter)">
+                  <Button
+                    type="text"
+                    size="small"
+                    aria-label="Next match"
+                    icon={<DownOutlined />}
+                    onClick={goNext}
+                  />
+                </Tooltip>
+              </Space>
+            )}
+            <Tooltip title="Close search (Esc)">
+              <Button
+                type="text"
+                size="small"
+                aria-label="Close search"
+                icon={<CloseOutlined />}
+                onClick={closeSearch}
+              />
+            </Tooltip>
+          </div>
+        </div>
+      </div>
+
+      {/* Body - Scrollable content */}
+      <div
+        ref={bodyRef}
+        style={{
+          flex: 1,
+          overflowX: 'hidden',
+          overflowY: 'auto',
+          display: 'flex',
+          flexDirection: 'column',
+          padding: `${token.sizeUnit * 3}px ${token.sizeUnit * 6}px 0`,
+          position: 'relative',
+        }}
+      >
+        {searchOpen && query.trim() && totalMatches === 0 && !searchPending && (
+          <div
+            style={{
+              position: 'absolute',
+              inset: 0,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              zIndex: 10,
+              pointerEvents: 'none',
+              background: `${token.colorBgContainer}cc`,
+            }}
+          >
+            <div
+              style={{
+                display: 'flex',
+                flexDirection: 'column',
+                alignItems: 'center',
+                padding: '28px 16px',
+                gap: 6,
+              }}
+            >
+              <div
+                style={{
+                  width: 36,
+                  height: 36,
+                  borderRadius: '50%',
+                  background: token.colorFillTertiary,
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  marginBottom: 2,
+                }}
+              >
+                <SearchOutlined style={{ fontSize: 16, color: token.colorTextTertiary }} />
+              </div>
+              <Typography.Text strong>No results</Typography.Text>
+              <Typography.Text
+                type="secondary"
+                style={{ fontSize: 12, textAlign: 'center', lineHeight: 1.5, maxWidth: 200 }}
+              >
+                Nothing matched <Typography.Text code>{query}</Typography.Text>
+              </Typography.Text>
+            </div>
+          </div>
+        )}
+        <div
+          ref={conversationRef}
+          style={{
+            flex: 1,
+            // If chrome + composer cannot fit on a short viewport, scroll the
+            // body rather than crushing the transcript and queue to slivers.
+            minHeight: queuedTasks.length > 0 ? 360 : 0,
+            display: 'flex',
+            flexDirection: 'column',
+            overflow: 'hidden',
+          }}
+        >
+          {!hasActiveAgenticTool && (
+            <Alert
+              type="warning"
+              showIcon
+              message="Historical session — runtime removed"
+              description="This session used the removed experimental Claude Code CLI integration. Its stored conversation remains readable, but it cannot be prompted, resumed, forked, spawned from, or restarted."
+              style={{ marginBottom: token.marginSM }}
+            />
+          )}
+          <SessionPanelContent
+            client={client}
+            session={session}
+            branch={branch}
+            currentUserId={currentUserId}
+            sessionMcpServerIds={sessionMcpServerIds}
+            scrollToBottom={scrollToBottom}
+            scrollToTop={scrollToTop}
+            setScrollToBottom={setScrollToBottom}
+            setScrollToTop={setScrollToTop}
+            queuedTasks={queuedTasks}
+            spawnModalOpen={spawnModalOpen}
+            setSpawnModalOpen={setSpawnModalOpen}
+            onSpawnModalConfirm={handleSpawnModalConfirm}
+            inputValueRef={inputValueRef}
+            isOpen={open}
+          />
+        </div>
+
+        {/* Footer is unavailable for historical sessions whose runtime was removed. */}
+        {sessionFooter}
+
+        <Modal
+          title="Reopen without confirmed cleanup?"
+          open={forceFailTarget !== null}
+          okText="Reopen anyway"
+          cancelText="Cancel"
+          keyboard
+          mask={{ closable: false }}
+          confirmLoading={stopRequestInFlight}
+          okButtonProps={{
+            danger: true,
+            disabled: forceFailConfirmation !== 'STOP',
+          }}
+          cancelButtonProps={{ disabled: stopRequestInFlight }}
+          onOk={handleForceFail}
+          onCancel={() => {
+            if (stopRequestInFlight) return;
+            setForceFailTarget(null);
+            setForceFailConfirmation('');
+          }}
+          afterOpenChange={(modalOpen) => {
+            if (modalOpen) forceFailInputRef.current?.focus();
+          }}
+        >
+          <Alert
+            type="warning"
+            showIcon
+            title="The previous work may still be running"
+            description="This reopens the conversation without stopping the previous work. It may still change files or run commands, and queued prompts may start. Try cleanup first. If it keeps failing, ask for support before overriding this protection."
+            style={{ marginBottom: token.marginMD }}
+          />
+          <Typography.Paragraph>
+            Type <Typography.Text code>STOP</Typography.Text> to acknowledge the risk and reopen.
+          </Typography.Paragraph>
+          {recoveryError && <Alert type="error" title={recoveryError} />}
+          <Input
+            ref={forceFailInputRef}
+            aria-label="Type STOP to reopen without confirmed cleanup"
+            value={forceFailConfirmation}
+            onChange={(event) => setForceFailConfirmation(event.target.value)}
+            onPressEnter={() => {
+              if (forceFailConfirmation === 'STOP') void handleForceFail();
+            }}
+            disabled={stopRequestInFlight}
+            autoComplete="off"
+          />
+        </Modal>
+
+        {/* Advanced upload modal preserves the existing file upload flow for
+            non-image files and notify-agent options. */}
+        <FileUpload
+          sessionId={session.session_id}
+          daemonUrl={getDaemonUrl()}
+          open={uploadModalOpen}
+          onClose={() => {
+            setUploadModalOpen(false);
+            setAdvancedUploadInitialFiles([]);
+          }}
+          initialFiles={advancedUploadInitialFiles}
+          onInsertMention={(filepath) => {
+            promptRef.current?.insertText(`@${filepath}`);
+          }}
+        />
+
+        {/* Fork modal — opened when Fork button is clicked with an empty textarea */}
+        <ForkSpawnModal
+          open={forkModalOpen}
+          action="fork"
+          session={session}
+          currentUser={currentUserId ? (userById.get(currentUserId) ?? null) : null}
+          onConfirm={handleForkModalConfirm}
+          onCancel={() => setForkModalOpen(false)}
+          client={client}
+          userById={userById}
+        />
+
+        {/* Switch tool — same tile picker as the quick-start empty state,
+            just replacing this (never-prompted) session instead of creating
+            the first one. Only reachable via moreMenuItems when canSwitchTool. */}
+        <Modal
+          title="Switch tool"
+          open={switchToolOpen}
+          onCancel={() => setSwitchToolOpen(false)}
+          footer={null}
+        >
+          <Typography.Paragraph type="secondary">
+            Choose a different tool for this session. Since nothing has been sent yet, this replaces
+            the session in place.
+          </Typography.Paragraph>
+          <div style={{ position: 'relative' }}>
+            <AgentSelectionGrid
+              agents={availableAgents ?? []}
+              selectedAgentId={switchingTool}
+              onSelect={handleSwitchTool}
+              columns={2}
+            />
+            {switchingTool && (
+              <div
+                style={{
+                  position: 'absolute',
+                  inset: 0,
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  background: token.colorBgElevated,
+                  opacity: 0.7,
+                }}
+              >
+                <Spin size="small" />
+              </div>
+            )}
+          </div>
+        </Modal>
+      </div>
+    </div>
+  );
+};
+
+// SessionPanel reads only entity-context data (users, MCP servers) and receives
+// session/branch as props. Wrapping with React.memo (default shallow compare)
+// lets it bail out of re-renders triggered by App's live-context updates as
+// long as its props are referentially stable. Callers MUST pass stable
+// `onClose` and `sessionMcpServerIds` (use EMPTY_STRING_ARRAY for empty).
+export default React.memo(SessionPanel);

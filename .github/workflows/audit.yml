@@ -1,0 +1,69 @@
+# Security audit — `pnpm audit` against the GitHub advisory database.
+#
+# Triggers:
+#   * PR / push to main when dependency manifests change. Most PRs don't
+#     touch deps and re-running audit against an unchanged lockfile
+#     returns the same result as the previous run, so we path-filter to
+#     skip the no-op case.
+#   * Nightly on its own schedule — catches ambient CVEs: a new advisory
+#     published against a dependency already in the lockfile would otherwise
+#     stay silent until the next incidental dependency change.
+#   * `workflow_dispatch` for ad-hoc runs.
+name: Security Audit
+
+on:
+  schedule:
+    - cron: '0 4 * * *'
+  push:
+    branches: [main]
+    paths:
+      - 'pnpm-lock.yaml'
+      - '**/package.json'
+      - 'pnpm-workspace.yaml'
+      - '.github/workflows/audit.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'pnpm-lock.yaml'
+      - '**/package.json'
+      - 'pnpm-workspace.yaml'
+      - '.github/workflows/audit.yml'
+  workflow_call:
+  workflow_dispatch:
+
+env:
+  PNPM_VERSION: '11.17.0'
+  NODE_VERSION: '22'
+
+jobs:
+  audit:
+    name: pnpm audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'pnpm'
+
+      - run: pnpm install --frozen-lockfile
+
+      # Blocking: any CRITICAL advisory in production dependencies fails the build.
+      - name: pnpm audit (prod, critical — blocking)
+        run: pnpm audit --audit-level=critical --prod
+
+      # Advisory: retain HIGH+ visibility without changing the critical-only gate.
+      # `continue-on-error` is explicit workflow policy, not a shell-level failure mask.
+      - name: pnpm audit (prod, high — advisory)
+        continue-on-error: true
+        run: pnpm audit --audit-level=high --prod
+
+      # Include dev dependencies so nightly/manual runs keep surfacing their HIGH+ advisories.
+      - name: pnpm audit (all, high — advisory)
+        continue-on-error: true
+        run: pnpm audit --audit-level=high

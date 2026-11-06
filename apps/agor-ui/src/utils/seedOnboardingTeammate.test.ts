@@ -1,0 +1,618 @@
+import type { Branch, Repo, Session, UserID } from '@agor-live/client';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { FRAMEWORK_REPO_SLUG, findFrameworkRepo } from '../hooks/useFrameworkRepo';
+import { stagePromptDraftSeed } from './promptDrafts';
+import { type SeedOnboardingTeammateInput, seedOnboardingTeammate } from './seedOnboardingTeammate';
+import { startTeammateBootstrapSession } from './startTeammateBootstrapSession';
+import { createTeammateBranch } from './teammateCreation';
+import { resolveTemplateSourceBranch, resolveTemplateSourceRemoteUrl } from './teammateTemplates';
+import { waitForBranchFilesystemReady } from './waitForBranchFilesystemReady';
+
+// These are the two collaborators the completion path must actually invoke —
+// the original bug meant neither ever ran (the fallback fired instead).
+vi.mock('./teammateCreation', () => ({ createTeammateBranch: vi.fn() }));
+vi.mock('./startTeammateBootstrapSession', () => ({ startTeammateBootstrapSession: vi.fn() }));
+vi.mock('./waitForBranchFilesystemReady', () => ({ waitForBranchFilesystemReady: vi.fn() }));
+vi.mock('./promptDrafts', () => ({ stagePromptDraftSeed: vi.fn() }));
+
+const createTeammateBranchMock = vi.mocked(createTeammateBranch);
+const startTeammateBootstrapSessionMock = vi.mocked(startTeammateBootstrapSession);
+
+const completeInitialization = {
+  sessionId: 'session-1',
+};
+const USER_ID = 'user-1' as UserID;
+
+function setup(overrides: Partial<SeedOnboardingTeammateInput> = {}) {
+  const onWarn = vi.fn();
+  const onCreateBranch = vi.fn();
+  const onUpdateBranch = vi.fn();
+  const onCreateSession = vi.fn(async () => completeInitialization);
+  const setPrimaryTeammateIfUnset = vi.fn().mockResolvedValue({ branch_id: 'branch-1' });
+  const client = {
+    service: vi.fn((name: string) => {
+      if (name === 'branches' || name === 'sessions') {
+        return { find: vi.fn(async () => ({ data: [] })) };
+      }
+      if (name === 'boards') return { setPrimaryTeammate: vi.fn(async () => undefined) };
+      if (name === 'users') return { setPrimaryTeammateIfUnset };
+      return {};
+    }),
+  } as unknown as SeedOnboardingTeammateInput['client'];
+  const input: SeedOnboardingTeammateInput = {
+    frameworkRepo: { repo_id: 'repo-fw', slug: 'preset-io/agor-teammate' } as Repo,
+    boardId: 'board-1',
+    teammateName: 'Rusty',
+    teammateEmoji: '🤖',
+    agent: 'claude-code',
+    startInitialTurn: true,
+    user: { name: 'Ada', email: 'ada@example.com' },
+    expectedUserId: USER_ID,
+    isCurrentUser: () => true,
+    client,
+    repoById: new Map(),
+    branchById: new Map(),
+    sessionById: new Map(),
+    onCreateBranch,
+    onUpdateBranch,
+    onCreateSession,
+    onWarn,
+    ...overrides,
+  };
+  return {
+    input,
+    onWarn,
+    onCreateBranch,
+    onUpdateBranch,
+    onCreateSession,
+    setPrimaryTeammateIfUnset,
+  };
+}
+
+describe('seedOnboardingTeammate', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(waitForBranchFilesystemReady).mockReset().mockResolvedValue(undefined);
+  });
+
+  it('opens an idle session with an owner-scoped starter draft when AI setup was skipped', async () => {
+    createTeammateBranchMock.mockResolvedValue({ branch_id: 'branch-1' } as Branch);
+    startTeammateBootstrapSessionMock.mockResolvedValue(completeInitialization);
+    const { input } = setup({ startInitialTurn: false });
+
+    expect(await seedOnboardingTeammate(input)).toMatchObject({
+      sessionId: 'session-1',
+      workspaceReady: true,
+    });
+    expect(startTeammateBootstrapSessionMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionConfig: expect.objectContaining({ agent: 'claude-code', initialPrompt: undefined }),
+      })
+    );
+    expect(stagePromptDraftSeed).toHaveBeenCalledWith(
+      USER_ID,
+      'session-1',
+      expect.stringContaining('Rusty')
+    );
+  });
+
+  it('does not stage the starter after the authenticated owner changes during session creation', async () => {
+    createTeammateBranchMock.mockResolvedValue({ branch_id: 'branch-1' } as Branch);
+    let current = true;
+    startTeammateBootstrapSessionMock.mockImplementationOnce(async () => {
+      current = false;
+      return completeInitialization;
+    });
+    const { input } = setup({ startInitialTurn: false, isCurrentUser: () => current });
+    expect(await seedOnboardingTeammate(input)).toEqual({});
+    expect(stagePromptDraftSeed).not.toHaveBeenCalled();
+  });
+
+  it('creates a teammate branch + first onboarding session when the framework repo is present', async () => {
+    createTeammateBranchMock.mockResolvedValue({
+      branch_id: 'branch-1',
+      board_id: 'board-1',
+    } as Branch);
+    startTeammateBootstrapSessionMock.mockResolvedValue(completeInitialization);
+
+    const {
+      input,
+      onWarn,
+      onCreateBranch,
+      onUpdateBranch,
+      onCreateSession,
+      setPrimaryTeammateIfUnset,
+    } = setup();
+    const result = await seedOnboardingTeammate(input);
+
+    // Branch is created on the framework repo, reusing the wizard's board.
+    expect(createTeammateBranchMock).toHaveBeenCalledTimes(1);
+    expect(createTeammateBranchMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        displayName: 'Rusty',
+        emoji: '🤖',
+        repoId: 'repo-fw',
+        boardId: 'board-1',
+      }),
+      expect.objectContaining({ onCreateBranch, onUpdateBranch })
+    );
+
+    // Onboarding session is started for the created branch.
+    expect(startTeammateBootstrapSessionMock).toHaveBeenCalledTimes(1);
+    const sessionArg = startTeammateBootstrapSessionMock.mock.calls[0][0];
+    expect(sessionArg).toEqual(
+      expect.objectContaining({ branchId: 'branch-1', boardId: 'board-1', onCreateSession })
+    );
+    // Agent choice is threaded through to the onboarding session.
+    expect(sessionArg.sessionConfig).toEqual(
+      expect.objectContaining({
+        branch_id: 'branch-1',
+        agent: 'claude-code',
+        title: '🤖 Rusty — first session',
+      })
+    );
+    const initialPrompt = (sessionArg.sessionConfig as { initialPrompt: string }).initialPrompt;
+    expect(initialPrompt).toContain('Rusty');
+    expect(initialPrompt).toContain('Read ONBOARDING.md');
+    expect(initialPrompt).toContain('otherwise, read BOOTSTRAP.md');
+
+    expect(result).toEqual({
+      workspaceReady: true,
+      branchId: 'branch-1',
+      sessionId: 'session-1',
+      initialization: completeInitialization,
+    });
+    expect(setPrimaryTeammateIfUnset).toHaveBeenCalledWith({
+      branchId: 'branch-1',
+      expectedUserId: USER_ID,
+    });
+    expect(onWarn).not.toHaveBeenCalled();
+  });
+
+  it('lists picked tools in the first prompt without attaching any server', async () => {
+    createTeammateBranchMock.mockResolvedValue({
+      branch_id: 'branch-1',
+      board_id: 'board-1',
+    } as Branch);
+    startTeammateBootstrapSessionMock.mockResolvedValue(completeInitialization);
+    const { input } = setup({
+      requestedTools: [{ name: 'Notion', catalogEntryName: 'com.notion/mcp' }],
+    });
+    await seedOnboardingTeammate(input);
+    const { sessionConfig } = startTeammateBootstrapSessionMock.mock.calls[0][0];
+    expect(sessionConfig.initialPrompt).toContain('Notion (com.notion/mcp)');
+    expect(sessionConfig).not.toHaveProperty('mcpServerIds');
+  });
+
+  it('returns the durable session when daemon-side initialization is incomplete', async () => {
+    createTeammateBranchMock.mockResolvedValue({
+      branch_id: 'branch-1',
+      board_id: 'board-1',
+    } as Branch);
+    const incompleteInitialization = {
+      sessionId: 'session-1',
+    };
+    startTeammateBootstrapSessionMock.mockResolvedValue(incompleteInitialization);
+
+    const result = await seedOnboardingTeammate(setup().input);
+
+    expect(result).toEqual({
+      workspaceReady: true,
+      branchId: 'branch-1',
+      sessionId: 'session-1',
+      initialization: incompleteInitialization,
+    });
+  });
+
+  // The completion handler (App.handleOnboardingComplete) resolves the framework
+  // repo FRESH and READY-ONLY from repoById before calling this. These tests
+  // exercise that seam with the repo states real usage actually produces — the
+  // daemon pre-creates a `cloning` placeholder, so `frameworkRepo: undefined`
+  // never occurs on its own. `findFrameworkRepo(..., { readyOnly: true })` is
+  // what turns a not-ready placeholder into the graceful fallback.
+  function frameworkRepoWithStatus(clone_status: Repo['clone_status']): Repo {
+    return { repo_id: 'repo-fw', slug: FRAMEWORK_REPO_SLUG, clone_status } as Repo;
+  }
+
+  for (const status of ['cloning', 'failed'] as const) {
+    it(`does NOT create a teammate and warns when the framework repo is ${status} (readyOnly fallback)`, async () => {
+      const repoById = new Map<string, Repo>([['repo-fw', frameworkRepoWithStatus(status)]]);
+      // Mirror the completion handler: resolve ready-only, feed the result in.
+      const readyFrameworkRepo = findFrameworkRepo(repoById, { readyOnly: true })?.[1];
+      expect(readyFrameworkRepo).toBeUndefined();
+
+      const { input, onWarn } = setup({ frameworkRepo: readyFrameworkRepo, repoById });
+      const result = await seedOnboardingTeammate(input);
+
+      expect(createTeammateBranchMock).not.toHaveBeenCalled();
+      expect(startTeammateBootstrapSessionMock).not.toHaveBeenCalled();
+      expect(onWarn).toHaveBeenCalledTimes(1);
+      expect(onWarn.mock.calls[0][0]).toMatch(/still finishing setup/i);
+      expect(result).toEqual({});
+    });
+  }
+
+  it('creates a teammate when the framework repo is ready (readyOnly resolves it)', async () => {
+    createTeammateBranchMock.mockResolvedValue({
+      branch_id: 'branch-1',
+      board_id: 'board-1',
+    } as Branch);
+    startTeammateBootstrapSessionMock.mockResolvedValue(completeInitialization);
+
+    const repoById = new Map<string, Repo>([['repo-fw', frameworkRepoWithStatus('ready')]]);
+    const readyFrameworkRepo = findFrameworkRepo(repoById, { readyOnly: true })?.[1];
+    expect(readyFrameworkRepo?.repo_id).toBe('repo-fw');
+
+    const { input, onWarn } = setup({ frameworkRepo: readyFrameworkRepo, repoById });
+    const result = await seedOnboardingTeammate(input);
+
+    expect(createTeammateBranchMock).toHaveBeenCalledTimes(1);
+    expect(createTeammateBranchMock).toHaveBeenCalledWith(
+      expect.objectContaining({ repoId: 'repo-fw', createdViaOnboarding: true }),
+      expect.anything()
+    );
+    expect(result).toEqual({
+      workspaceReady: true,
+      branchId: 'branch-1',
+      sessionId: 'session-1',
+      initialization: completeInitialization,
+    });
+    expect(onWarn).not.toHaveBeenCalled();
+  });
+
+  it('threads the template persona into the first-session prompt', async () => {
+    createTeammateBranchMock.mockResolvedValue({
+      branch_id: 'branch-1',
+      board_id: 'board-1',
+    } as Branch);
+    startTeammateBootstrapSessionMock.mockResolvedValue({ sessionId: 'session-1' });
+
+    const { input } = setup({ templateId: 'legal-analyst' });
+    await seedOnboardingTeammate(input);
+
+    const sessionArg = startTeammateBootstrapSessionMock.mock.calls[0][0];
+    const initialPrompt = (sessionArg.sessionConfig as { initialPrompt: string }).initialPrompt;
+    expect(initialPrompt).toContain('- Created from the Legal analyst template.');
+    expect(initialPrompt).toMatch(/Open as yourself: one warm line/);
+  });
+
+  it('creates a prompt-only template on the default branch with its remit in the prompt', async () => {
+    createTeammateBranchMock.mockResolvedValue({
+      branch_id: 'branch-1',
+      board_id: 'board-1',
+    } as Branch);
+    startTeammateBootstrapSessionMock.mockResolvedValue({ sessionId: 'session-1' });
+
+    // The wizard passes resolveTemplateSourceBranch/RemoteUrl, both undefined here.
+    const { input } = setup({
+      templateId: 'personal-assistant',
+      sourceBranch: resolveTemplateSourceBranch('personal-assistant'),
+      sourceRemoteUrl: resolveTemplateSourceRemoteUrl('personal-assistant'),
+    });
+    await seedOnboardingTeammate(input);
+
+    const branchInput = createTeammateBranchMock.mock.calls[0][0];
+    expect(branchInput.sourceBranch).toBeUndefined();
+    expect(branchInput.sourceRemoteUrl).toBeUndefined();
+    const sessionArg = startTeammateBootstrapSessionMock.mock.calls[0][0];
+    const initialPrompt = (sessionArg.sessionConfig as { initialPrompt: string }).initialPrompt;
+    expect(initialPrompt).toContain('- Created from the Personal assistant template.');
+    expect(initialPrompt).toContain(
+      '- Template remit: Desired outcome: a useful recurring brief from Slack and connected docs.'
+    );
+  });
+
+  it('forwards the template source branch to createTeammateBranch', async () => {
+    createTeammateBranchMock.mockResolvedValue({
+      branch_id: 'branch-1',
+      board_id: 'board-1',
+    } as Branch);
+    startTeammateBootstrapSessionMock.mockResolvedValue(completeInitialization);
+
+    const { input } = setup({
+      sourceBranch: 'template/legal-analyst',
+      sourceRemoteUrl: 'https://github.com/preset-io/agor-teammate.git',
+    });
+    await seedOnboardingTeammate(input);
+
+    expect(createTeammateBranchMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sourceBranch: 'template/legal-analyst',
+        sourceRemoteUrl: 'https://github.com/preset-io/agor-teammate.git',
+      }),
+      expect.anything()
+    );
+  });
+
+  it('passes the resolved framework repo so its source rule does not depend on the map snapshot', async () => {
+    createTeammateBranchMock.mockResolvedValue({
+      branch_id: 'branch-1',
+      board_id: 'board-1',
+    } as Branch);
+    startTeammateBootstrapSessionMock.mockResolvedValue(completeInitialization);
+
+    const { input } = setup({ repoById: new Map() });
+    await seedOnboardingTeammate(input);
+
+    expect(createTeammateBranchMock.mock.calls[0][0].repo).toBe(input.frameworkRepo);
+  });
+
+  it('warns (non-fatal) and returns no session when teammate creation throws', async () => {
+    createTeammateBranchMock.mockRejectedValue(new Error('boom'));
+    const { input, onWarn } = setup();
+
+    const result = await seedOnboardingTeammate(input);
+
+    expect(startTeammateBootstrapSessionMock).not.toHaveBeenCalled();
+    expect(onWarn).toHaveBeenCalledTimes(1);
+    expect(onWarn.mock.calls[0][0]).toBe(
+      "Your board is ready, but your AI teammate didn't start. You can create one from the board anytime. (boom)"
+    );
+    expect(result).toEqual({});
+  });
+
+  it.each(['Template fetch failed', 'Authentication failed', 'Git branch does not exist'])(
+    'guides recovery of the saved teammate without duplicating it: %s',
+    async (detail) => {
+      const saved = {
+        branch_id: 'branch-1',
+        board_id: 'board-1',
+        custom_context: {
+          teammate: { kind: 'teammate', createdViaOnboarding: true, displayName: 'Rusty' },
+        },
+      } as unknown as Branch;
+      createTeammateBranchMock.mockResolvedValue(saved);
+      startTeammateBootstrapSessionMock.mockRejectedValueOnce(new Error(detail));
+      const { input, onWarn } = setup();
+      expect(await seedOnboardingTeammate(input)).toEqual({ branchId: saved.branch_id });
+      expect(onWarn).toHaveBeenCalledWith(expect.stringContaining('Retry on that same teammate'));
+      expect(onWarn).toHaveBeenCalledWith(expect.stringContaining(detail));
+      expect(onWarn.mock.calls[0][0]).not.toContain('create one from the board');
+      input.branchById.set(saved.branch_id, saved);
+      startTeammateBootstrapSessionMock.mockResolvedValue(completeInitialization);
+      expect(await seedOnboardingTeammate(input)).toMatchObject({
+        branchId: saved.branch_id,
+        sessionId: completeInitialization.sessionId,
+      });
+      expect(createTeammateBranchMock).toHaveBeenCalledTimes(1);
+    }
+  );
+
+  // If no fallback agent is available, readiness is still required, but no
+  // session should be started with an arbitrary provider.
+  for (const agent of [null, undefined] as const) {
+    it(`waits for the workspace but creates no session when no agent is available (agent: ${agent})`, async () => {
+      createTeammateBranchMock.mockResolvedValue({
+        branch_id: 'branch-1',
+        board_id: 'board-1',
+      } as Branch);
+
+      const { input, onWarn, onCreateSession, setPrimaryTeammateIfUnset } = setup({ agent });
+      const result = await seedOnboardingTeammate(input);
+
+      // The teammate's branch still lands on the board...
+      expect(createTeammateBranchMock).toHaveBeenCalledTimes(1);
+      // ...but nothing is prompted, and no claude-code default sneaks in.
+      expect(startTeammateBootstrapSessionMock).not.toHaveBeenCalled();
+      expect(onCreateSession).not.toHaveBeenCalled();
+      expect(result).toEqual({ branchId: 'branch-1', workspaceReady: true });
+      expect(waitForBranchFilesystemReady).toHaveBeenCalledWith(input.client, 'branch-1');
+      expect(setPrimaryTeammateIfUnset).toHaveBeenCalledWith({
+        branchId: 'branch-1',
+        expectedUserId: USER_ID,
+      });
+
+      // The user is told why there's no session waiting for them.
+      expect(onWarn).toHaveBeenCalledTimes(1);
+      expect(onWarn.mock.calls[0][0]).toMatch(/connect an ai model/i);
+    });
+  }
+
+  it('does not report no-agent setup complete before filesystem readiness', async () => {
+    createTeammateBranchMock.mockResolvedValue({
+      branch_id: 'branch-1',
+      board_id: 'board-1',
+    } as Branch);
+    let resolveReady!: () => void;
+    vi.mocked(waitForBranchFilesystemReady).mockReturnValueOnce(
+      new Promise<void>((resolve) => {
+        resolveReady = resolve;
+      })
+    );
+    const { input } = setup({ agent: null });
+    const finished = vi.fn();
+    const seeding = seedOnboardingTeammate(input).then((result) => {
+      finished(result);
+      return result;
+    });
+    await vi.waitFor(() => expect(waitForBranchFilesystemReady).toHaveBeenCalled());
+    expect(finished).not.toHaveBeenCalled();
+    resolveReady();
+    await expect(seeding).resolves.toEqual({ branchId: 'branch-1', workspaceReady: true });
+  });
+
+  it('retains a failed no-agent workspace for retry without claiming readiness', async () => {
+    createTeammateBranchMock.mockResolvedValue({
+      branch_id: 'branch-1',
+      board_id: 'board-1',
+    } as Branch);
+    vi.mocked(waitForBranchFilesystemReady).mockRejectedValueOnce(
+      new Error('Template fetch failed')
+    );
+    const { input, onWarn } = setup({ agent: null });
+    await expect(seedOnboardingTeammate(input)).resolves.toEqual({ branchId: 'branch-1' });
+    expect(onWarn).toHaveBeenCalledWith(expect.stringContaining('Retry on that same teammate'));
+    expect(startTeammateBootstrapSessionMock).not.toHaveBeenCalled();
+  });
+
+  it('does nothing when no teammate was named (the workspace step was skipped)', async () => {
+    const { input, onWarn } = setup({ teammateName: '   ' });
+    const result = await seedOnboardingTeammate(input);
+
+    expect(createTeammateBranchMock).not.toHaveBeenCalled();
+    expect(onWarn).not.toHaveBeenCalled();
+    expect(result).toEqual({});
+  });
+
+  it('reuses a durable onboarding branch and session on completion retry', async () => {
+    const existingBranch = {
+      branch_id: 'branch-existing',
+      board_id: 'board-1',
+      custom_context: {
+        teammate: { kind: 'teammate', createdViaOnboarding: true, displayName: 'Rusty' },
+      },
+    } as unknown as Branch;
+    const existingSession = {
+      session_id: 'session-existing',
+      title: '🤖 Rusty — first session',
+      branch_id: 'branch-existing',
+    } as Session;
+    const setPrimaryTeammate = vi.fn(async () => undefined);
+    const { input: baseInput, onWarn, setPrimaryTeammateIfUnset } = setup();
+    const input = {
+      ...baseInput,
+      frameworkRepo: undefined,
+      branchById: new Map([[existingBranch.branch_id, existingBranch]]),
+      sessionById: new Map([[existingSession.session_id, existingSession]]),
+      client: {
+        service: vi.fn((name: string) => {
+          if (name === 'boards') return { setPrimaryTeammate };
+          if (name === 'users') return { setPrimaryTeammateIfUnset };
+          return {};
+        }),
+      } as unknown as SeedOnboardingTeammateInput['client'],
+    } satisfies SeedOnboardingTeammateInput;
+
+    const result = await seedOnboardingTeammate(input);
+
+    expect(createTeammateBranchMock).not.toHaveBeenCalled();
+    expect(startTeammateBootstrapSessionMock).not.toHaveBeenCalled();
+    expect(setPrimaryTeammate).toHaveBeenCalledWith({
+      boardId: 'board-1',
+      branchId: 'branch-existing',
+    });
+    expect(result).toEqual({
+      workspaceReady: true,
+      branchId: 'branch-existing',
+      sessionId: 'session-existing',
+    });
+    expect(onWarn).not.toHaveBeenCalled();
+  });
+
+  it('discovers durable branch/session state from the API before maps hydrate after reload', async () => {
+    const existingBranch = {
+      branch_id: 'branch-existing',
+      board_id: 'board-1',
+      custom_context: {
+        teammate: { kind: 'teammate', createdViaOnboarding: true, displayName: 'Rusty' },
+      },
+    } as unknown as Branch;
+    const existingSession = {
+      session_id: 'session-existing',
+      title: '🤖 Rusty — first session',
+      branch_id: 'branch-existing',
+    } as Session;
+    const setPrimaryTeammate = vi.fn(async () => undefined);
+    const branchFind = vi.fn(async () => ({ data: [existingBranch] }));
+    const sessionFind = vi.fn(async () => ({ data: [existingSession] }));
+    const service = vi.fn((name: string) => {
+      if (name === 'branches') return { find: branchFind };
+      if (name === 'sessions') return { find: sessionFind };
+      if (name === 'boards') return { setPrimaryTeammate };
+      return {};
+    });
+    const { input: baseInput, onWarn, setPrimaryTeammateIfUnset } = setup();
+    const input = {
+      ...baseInput,
+      frameworkRepo: undefined,
+      branchById: new Map(),
+      sessionById: new Map(),
+      client: {
+        service: vi.fn((name: string) => {
+          if (name === 'users') return { setPrimaryTeammateIfUnset };
+          return service(name);
+        }),
+      } as unknown as SeedOnboardingTeammateInput['client'],
+    } satisfies SeedOnboardingTeammateInput;
+
+    const result = await seedOnboardingTeammate(input);
+
+    expect(branchFind).toHaveBeenCalledWith({
+      query: { board_id: 'board-1', archived: false, $limit: 100 },
+    });
+    expect(sessionFind).toHaveBeenCalledWith({
+      query: { branch_id: 'branch-existing', archived: false, $limit: 100 },
+    });
+    expect(createTeammateBranchMock).not.toHaveBeenCalled();
+    expect(startTeammateBootstrapSessionMock).not.toHaveBeenCalled();
+    expect(result).toEqual({
+      workspaceReady: true,
+      branchId: 'branch-existing',
+      sessionId: 'session-existing',
+    });
+    expect(onWarn).not.toHaveBeenCalled();
+  });
+
+  it('does not start any onboarding side effect after the initiating user changes', async () => {
+    const { input, onWarn, setPrimaryTeammateIfUnset } = setup({
+      isCurrentUser: () => false,
+    });
+
+    await expect(seedOnboardingTeammate(input)).resolves.toEqual({});
+
+    expect(createTeammateBranchMock).not.toHaveBeenCalled();
+    expect(setPrimaryTeammateIfUnset).not.toHaveBeenCalled();
+    expect(startTeammateBootstrapSessionMock).not.toHaveBeenCalled();
+    expect(onWarn).not.toHaveBeenCalled();
+  });
+
+  it('stops after a delayed branch stage when the initiating user changes', async () => {
+    let currentUserId = USER_ID;
+    let resolveBranch!: (branch: Branch) => void;
+    createTeammateBranchMock.mockImplementation(
+      () =>
+        new Promise<Branch>((resolve) => {
+          resolveBranch = resolve;
+        })
+    );
+    const { input, onWarn, setPrimaryTeammateIfUnset } = setup({
+      isCurrentUser: (expectedUserId) => currentUserId === expectedUserId,
+    });
+
+    const seeding = seedOnboardingTeammate(input);
+    await vi.waitFor(() => expect(createTeammateBranchMock).toHaveBeenCalledTimes(1));
+    currentUserId = 'user-2' as UserID;
+    resolveBranch({ branch_id: 'branch-1', board_id: 'board-1' } as Branch);
+
+    await expect(seeding).resolves.toEqual({});
+    expect(setPrimaryTeammateIfUnset).not.toHaveBeenCalled();
+    expect(startTeammateBootstrapSessionMock).not.toHaveBeenCalled();
+    expect(onWarn).not.toHaveBeenCalled();
+  });
+
+  it('stops after a delayed stage when the same user establishes a new auth session', async () => {
+    let authenticationGeneration = 1;
+    const operationGeneration = authenticationGeneration;
+    let resolveBranch!: (branch: Branch) => void;
+    createTeammateBranchMock.mockImplementation(
+      () =>
+        new Promise<Branch>((resolve) => {
+          resolveBranch = resolve;
+        })
+    );
+    const { input, onWarn, setPrimaryTeammateIfUnset } = setup({
+      isCurrentUser: (expectedUserId) =>
+        expectedUserId === USER_ID && authenticationGeneration === operationGeneration,
+    });
+
+    const seeding = seedOnboardingTeammate(input);
+    await vi.waitFor(() => expect(createTeammateBranchMock).toHaveBeenCalledTimes(1));
+    authenticationGeneration += 1;
+    resolveBranch({ branch_id: 'branch-1', board_id: 'board-1' } as Branch);
+
+    await expect(seeding).resolves.toEqual({});
+    expect(setPrimaryTeammateIfUnset).not.toHaveBeenCalled();
+    expect(startTeammateBootstrapSessionMock).not.toHaveBeenCalled();
+    expect(onWarn).not.toHaveBeenCalled();
+  });
+});

@@ -1,0 +1,374 @@
+import type {
+  AgorClient,
+  Board,
+  Branch,
+  BranchArchiveOrDeleteOptions,
+  MCPServer,
+  Repo,
+  Session,
+  User,
+} from '@agor-live/client';
+import { hasMinimumRole, isTeammate, ROLES, resolveRepoCleanupPolicy } from '@agor-live/client';
+import { DownOutlined, FolderOutlined, LinkOutlined } from '@ant-design/icons';
+import {
+  Alert,
+  Button,
+  Checkbox,
+  Collapse,
+  Descriptions,
+  Form,
+  Input,
+  Select,
+  Space,
+  Tooltip,
+  Typography,
+} from 'antd';
+import { useState } from 'react';
+import { useServerRead } from '../../../hooks/useServerRead';
+import { useAgorStore } from '../../../store/agorStore';
+import { selectBranchById } from '../../../store/selectors';
+import { ArchiveActionButton } from '../../ArchiveButton';
+import { ArchiveDeleteBranchModal } from '../../ArchiveDeleteBranchModal';
+import { RepoCleanupSettingsModal } from '../../ArchiveDeleteBranchModal/RepoCleanupSettingsModal';
+import { boardSelectOptions } from '../../BoardTile';
+import { describeBranchStatus } from '../../BranchFilesystemRecovery/describeBranchStatus';
+import { BranchWorkspaceStatus } from '../../BranchWorkspaceStatus';
+import { CompactNotice } from '../../CompactNotice';
+import { MCPServerSelect } from '../../MCPServerSelect';
+import { FIELD_WIDTHS } from '../../SettingsModal/panelPrimitives';
+import { Tag } from '../../Tag';
+import type { GeneralFormState } from '../useBranchModalForm';
+
+// Re-exported so external consumers can keep importing the patch-shape type
+// from the same path. Canonical definition lives in `useBranchModalForm`.
+export type { BranchUpdate } from '../useBranchModalForm';
+
+const { TextArea } = Input;
+
+interface GeneralTabProps {
+  client?: AgorClient | null;
+  currentUser?: User | null;
+  branch: Branch;
+  repo: Repo;
+  sessions: Session[]; // Used to gauge environment risk on Archive/Delete
+  boards?: Board[];
+  mcpServers?: MCPServer[];
+  canEdit: boolean;
+  state: GeneralFormState;
+  setField: <K extends keyof GeneralFormState>(key: K, value: GeneralFormState[K]) => void;
+  onArchiveOrDelete?: (
+    branchId: string,
+    options: BranchArchiveOrDeleteOptions
+  ) => void | Promise<void>;
+  /** Verifying `board.attach_branch` on a newly-picked target board. */
+  boardAttachChecking?: boolean;
+  /** Set once verification finds the caller can't move a branch onto the picked board. */
+  boardAttachError?: string | null;
+}
+
+export const GeneralTab: React.FC<GeneralTabProps> = ({
+  client,
+  currentUser,
+  branch,
+  repo,
+  sessions,
+  boards = [],
+  mcpServers = [],
+  canEdit,
+  state,
+  setField,
+  onArchiveOrDelete,
+  boardAttachChecking = false,
+  boardAttachError = null,
+}) => {
+  const [archiveDeleteModalOpen, setArchiveDeleteModalOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const policy = resolveRepoCleanupPolicy(repo.cleanup_policy);
+  const branchById = useAgorStore(selectBranchById);
+  // Settings retains an editing snapshot, and the canvas store excludes archived
+  // branches. Keep only this status projection live without resetting form drafts.
+  const { data: workspaceStatusBranch } = useServerRead(
+    client,
+    branch.branch_id,
+    (client) => client.service('branches').get(branch.branch_id),
+    {
+      subscribe: (client, { patch }) => {
+        const service = client.service('branches');
+        const onPatched = (updated: Branch) => {
+          if (updated.branch_id === branch.branch_id) patch(() => updated);
+        };
+        service.on('patched', onPatched);
+        return () => service.off('patched', onPatched);
+      },
+    }
+  );
+
+  const handleArchiveOrDelete = (options: BranchArchiveOrDeleteOptions) => {
+    onArchiveOrDelete?.(branch.branch_id, options);
+  };
+
+  const isTeammateBranch = isTeammate(branch);
+  const deletionNotice = branch.deletion_status ? describeBranchStatus(branch, 'unknown') : null;
+
+  return (
+    <div style={{ width: '100%', maxHeight: '70vh', overflowY: 'auto' }}>
+      <Space orientation="vertical" size="large" style={{ width: '100%' }}>
+        <BranchWorkspaceStatus
+          branch={workspaceStatusBranch ?? branch}
+          client={client}
+          currentUser={currentUser}
+          detailed
+        />
+        {deletionNotice && (
+          <CompactNotice
+            type={deletionNotice.type}
+            role="status"
+            message={deletionNotice.message}
+            details={deletionNotice.details}
+          />
+        )}
+
+        {/* Basic Information */}
+        <Descriptions column={1} bordered size="small">
+          <Descriptions.Item label="Name">
+            <Typography.Text strong>{branch.name}</Typography.Text>
+            {branch.new_branch && (
+              <Tag color="green" style={{ marginLeft: 8, fontSize: 11 }}>
+                New Branch
+              </Tag>
+            )}
+          </Descriptions.Item>
+          <Descriptions.Item label="Repository">
+            <Space>
+              <FolderOutlined />
+              <Typography.Text>{repo.name}</Typography.Text>
+            </Space>
+          </Descriptions.Item>
+          <Descriptions.Item label="Branch">
+            <Typography.Text code>{branch.ref}</Typography.Text>
+          </Descriptions.Item>
+          {branch.base_ref && (
+            <Descriptions.Item label={branch.ref_type === 'tag' ? 'Base Tag' : 'Base Branch'}>
+              <Typography.Text code>
+                {branch.base_ref}
+                {branch.base_sha && ` (${branch.base_sha.substring(0, 7)})`}
+              </Typography.Text>
+            </Descriptions.Item>
+          )}
+          {branch.tracking_branch && (
+            <Descriptions.Item label="Tracking">
+              <Typography.Text code>{branch.tracking_branch}</Typography.Text>
+            </Descriptions.Item>
+          )}
+          {branch.last_commit_sha && (
+            <Descriptions.Item label="Current SHA">
+              <Typography.Text code>{branch.last_commit_sha.substring(0, 7)}</Typography.Text>
+            </Descriptions.Item>
+          )}
+          <Descriptions.Item label="Path">
+            <Typography.Text
+              code
+              style={{ fontSize: 11 }}
+              copyable={{
+                text: branch.path,
+                tooltips: ['Copy path', 'Copied!'],
+              }}
+            >
+              {branch.path}
+            </Typography.Text>
+          </Descriptions.Item>
+        </Descriptions>
+
+        <Collapse
+          ghost
+          expandIcon={({ isActive }) => <DownOutlined rotate={isActive ? 180 : 0} />}
+          destroyOnHidden={false}
+          items={[
+            {
+              key: 'cleanup',
+              label: <Typography.Text strong>Branch cleanup</Typography.Text>,
+              forceRender: true,
+              children: (
+                <Space orientation="vertical" style={{ width: '100%' }}>
+                  <Alert
+                    type="warning"
+                    showIcon
+                    description="Cleanup can delete valuable files with no undo. Protection does not prevent permanent deletion."
+                  />
+                  {!policy.allow_branch_protection && (
+                    <Alert
+                      type="warning"
+                      showIcon
+                      description="Repository policy overrides saved protection. Your preference is retained and takes effect again if protection is allowed."
+                    />
+                  )}
+                  <Typography.Text>
+                    {policy.enabled
+                      ? 'Enabled for this repository'
+                      : 'Disabled for this repository'}
+                  </Typography.Text>
+                  <Typography.Text code>
+                    {policy.command || 'No cleanup command configured'}
+                  </Typography.Text>
+                  <Checkbox
+                    checked={state.cleanupProtected}
+                    disabled={!canEdit || !policy.allow_branch_protection}
+                    onChange={(event) => setField('cleanupProtected', event.target.checked)}
+                  >
+                    Protect this branch from cleanup
+                  </Checkbox>
+                  <Typography.Text type="secondary">
+                    Save branch changes to apply this preference.
+                  </Typography.Text>
+                  {client && currentUser && hasMinimumRole(currentUser.role, ROLES.ADMIN) && (
+                    <Button onClick={() => setSettingsOpen(true)}>Open repository settings</Button>
+                  )}
+                  {client && currentUser && settingsOpen && (
+                    <RepoCleanupSettingsModal
+                      client={client}
+                      user={currentUser}
+                      repo={repo}
+                      open={settingsOpen}
+                      onCancel={() => setSettingsOpen(false)}
+                      onSaved={() => setSettingsOpen(false)}
+                    />
+                  )}
+                </Space>
+              ),
+            },
+          ]}
+        />
+
+        {/* Work Context */}
+        <div>
+          <Typography.Text strong style={{ fontSize: 14, display: 'block', marginBottom: 16 }}>
+            Work Context
+          </Typography.Text>
+          <Form layout="vertical" colon={false}>
+            <Form.Item
+              label="Board"
+              style={FIELD_WIDTHS.short}
+              validateStatus={boardAttachError ? 'error' : undefined}
+              help={
+                boardAttachError ||
+                (boardAttachChecking ? 'Checking access to that board…' : undefined)
+              }
+            >
+              <Select
+                value={state.boardId}
+                onChange={(value) => setField('boardId', value)}
+                placeholder="Select board (optional)..."
+                allowClear
+                disabled={!canEdit || !!branch.deletion_status}
+                loading={boardAttachChecking}
+                options={boardSelectOptions(boards, branchById)}
+              />
+            </Form.Item>
+
+            <Form.Item label="Issue" style={FIELD_WIDTHS.medium}>
+              <Input
+                value={state.issueUrl}
+                onChange={(e) => setField('issueUrl', e.target.value)}
+                placeholder="https://github.com/user/repo/issues/42"
+                prefix={<LinkOutlined />}
+                disabled={!canEdit || !!branch.deletion_status}
+              />
+            </Form.Item>
+
+            <Form.Item label="Pull Request" style={FIELD_WIDTHS.medium}>
+              <Input
+                value={state.prUrl}
+                onChange={(e) => setField('prUrl', e.target.value)}
+                placeholder="https://github.com/user/repo/pull/43"
+                prefix={<LinkOutlined />}
+                disabled={!canEdit || !!branch.deletion_status}
+              />
+            </Form.Item>
+
+            {/* Hide Notes for teammates — edited as "Description" in the Teammate tab */}
+            {!isTeammateBranch && (
+              <Form.Item
+                label={
+                  <Space size={4}>
+                    <span>Notes</span>
+                    <Tooltip title="Markdown formatting supported (headings, bold, italic, lists, code blocks, etc.)">
+                      <span
+                        style={{
+                          fontSize: '10px',
+                          fontWeight: 'bold',
+                          fontFamily: 'monospace',
+                          opacity: 0.6,
+                          cursor: 'help',
+                        }}
+                      >
+                        MD
+                      </span>
+                    </Tooltip>
+                  </Space>
+                }
+              >
+                <TextArea
+                  value={state.notes}
+                  onChange={(e) => setField('notes', e.target.value)}
+                  placeholder="Freeform notes about this branch..."
+                  rows={4}
+                  disabled={!canEdit || !!branch.deletion_status}
+                />
+              </Form.Item>
+            )}
+
+            <Form.Item
+              label="MCP Servers"
+              tooltip="Default MCP servers for new sessions in this branch"
+              style={FIELD_WIDTHS.medium}
+            >
+              <MCPServerSelect
+                mcpServers={mcpServers}
+                value={state.mcpServerIds}
+                onChange={(value) => setField('mcpServerIds', value)}
+                placeholder="Select default MCP servers..."
+                disabled={!canEdit || !!branch.deletion_status}
+              />
+            </Form.Item>
+          </Form>
+        </div>
+
+        {/* Timestamps */}
+        <Descriptions column={2} bordered size="small">
+          <Descriptions.Item label="Created">
+            {new Date(branch.created_at).toLocaleString()}
+          </Descriptions.Item>
+          <Descriptions.Item label="Last Used">
+            {branch.last_used ? new Date(branch.last_used).toLocaleString() : 'Never'}
+          </Descriptions.Item>
+        </Descriptions>
+
+        {/* Out-of-band destructive action: archive/delete is not part of the
+            modal's Save flow because it tears the branch down entirely. */}
+        <Space>
+          <ArchiveActionButton
+            tooltip=""
+            size="middle"
+            onClick={() => setArchiveDeleteModalOpen(true)}
+            disabled={!canEdit}
+          >
+            Archive or Delete Branch
+          </ArchiveActionButton>
+        </Space>
+        <ArchiveDeleteBranchModal
+          client={client}
+          currentUser={currentUser}
+          open={archiveDeleteModalOpen}
+          branch={branch}
+          sessionCount={sessions.length}
+          environmentRunning={branch.environment_instance?.status === 'running'}
+          onConfirm={(options) => {
+            handleArchiveOrDelete(options);
+            setArchiveDeleteModalOpen(false);
+          }}
+          onCancel={() => setArchiveDeleteModalOpen(false)}
+        />
+      </Space>
+    </div>
+  );
+};

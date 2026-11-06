@@ -1,0 +1,179 @@
+import { describe, expect, it } from 'vitest';
+import {
+  canonicalMCPCustomHeaderEntries,
+  findDuplicateMCPCustomHeaderName,
+  hasPrescribedMCPAuthHeader,
+  isReservedMCPCustomHeaderName,
+  isValidMCPHeaderName,
+  MCP_HEADER_REDACTED_SENTINEL,
+  mergeMCPRemoteHeaders,
+  normalizeMCPCustomHeaders,
+  redactMCPCustomHeaders,
+  renderMCPTokenHeader,
+  restoreRedactedMCPCustomHeaders,
+} from './http-headers';
+
+describe('MCP HTTP header helpers', () => {
+  it('validates custom header names', () => {
+    expect(isValidMCPHeaderName('DD-API-KEY')).toBe(true);
+    expect(isValidMCPHeaderName('bad header')).toBe(false);
+    expect(isReservedMCPCustomHeaderName('Authorization')).toBe(true);
+    expect(isReservedMCPCustomHeaderName('X-Custom')).toBe(false);
+  });
+
+  it('filters invalid and reserved custom header names', () => {
+    expect(
+      normalizeMCPCustomHeaders({
+        'DD-API-KEY': 'dummy-api-key',
+        Authorization: 'Bearer custom-should-not-win',
+        Cookie: 'session=secret',
+        'Mcp-Session-Id': 'session-id',
+        'bad header': 'nope',
+        '': 'empty',
+      })
+    ).toEqual({ 'DD-API-KEY': 'dummy-api-key' });
+  });
+
+  it('rejects case-insensitive duplicate names before persistence or Fetch merging', () => {
+    const headers = { ' X-Route ': 'first', 'x-route': 'second' };
+    expect(findDuplicateMCPCustomHeaderName(headers)).toEqual({
+      first: ' X-Route ',
+      duplicate: 'x-route',
+    });
+    expect(() => normalizeMCPCustomHeaders(headers)).toThrow(/Duplicate custom HTTP header names/);
+    expect(() => mergeMCPRemoteHeaders({ custom: headers })).toThrow(
+      /Duplicate custom HTTP header names/
+    );
+  });
+
+  it('canonicalizes non-duplicate ordering and name case identically', () => {
+    expect(canonicalMCPCustomHeaderEntries({ 'X-B': '2', 'X-A': '1' })).toEqual(
+      canonicalMCPCustomHeaderEntries({ 'x-a': '1', 'x-b': '2' })
+    );
+  });
+
+  it('merges base, custom, and auth headers with auth taking precedence', () => {
+    expect(
+      mergeMCPRemoteHeaders({
+        base: { Accept: 'application/json' },
+        custom: { 'DD-API-KEY': 'dummy-api-key', Authorization: 'Bearer custom' },
+        auth: { Authorization: 'Bearer auth' },
+      })
+    ).toEqual({
+      Accept: 'application/json',
+      'DD-API-KEY': 'dummy-api-key',
+      Authorization: 'Bearer auth',
+    });
+  });
+
+  it('redacts custom header values while preserving names', () => {
+    expect(
+      redactMCPCustomHeaders({
+        'DD-API-KEY': 'dummy-api-key',
+        'X-Datadog-Parent-Org-Id': '1234',
+      })
+    ).toEqual({
+      'DD-API-KEY': MCP_HEADER_REDACTED_SENTINEL,
+      'X-Datadog-Parent-Org-Id': MCP_HEADER_REDACTED_SENTINEL,
+    });
+  });
+
+  it('preserves bare {{ user.env.NAME }} header templates but redacts everything else', () => {
+    expect(
+      redactMCPCustomHeaders({
+        'X-API-Key': '{{ user.env.DATADOG_API_KEY }}',
+        'X-Raw-Secret': 'dummy-api-key',
+        'X-Partial': 'prefix-{{user.env.X}}',
+        'X-Helper': '{{default user.env.MISSING "sk-live-shouldnotleak"}}',
+      })
+    ).toEqual({
+      'X-API-Key': '{{ user.env.DATADOG_API_KEY }}',
+      'X-Raw-Secret': MCP_HEADER_REDACTED_SENTINEL,
+      'X-Partial': MCP_HEADER_REDACTED_SENTINEL,
+      'X-Helper': MCP_HEADER_REDACTED_SENTINEL,
+    });
+  });
+
+  it('restores redacted values from existing headers and normalizes the result', () => {
+    expect(
+      restoreRedactedMCPCustomHeaders({
+        current: {
+          'DD-API-KEY': 'secret-value',
+          'X-Datadog-Parent-Org-Id': '1234',
+        },
+        next: {
+          'DD-API-KEY': MCP_HEADER_REDACTED_SENTINEL,
+          'X-Datadog-Parent-Org-Id': '5678',
+          Authorization: 'Bearer should-not-persist',
+        },
+      })
+    ).toEqual({
+      'DD-API-KEY': 'secret-value',
+      'X-Datadog-Parent-Org-Id': '5678',
+    });
+  });
+
+  it('never persists the sentinel when there is nothing stored to restore', () => {
+    // A stale form echoes back a header that a concurrent edit removed.
+    // Storing the sentinel would send `••••••••` upstream as the literal
+    // header value.
+    expect(
+      restoreRedactedMCPCustomHeaders({
+        current: { 'X-Other': 'kept' },
+        next: {
+          'DD-API-KEY': MCP_HEADER_REDACTED_SENTINEL,
+          'X-Other': 'kept',
+        },
+      })
+    ).toEqual({ 'X-Other': 'kept' });
+  });
+});
+
+describe('renderMCPTokenHeader', () => {
+  it('keeps the default Authorization: Bearer recipe', () => {
+    expect(renderMCPTokenHeader({ token: 'k' })).toEqual({ Authorization: 'Bearer k' });
+  });
+
+  it('sends a vendor prefix or header exactly as stated', () => {
+    expect(renderMCPTokenHeader({ token: 'k', token_prefix: 'Token token=' })).toEqual({
+      Authorization: 'Token token=k',
+    });
+    expect(renderMCPTokenHeader({ token: 'k', token_header: 'api-key' })).toEqual({
+      'api-key': 'k',
+    });
+    expect(
+      renderMCPTokenHeader({ token: 'k', token_header: 'Authorization', token_prefix: 'Token ' })
+    ).toEqual({ Authorization: 'Token k' });
+  });
+
+  it('lets the auth header win over a custom header of the same name in any casing', () => {
+    expect(
+      mergeMCPRemoteHeaders({
+        custom: { 'API-Key': 'stale', 'x-environment-id': '42' },
+        auth: renderMCPTokenHeader({ token: 'k', token_header: 'api-key' }),
+      })
+    ).toEqual({ 'x-environment-id': '42', 'api-key': 'k' });
+  });
+
+  it('recognises the resolved header each auth prescribes', () => {
+    const pagerDuty = { type: 'bearer' as const, token_prefix: 'Token token=' };
+    const similarweb = { type: 'bearer' as const, token_header: 'api-key' };
+    expect(
+      hasPrescribedMCPAuthHeader(pagerDuty, renderMCPTokenHeader({ ...pagerDuty, token: 'k' }))
+    ).toBe(true);
+    expect(
+      hasPrescribedMCPAuthHeader(similarweb, renderMCPTokenHeader({ ...similarweb, token: 'k' }))
+    ).toBe(true);
+    expect(hasPrescribedMCPAuthHeader({ type: 'oauth' }, { authorization: 'Bearer t' })).toBe(true);
+    expect(hasPrescribedMCPAuthHeader(undefined, undefined)).toBe(true);
+    expect(hasPrescribedMCPAuthHeader({ type: 'none' }, undefined)).toBe(true);
+
+    expect(hasPrescribedMCPAuthHeader(pagerDuty, { Authorization: 'Bearer k' })).toBe(false);
+    expect(hasPrescribedMCPAuthHeader(pagerDuty, { Authorization: 'Token token=' })).toBe(false);
+    expect(hasPrescribedMCPAuthHeader(similarweb, { Authorization: 'Bearer k' })).toBe(false);
+    expect(hasPrescribedMCPAuthHeader({ type: 'bearer' }, { Authorization: 'Bearer ' })).toBe(
+      false
+    );
+    expect(hasPrescribedMCPAuthHeader({ type: 'jwt' }, undefined)).toBe(false);
+  });
+});

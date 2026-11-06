@@ -1,0 +1,2363 @@
+import { AgorLocalAuthMode } from '@agor/core/config/browser';
+import type {
+  AgenticToolName,
+  Artifact,
+  AuthCheckResult,
+  Board,
+  BoardID,
+  Branch,
+  BranchArchiveOrDeleteOptions,
+  BranchID,
+  CreateLocalRepoRequest,
+  CreateRepoRequest,
+  CreateUserInput,
+  GatewayChannelCreateData,
+  GatewayChannelPatchData,
+  OnboardingState,
+  PermissionMode,
+  Repo,
+  Session,
+  SessionID,
+  SpawnConfig,
+  UpdateUserInput,
+  User,
+  UUID,
+} from '@agor-live/client';
+import {
+  boardPath,
+  ENTITY_PATH_SEGMENTS,
+  hasMinimumRole,
+  isAgenticToolName,
+  PAGINATION,
+  ROLES,
+  sessionPath,
+} from '@agor-live/client';
+import { ConfigProvider, theme } from 'antd';
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { BrowserRouter, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
+import { AVAILABLE_AGENTS } from './components/AgentSelectionGrid';
+import { resolveAvailableUserAgenticTool } from './components/AgentSelectionGrid/availableAgents';
+import type { BranchUpdate } from './components/BranchModal/tabs/GeneralTab';
+import { ActionErrorNotice } from './components/CompactNotice';
+import { DaemonConfigurationAlert, DaemonConnectionAlert } from './components/DaemonErrorAlerts';
+import { ErrorBoundary, setCrashContext } from './components/ErrorBoundary';
+import { uploadFilesToSession } from './components/FileUpload/upload';
+import { ForcePasswordChangeModal } from './components/ForcePasswordChangeModal';
+import { InitialLoadingScreen } from './components/InitialLoadingScreen';
+import { LoginPage } from './components/LoginPage';
+import { MCPCatalogModalHost } from './components/Marketplace/MCPCatalogModalHost';
+import { OnboardingBanners } from './components/OnboardingBanners';
+import { type OnboardingCompletionResult, OnboardingWizard } from './components/OnboardingWizard';
+import { buildPromptWithAttachments } from './components/SessionPanel/composerAttachments';
+import { sendPromptWithReconciliation } from './components/SessionPanel/promptReconciliation';
+import { SettingsModal } from './components/SettingsModal';
+import { StreamdownPortalApp } from './components/StreamdownPortalApp';
+import { TouchTooltipConfig } from './components/TouchTooltipConfig';
+import { getDaemonUrl } from './config/daemon';
+import { CanvasNavigationProvider } from './contexts/CanvasNavigationContext';
+import { ConnectionProvider } from './contexts/ConnectionContext';
+import { MCPCatalogModalProvider } from './contexts/MCPCatalogModalContext';
+import { ThemeProvider, useTheme } from './contexts/ThemeContext';
+import { setPrimaryAgenticToolIfUnset } from './domain/primaryAgenticTool';
+import {
+  getSessionCreationWarning,
+  type NewSessionConfig,
+  runSessionCreationStages,
+  type SessionCreationResult,
+} from './domain/sessionCreation';
+import {
+  IdentityContractState,
+  isIdentityCapabilityAvailable,
+  useAgorClient,
+  useAgorData,
+  useAuth,
+  useAuthConfig,
+  useBoardActions,
+  useForcedPasswordChangeHandler,
+  useInitialLoaderPhase,
+  useServerVersion,
+  useSessionActions,
+} from './hooks';
+import { useAuthenticatedInstanceConfig } from './hooks/useAuthenticatedInstanceConfig';
+import { useAuthorityOperationGuard } from './hooks/useAuthorityOperationGuard';
+import { useEnsureFrameworkRepo } from './hooks/useEnsureFrameworkRepo';
+import { useEnvironmentStart } from './hooks/useEnvironmentStart';
+import { findFrameworkRepo } from './hooks/useFrameworkRepo';
+import {
+  type OnboardingOperationOwner,
+  useOnboardingLifecycle,
+} from './hooks/useOnboardingLifecycle';
+import { usePinnedOpenRows } from './hooks/usePinnedRows';
+import { useSurfaceBranding } from './hooks/useSurfaceBranding';
+import { useUnarchiveBranch } from './hooks/useUnarchiveBranch';
+import { repoPatched, sessionCreated } from './store/agorRealtimeActions';
+import { agorStore, useAgorStore } from './store/agorStore';
+import { DeviceRouter } from './surfaces/DeviceRouter';
+import { SharedUserSettingsModal } from './surfaces/SharedUserSettingsModal';
+import type { RouteSurfaceId } from './surfaces/surfaceRegistry';
+import {
+  ARTIFACT_FULLSCREEN_ROUTE_PATHS,
+  CLI_LOGIN_ROUTE_PATHS,
+  KNOWLEDGE_ROUTE_PATHS,
+  MCP_CONNECT_ROUTE_PATHS,
+  MCP_OAUTH_RETURN_ROUTE_PATHS,
+  MCP_RECOVERY_ROUTE_PATHS,
+  RBAC_POLICY_PROTOTYPE_ROUTE_PATH,
+} from './surfaces/surfaceRegistry';
+import { useWorkspaceSurfaceLifecycle } from './surfaces/useWorkspaceSurfaceLifecycle';
+import type { CreateRepoOptions } from './types';
+import {
+  CLIENT_NOT_CONNECTED_ERROR,
+  describeActionError,
+  formatActionError,
+  isInFlightConnectionLossError,
+  notConnectedMessage,
+  sessionStartedMessageNotSent,
+  withRawDetail,
+} from './utils/connectionErrors';
+import { createRepository } from './utils/createRepository';
+import {
+  enrichAuthenticatedUser,
+  hasObservedOnboardingCompletion,
+} from './utils/currentUserAuthority';
+import { ensureOnboardingFrameworkRepo } from './utils/ensureOnboardingFrameworkRepo';
+import { completeLocalPasswordChange } from './utils/forcePasswordChange';
+import { useThemedMessage } from './utils/message';
+import {
+  buildDeferredOnboardingPreferences,
+  buildRestartedOnboardingPreferences,
+  buildResumedOnboardingPreferences,
+  isOnboardingDeferred,
+  type OnboardingReopenMode,
+} from './utils/onboardingLifecycle';
+import { buildCompletedOnboardingPreferences } from './utils/onboardingPreferences';
+import { savePromptDraft } from './utils/promptDrafts';
+import { seedOnboardingTeammate } from './utils/seedOnboardingTeammate';
+import { updateSessionMcpServers } from './utils/sessionMcpServers';
+import {
+  type LatestSessionUpdateRequests,
+  runSessionUpdateWithLatestNotification,
+} from './utils/sessionUpdateNotifications';
+import { OPEN_CREATE_FLOW_EVENT, requestShellPicker } from './utils/shellEvents';
+import { getRouterBasename, isMobileShellPath } from './utils/uiRoutes';
+
+type RouteModuleKey = RouteSurfaceId | 'mobile';
+
+type EnvironmentAction = 'start' | 'stop' | 'nuke';
+
+interface PendingEnvironmentToast {
+  action: EnvironmentAction;
+  key: string;
+  /** `last_command.attempt_id` before the request; a result only counts once it changes. */
+  previousAttemptId: string | undefined;
+}
+
+// Stable reference — an inline object here re-processes the modal on every App
+// render (flicker). The onboarding surface is always dark.
+const ONBOARDING_DARK_THEME = { algorithm: theme.darkAlgorithm };
+
+// Stable empty-repo array so the onboarding framework-repo memo keeps a constant
+// identity while the wizard is closed (no framework repo resolved yet).
+const EMPTY_REPOS: Repo[] = [];
+
+const ENV_ACTION_COPY: Record<EnvironmentAction, { present: string; done: string }> = {
+  start: { present: 'start', done: 'started' },
+  stop: { present: 'stop', done: 'stopped' },
+  nuke: { present: 'nuke', done: 'nuked' },
+};
+
+const loadedRouteModuleKeys = new Set<RouteModuleKey>();
+
+function cacheRouteLoader<TModule, TRouteModule>(
+  moduleKey: RouteModuleKey,
+  importModule: () => Promise<TModule>,
+  selectDefault: (module: TModule) => TRouteModule
+) {
+  let promise: Promise<TRouteModule> | null = null;
+
+  return () => {
+    promise ??= importModule().then((module) => {
+      loadedRouteModuleKeys.add(moduleKey);
+      return selectDefault(module);
+    });
+    return promise;
+  };
+}
+
+const loadAgorApp = cacheRouteLoader(
+  'workspace',
+  () => import('./components/App'),
+  (module) => ({ default: module.App })
+);
+const loadKnowledgePage = cacheRouteLoader(
+  'knowledge',
+  () => import('./pages/KnowledgePage'),
+  (module) => ({ default: module.KnowledgePage })
+);
+const loadArtifactFullscreenPage = cacheRouteLoader(
+  'artifact-fullscreen',
+  () => import('./pages/ArtifactFullscreenPage'),
+  (module) => ({ default: module.ArtifactFullscreenPage })
+);
+const loadMcpRecoveryPage = cacheRouteLoader(
+  'mcp-recovery',
+  () => import('./pages/MCPSlackRecoveryPage'),
+  (module) => ({ default: module.MCPSlackRecoveryPage })
+);
+const loadMcpConnectPage = cacheRouteLoader(
+  'mcp-connect',
+  () => import('./pages/MCPOAuthConnectPage'),
+  (module) => ({ default: module.MCPOAuthConnectPage })
+);
+const loadMcpOAuthReturnPage = cacheRouteLoader(
+  'mcp-oauth-return',
+  () => import('./pages/MCPOAuthReturnPage'),
+  (module) => ({ default: module.MCPOAuthReturnPage })
+);
+const loadCliLoginPage = cacheRouteLoader(
+  'cli-login',
+  () => import('./pages/CLILoginPage'),
+  (module) => ({ default: module.CLILoginPage })
+);
+const loadMobileApp = cacheRouteLoader(
+  'mobile',
+  () => import('./components/mobile/MobileApp'),
+  (module) => ({ default: module.MobileApp })
+);
+const loadStreamdownDemoPage = cacheRouteLoader(
+  'demo',
+  () => import('./pages/StreamdownDemoPage'),
+  (module) => ({ default: module.StreamdownDemoPage })
+);
+const MarketingScreenshotPage = lazy(() =>
+  import('./pages/MarketingScreenshotPage').then((module) => ({
+    default: module.MarketingScreenshotPage,
+  }))
+);
+const MarketingVideoPage = lazy(() =>
+  import('./pages/marketing/MarketingVideoPage').then((module) => ({
+    default: module.MarketingVideoPage,
+  }))
+);
+const RbacPolicyPrototypePage = import.meta.env.DEV
+  ? lazy(() =>
+      import('./pages/RbacPolicyPrototypePage').then((module) => ({
+        default: module.RbacPolicyPrototypePage,
+      }))
+    )
+  : null;
+
+const AgorApp = lazy(loadAgorApp);
+const KnowledgePage = lazy(loadKnowledgePage);
+const ArtifactFullscreenPage = lazy(loadArtifactFullscreenPage);
+const MCPSlackRecoveryPage = lazy(loadMcpRecoveryPage);
+const MCPOAuthConnectPage = lazy(loadMcpConnectPage);
+const MCPOAuthReturnPage = lazy(loadMcpOAuthReturnPage);
+const CLILoginPage = lazy(loadCliLoginPage);
+const MobileApp = lazy(loadMobileApp);
+const StreamdownDemoPage = lazy(loadStreamdownDemoPage);
+
+const routeModuleLoaders = {
+  workspace: loadAgorApp,
+  knowledge: loadKnowledgePage,
+  'artifact-fullscreen': loadArtifactFullscreenPage,
+  'mcp-recovery': loadMcpRecoveryPage,
+  'mcp-connect': loadMcpConnectPage,
+  'mcp-oauth-return': loadMcpOAuthReturnPage,
+  'cli-login': loadCliLoginPage,
+  demo: loadStreamdownDemoPage,
+  mobile: loadMobileApp,
+} satisfies Record<RouteModuleKey, () => Promise<unknown>>;
+
+function getRouteModuleKey(surfaceId: RouteSurfaceId, pathname: string): RouteModuleKey {
+  if (isMobileShellPath(pathname)) return 'mobile';
+  return surfaceId;
+}
+
+function preloadRouteModule(moduleKey: RouteModuleKey): Promise<unknown> {
+  if (loadedRouteModuleKeys.has(moduleKey)) return Promise.resolve();
+  return routeModuleLoaders[moduleKey]();
+}
+
+function AppContent() {
+  const { showSuccess, showError, showWarning, showInfo, showLoading, destroy } =
+    useThemedMessage();
+  const navigate = useNavigate();
+  const location = useLocation();
+  const { currentSurface, workspaceSurfaceShouldRun } = useWorkspaceSurfaceLifecycle(
+    location.pathname
+  );
+  // Apply each surface's declared favicon/title centrally. Non-dynamic surfaces
+  // get the absolute brand mark + static title here; the 'dynamic' Workspace
+  // shell no-ops and manages its own via useFaviconStatus/useBoardTitle. This
+  // makes the registry's `branding` field the single enforcement point so a new
+  // static surface can't forget to wire it.
+  useSurfaceBranding(currentSurface);
+  const sharedSurfaceOwnsUserSettings =
+    currentSurface.usesSharedUserSettings || isMobileShellPath(location.pathname);
+  const routeModuleKey = getRouteModuleKey(currentSurface.id, location.pathname);
+  const [routeModuleReady, setRouteModuleReady] = useState(() =>
+    loadedRouteModuleKeys.has(routeModuleKey)
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+
+    if (!loadedRouteModuleKeys.has(routeModuleKey)) {
+      setRouteModuleReady(false);
+    }
+
+    preloadRouteModule(routeModuleKey)
+      .catch(() => {
+        // Let React.lazy/ErrorBoundary surface the route-load failure.
+      })
+      .finally(() => {
+        if (!cancelled) setRouteModuleReady(true);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [routeModuleKey]);
+
+  // Fetch daemon auth and instance configuration
+  const {
+    config: authConfig,
+    instanceConfig,
+    featuresConfig,
+    loading: authConfigLoading,
+    error: authConfigError,
+    identityContractState,
+    retry: retryAuthConfig,
+  } = useAuthConfig();
+  const passwordWriteAvailable = isIdentityCapabilityAvailable(
+    authConfig,
+    identityContractState,
+    'passwordWrite'
+  );
+
+  // Authentication
+  const {
+    user,
+    authenticated,
+    loading: authLoading,
+    error: authError,
+    accessToken,
+    authenticationGeneration,
+    isAuthenticationGenerationCurrent,
+    isAuthenticationOwnerCurrent,
+    login,
+    captureAuthorityCycle,
+    loginForAuthorityCycle,
+    logout,
+    logoutForAuthorityCycle,
+    reconcileStoredCredentials,
+    refreshCurrentUserForAuthorityCycle,
+  } = useAuth();
+
+  // Call ALL hooks unconditionally BEFORE any conditional returns.
+  // Connect to daemon with authentication token (auth is always required —
+  // anonymous mode was removed; the LoginPage gate below blocks rendering
+  // until we have a token).
+  const {
+    client,
+    connected,
+    connecting,
+    authGeneration,
+    error: connectionError,
+    retryConnection,
+  } = useAgorClient({
+    accessToken: authenticated ? accessToken : null,
+    authorityGeneration: authenticationGeneration,
+    reconcileCredentials: reconcileStoredCredentials,
+    isAuthorityGenerationCurrent: isAuthenticationGenerationCurrent,
+  });
+  const clientRef = useRef(client);
+  clientRef.current = client;
+  const startEnvironmentWithConfirmation = useEnvironmentStart(client);
+  const handleUnarchiveBranch = useUnarchiveBranch(client);
+  // Authenticated callers see their tenant's label; pre-login config is the fallback.
+  const authenticatedInstanceConfig = useAuthenticatedInstanceConfig({
+    client,
+    user,
+    connected,
+    connecting,
+    authGeneration,
+    authenticationGeneration,
+    isAuthenticationGenerationCurrent,
+  });
+  const headerInstanceConfig = authenticatedInstanceConfig ?? instanceConfig;
+  const appAuthorityGuard = useAuthorityOperationGuard(
+    user?.user_id && user.role && client && connected && !connecting
+      ? [user.user_id, user.role, client, authGeneration]
+      : null
+  );
+  const handleForcePasswordChange = useForcedPasswordChangeHandler({
+    client,
+    user,
+    appAuthorityGuard,
+    captureAuthorityCycle,
+    reauthenticate: loginForAuthorityCycle,
+    logout: logoutForAuthorityCycle,
+    onCompleted: (signedIn) => {
+      showSuccess(signedIn ? 'Password changed.' : 'Password changed. Sign in again to continue.');
+    },
+  });
+  const pendingEnvironmentToastsRef = useRef<Map<string, PendingEnvironmentToast>>(new Map());
+  const previousEnvironmentAttemptId = (branchId: string) =>
+    agorStore.getState().branchById.get(branchId as BranchID)?.environment_instance?.last_command
+      ?.attempt_id;
+  const latestSessionUpdateRequestsRef = useRef<LatestSessionUpdateRequests>(new Map());
+
+  useEffect(() => {
+    if (!client) return;
+
+    const branchesService = client.service('branches');
+    const handleBranchPatched = (branch: Branch) => {
+      const pending = pendingEnvironmentToastsRef.current.get(branch.branch_id);
+      if (!pending) return;
+
+      const lastCommand = branch.environment_instance?.last_command;
+      if (!lastCommand || lastCommand.action !== pending.action) return;
+
+      if (!lastCommand.attempt_id || lastCommand.attempt_id === pending.previousAttemptId) return;
+
+      const copy = ENV_ACTION_COPY[pending.action];
+      if (lastCommand.status === 'succeeded') {
+        showSuccess(`Environment ${copy.done}.`, { key: pending.key });
+      } else if (lastCommand.status === 'failed') {
+        showError(
+          lastCommand.message
+            ? `Couldn't ${copy.present} the environment. (${lastCommand.message})`
+            : `Couldn't ${copy.present} the environment.`,
+          { key: pending.key }
+        );
+      } else {
+        showWarning(
+          `Agor couldn't confirm the last ${copy.present}. Check the logs before you try again.`,
+          { key: pending.key, duration: 0 }
+        );
+      }
+      pendingEnvironmentToastsRef.current.delete(branch.branch_id);
+    };
+
+    branchesService.on('patched', handleBranchPatched);
+    return () => {
+      branchesService.removeListener('patched', handleBranchPatched);
+    };
+  }, [client, showError, showSuccess, showWarning]);
+
+  // Track FE/BE drift: capture the daemon's build SHA on first load (via
+  // /health) and flip outOfSync when the daemon later reports a different
+  // SHA on socket reconnect. Surfaced through ConnectionContext →
+  // ConnectionStatus (amber tag with a refresh tooltip) and AboutTab (debug
+  // rows). Mounted exactly once so all consumers share the same baseline.
+  const { capturedSha, currentSha, outOfSync } = useServerVersion(client);
+
+  // Referentially stable context value: without the memo, every App render
+  // hands consumers a fresh object and defeats their own memoization.
+  const connectionContextValue = useMemo(
+    () => ({ connected, connecting, authGeneration, outOfSync, capturedSha, currentSha }),
+    [connected, connecting, authGeneration, outOfSync, capturedSha, currentSha]
+  );
+
+  const directSessionIdFromPath =
+    location.pathname.match(/^\/(?:s|m\/session)\/([^/]+)\/?$/)?.[1] ?? null;
+  const directBranchIdFromPath = location.pathname.match(/^\/w\/([^/]+)\/?$/)?.[1] ?? null;
+  const authenticatedUserCanListUsers = hasMinimumRole(user?.role, ROLES.MEMBER);
+  // A deep link's target (and an open session's branch) stays while routed
+  // to, whatever scope evicts; a short id is pinned once the UI resolves it.
+  usePinnedOpenRows({ sessions: [directSessionIdFromPath], branches: [directBranchIdFromPath] });
+
+  // Pass the stable client lifetime, not `connected ? client : null`:
+  // useAgorData owns reconnect refetches and `null` is reserved for logout /
+  // token removal. See the reset-effect comment in useAgorData.ts for the full
+  // failure chain we're avoiding.
+  // Skip data fetch if user needs to change password — the ForcePasswordChangeModal handles that.
+  const {
+    initialLoadItems,
+    initialLoadComplete,
+    loadingStage,
+    loading,
+    error: dataError,
+    refetch: refetchData,
+  } = useAgorData(client, {
+    enabled: workspaceSurfaceShouldRun && !(user?.must_change_password && passwordWriteAvailable),
+    directSessionId: directSessionIdFromPath,
+    directBranchId: directBranchIdFromPath,
+    authenticatedUserId: user?.user_id,
+    authenticatedUserRole: user?.role,
+    authGeneration,
+    connectionReady: connected && !connecting,
+  });
+
+  // Entity maps are NOT subscribed here. Each surface that needs a whole map
+  // (MobileApp, OnboardingWizard, KnowledgePage) self-subscribes via
+  // `useAgorStore(selectX)` at its own top, so the outer shell re-renders only
+  // on load-state — not on every entity write. Outer App's own handler-time
+  // lookups read imperatively through `agorStore.getState()`, and the single
+  // render-time entity read (currentUser) uses a narrow by-id selector below.
+
+  // Session actions
+  const { createSession, forkSession, btwForkSession, spawnSession, updateSession, deleteSession } =
+    useSessionActions(client);
+
+  // Board actions
+  const { createBoard, updateBoard, deleteBoard, archiveBoard, unarchiveBoard } =
+    useBoardActions(client);
+
+  // Onboarding state (for new users)
+  const [settingsTabToOpen, setSettingsTabToOpen] = useState<string | null>(null);
+  const [openUserSettings, setOpenUserSettings] = useState(false);
+  const [userSettingsInitialTab, setUserSettingsInitialTab] = useState<string | undefined>(
+    undefined
+  );
+  const [openNewBranch, setOpenNewBranch] = useState(false);
+  const [credentialVersion, setCredentialVersion] = useState(0);
+
+  // Detect GitHub App setup callback URL and auto-open gateway settings
+  useEffect(() => {
+    if (
+      location.pathname === '/gateway/github/setup' &&
+      location.search.includes('installation_id')
+    ) {
+      setSettingsTabToOpen('gateway');
+    }
+  }, [location.pathname, location.search]);
+
+  // Track if we've successfully loaded data at least once
+  // This prevents UI from unmounting during reconnections
+  const [hasLoadedOnce, setHasLoadedOnce] = useState(false);
+
+  // Mark as loaded once the initial fetch completes (regardless of whether the
+  // workspace is empty — checking map sizes failed for fresh instances with no
+  // sessions/boards/repos yet).
+  useEffect(() => {
+    if (!loading && !dataError && initialLoadComplete) {
+      setHasLoadedOnce(true);
+    }
+  }, [loading, initialLoadComplete, dataError]);
+
+  const mustChangePassword = !!user?.must_change_password && passwordWriteAvailable;
+  const loaderPhase = useInitialLoaderPhase({
+    connecting,
+    loading,
+    dataError,
+    mustChangePassword,
+    // Treat the route surface chunk as part of the initial load so the loader
+    // only performs its fade-out once. Otherwise the data loader can fade to 0
+    // and then pop back to opacity 1 while the lazy route module finishes.
+    initialLoadComplete: initialLoadComplete && routeModuleReady,
+  });
+
+  const workspaceLoadingFallback = (
+    <InitialLoadingScreen
+      phase={loaderPhase === 'done' ? 'fading' : loaderPhase}
+      connecting={connecting}
+      loadingStage={loadingStage}
+      items={initialLoadItems}
+    />
+  );
+
+  const routeFallback = workspaceSurfaceShouldRun ? (
+    workspaceLoadingFallback
+  ) : (
+    <InitialLoadingScreen message="Loading surface…" />
+  );
+
+  // Get current user from users Map (real-time updates via WebSocket).
+  // Narrow by-id selector: subscribes to this ONE user entity, not the whole
+  // userById map, so unrelated user writes don't re-render the shell. Falls
+  // back to the auth user until the map has loaded that row.
+  const storedCurrentUser = useAgorStore((s) =>
+    user ? (s.userById.get(user.user_id) ?? null) : null
+  );
+  // A viewer cannot refresh the directory, so never let a row retained from a
+  // prior member identity/role override the current authentication response.
+  const currentUser = enrichAuthenticatedUser(
+    user,
+    authenticatedUserCanListUsers ? storedCurrentUser : null
+  );
+  // Authentication owns the open gate, but a same-user realtime directory
+  // `true` is safe as a close-only terminal signal from another tab. Directory
+  // `false` can never undo an authenticated completion or open the wizard.
+  const onboardingCompletionObserved = hasObservedOnboardingCompletion(
+    user,
+    authenticatedUserCanListUsers ? storedCurrentUser : null
+  );
+  const mcpServerCount = useAgorStore((s) => s.mcpServerById.size);
+  // Slack/GitHub connections are gateway channels, a separate store map from MCP
+  // servers. Narrow size selector so unrelated channel writes don't re-render the shell.
+  const gatewayChannelCount = useAgorStore((s) => s.gatewayChannelById.size);
+  // Both integration collections are background-hydrated; gate the teal banner on
+  // their first apply so a zero count can't flash before the data is known.
+  const integrationsHydrated = useAgorStore(
+    (s) => s.mcpServersHydrated && s.gatewayChannelsHydrated
+  );
+  // Members can browse Catalog; its existing policy gate owns connection authority.
+  const canManageMcp = hasMinimumRole(currentUser?.role, ROLES.MEMBER);
+  // Onboarding provisions boards, repos, branches and sessions. A viewer is a
+  // read-only role, so its first login must enter the workspace without opening
+  // a flow the daemon will correctly refuse at every write boundary.
+  const canRunOnboarding = hasMinimumRole(currentUser?.role, ROLES.MEMBER);
+
+  // Keep the global ErrorBoundary's crash context populated so a render
+  // crash anywhere below us can produce a useful report (build SHA + signed-in
+  // user). The boundary is a class component that lives ABOVE this tree, so
+  // it can't read hooks — a module-level setter is the bridge.
+  useEffect(() => {
+    setCrashContext({
+      buildSha: capturedSha,
+      userEmail: currentUser?.email ?? null,
+    });
+  }, [capturedSha, currentUser?.email]);
+
+  // Onboarding visibility has one owner. Explicit deferred/completed terminal
+  // states prevent loading, route, realtime, or stale-auth churn from turning a
+  // close into an immediate reopen.
+  const onboardingDeferred = isOnboardingDeferred(currentUser?.preferences);
+  const onboardingReady =
+    !!currentUser &&
+    !(currentUser.must_change_password && passwordWriteAvailable) &&
+    connected &&
+    workspaceSurfaceShouldRun &&
+    currentSurface.startsWorkspaceRuntime &&
+    !loading;
+  const {
+    activeOwner: onboardingWizardOwner,
+    open: onboardingWizardOpen,
+    activate: activateOnboardingWizard,
+    isOwnerCurrent: isOnboardingOwnerCurrent,
+    defer: deferOnboardingWizard,
+    complete: completeOnboardingWizard,
+  } = useOnboardingLifecycle({
+    userId: currentUser?.user_id,
+    authenticationGeneration,
+    eligible: canRunOnboarding,
+    ready: onboardingReady,
+    completed: onboardingCompletionObserved,
+    deferred: onboardingDeferred,
+    isAuthenticationOwnerCurrent,
+  });
+  const onboardingSeedResultRef = useRef(
+    new Map<string, { branchId?: string; sessionId?: string }>()
+  );
+  const onboardingCompletionWriteRef = useRef<{
+    owner: OnboardingOperationOwner;
+    promise: Promise<unknown>;
+  } | null>(null);
+  const onboardingWizardWriteRef = useRef<{
+    owner: OnboardingOperationOwner;
+    promise: Promise<unknown>;
+  } | null>(null);
+  const onboardingSeedOwnerRef = useRef<string | undefined>(undefined);
+
+  useEffect(() => {
+    const ownerKey = onboardingWizardOwner
+      ? `${onboardingWizardOwner.userId}:${onboardingWizardOwner.authenticationGeneration}`
+      : undefined;
+    if (onboardingSeedOwnerRef.current === ownerKey) return;
+    onboardingSeedOwnerRef.current = ownerKey;
+    onboardingSeedResultRef.current.clear();
+  }, [onboardingWizardOwner]);
+
+  const handleCreateRepo = useCallback(
+    (data: CreateRepoRequest, options: CreateRepoOptions = {}) =>
+      createRepository(client, data, options, { showError, showInfo, showWarning }, repoPatched),
+    [client, showError, showInfo, showWarning]
+  );
+
+  // Auto-clone the AI-teammate framework repo in the background while the user
+  // walks through onboarding, so it's ready to seed the first teammate by the
+  // time they finish. The store swaps its repo Map on every repo event broadcast
+  // to any client, so this render-time read is narrowed to the single framework
+  // row AND gated on the wizard being open — otherwise the always-mounted shell
+  // would re-render on unrelated repo writes. NOT ready-only: it must still match
+  // the `cloning` placeholder so useEnsureFrameworkRepo doesn't re-fire the clone.
+  const frameworkRepo = useAgorStore((s) =>
+    onboardingWizardOpen ? (findFrameworkRepo(s.repoById)?.[1] ?? null) : null
+  );
+  const frameworkRepoList = useMemo(
+    () => (frameworkRepo ? [frameworkRepo] : EMPTY_REPOS),
+    [frameworkRepo]
+  );
+  // Prefetch is not a user request: no global toasts. Keep local status and
+  // durable repo diagnostics; completion below owns required-step errors.
+  const onboardingCreateRepo = useCallback(
+    (data: CreateRepoRequest) =>
+      handleCreateRepo(data, {
+        silent: true,
+        shouldApply: () =>
+          !!onboardingWizardOwner && isOnboardingOwnerCurrent(onboardingWizardOwner),
+      }),
+    [handleCreateRepo, onboardingWizardOwner, isOnboardingOwnerCurrent]
+  );
+  const frameworkSetup = useEnsureFrameworkRepo(frameworkRepoList, onboardingCreateRepo, {
+    enabled: onboardingWizardOpen && canRunOnboarding,
+    ownerKey: onboardingWizardOwner,
+  });
+
+  // Handle wizard completion
+  const handleOnboardingComplete = async (
+    owner: OnboardingOperationOwner,
+    result: OnboardingCompletionResult,
+    isAttemptCurrent: () => boolean
+  ) => {
+    // The wizard awaits this and stays open while resource creation and
+    // navigation run. The durable completion write then closes it before the
+    // best-effort auth refresh, so refresh failure cannot turn success into a
+    // trapped final screen.
+    if (!currentUser || !isOnboardingOwnerCurrent(owner)) return;
+    if (!client) throw new Error('Not connected - try again when Agor reconnects.');
+    const operationUserId = owner.userId;
+    const isCurrentUser = () => isAttemptCurrent() && isOnboardingOwnerCurrent(owner);
+
+    // Completing onboarding is an explicit tool choice. Seed it only while the
+    // preference is unset; a Settings selection made concurrently always wins.
+    if (!isCurrentUser()) return;
+    if (result.agent && client) {
+      try {
+        await setPrimaryAgenticToolIfUnset(client, currentUser, result.agent);
+      } catch (error) {
+        console.warn(
+          '[onboarding] Failed to seed primary coding agent:',
+          error instanceof Error ? error.message : String(error)
+        );
+      }
+    }
+    if (!isCurrentUser()) return;
+
+    // A named teammate is a required step. Re-read shared metadata, retry a
+    // settled failure in place, and keep the wizard open on a contextual error.
+    // Prefetch failure must not masquerade as completed onboarding.
+    const readyFrameworkRepo = result.teammateName?.trim()
+      ? await ensureOnboardingFrameworkRepo({
+          getRepoById: () => agorStore.getState().repoById,
+          subscribe: (listener) => agorStore.subscribe(listener),
+          fetchRepos: () =>
+            client.service('repos').findAll({ query: { $limit: PAGINATION.DEFAULT_LIMIT } }),
+          applyRepo: (repo) => {
+            if (isCurrentUser()) repoPatched(repo);
+          },
+          createRepo: (data) =>
+            handleCreateRepo(data, { silent: true, shouldApply: isCurrentUser }),
+          isCurrent: isCurrentUser,
+          deadlineMs: 20_000,
+        })
+      : undefined;
+    if (!isCurrentUser()) return;
+
+    const retainedSeed = onboardingSeedResultRef.current.get(result.boardId);
+    // Always end onboarding inside the first-task composer: if the user skipped
+    // the LLM step, fall back to their governed default agent so the pre-seeded
+    // session still opens. Without a configured model, keep the starter as an
+    // editable draft instead of manufacturing a failed credential-less turn.
+    const bootstrapAgent =
+      result.agent ??
+      resolveAvailableUserAgenticTool(
+        currentUser,
+        agorStore.getState().agenticToolSettingsByName,
+        AVAILABLE_AGENTS
+      );
+    const seeded = await seedOnboardingTeammate({
+      frameworkRepo: readyFrameworkRepo,
+      boardId: result.boardId,
+      teammateName: result.teammateName,
+      teammateEmoji: result.teammateEmoji,
+      sourceBranch: result.sourceBranch,
+      sourceRemoteUrl: result.sourceRemoteUrl,
+      agent: bootstrapAgent,
+      startInitialTurn: result.agent != null,
+      // Template persona for the first-session opener.
+      templateId: result.templateId,
+      requestedTools: result.requestedTools,
+      user: {
+        name: currentUser.name,
+        email: currentUser.email,
+      },
+      expectedUserId: operationUserId,
+      isCurrentUser: (expectedUserId) => expectedUserId === operationUserId && isCurrentUser(),
+      client,
+      repoById: agorStore.getState().repoById,
+      branchById: agorStore.getState().branchById,
+      sessionById: agorStore.getState().sessionById,
+      existingBranchId: retainedSeed?.branchId || result.branchId || undefined,
+      existingSessionId: retainedSeed?.sessionId || result.sessionId || undefined,
+      onCreateBranch: (repoId, data) =>
+        isCurrentUser() ? handleCreateBranch(repoId, data) : Promise.resolve(null),
+      onUpdateBranch: (branchId, updates) => {
+        if (!isCurrentUser()) return;
+        return handleUpdateBranch(branchId, updates as BranchUpdate, { silent: true });
+      },
+      onCreateSession: async (config, boardId) => {
+        if (!isCurrentUser()) return null;
+        return handleCreateSession(config, boardId);
+      },
+      onWarn: (message) => {
+        if (isCurrentUser()) {
+          showWarning(message, { key: 'onboarding-teammate', duration: 8 });
+        }
+      },
+    });
+    if (!isCurrentUser()) return;
+    const branchId = seeded.branchId ?? retainedSeed?.branchId ?? result.branchId;
+    const sessionId = seeded.sessionId ?? retainedSeed?.sessionId ?? result.sessionId;
+    onboardingSeedResultRef.current.set(result.boardId, {
+      ...(branchId ? { branchId } : {}),
+      ...(sessionId ? { sessionId } : {}),
+    });
+
+    if (
+      result.teammateName?.trim() &&
+      (!seeded.workspaceReady || !branchId || (bootstrapAgent && !sessionId))
+    ) {
+      throw new Error(
+        branchId
+          ? 'Your board and teammate are saved, but setup has not finished. Check the teammate workspace status; if setup failed, use Retry on that teammate, then finish onboarding again.'
+          : 'Your board is saved, but the teammate workspace could not be created. Check repository setup and your board permissions, then try again.'
+      );
+    }
+
+    // Completion is the commit point of the client-side saga. Do it only after
+    // required teammate work has succeeded (or the user skipped naming one),
+    // so closing/reloading during provisioning leaves an
+    // incomplete wizard that can resume instead of a falsely completed user.
+    // Fetch immediately before the whole-preferences patch to preserve any
+    // unrelated setting changed while the wizard was open.
+    const latestUser = (await client.service('users').get(currentUser.user_id)) as User;
+    if (!isCurrentUser()) return;
+    const completionResult = { ...result, branchId, sessionId };
+    const completionWrite = handleUpdateUser(
+      currentUser.user_id,
+      {
+        onboarding_completed: true,
+        preferences: buildCompletedOnboardingPreferences(latestUser.preferences, completionResult),
+      },
+      { silent: true }
+    );
+    onboardingCompletionWriteRef.current = { owner, promise: completionWrite };
+    try {
+      await completionWrite;
+    } finally {
+      if (onboardingCompletionWriteRef.current?.promise === completionWrite) {
+        onboardingCompletionWriteRef.current = null;
+      }
+    }
+
+    // The successful preference write is the commit point. Its realtime user
+    // event may have already moved this lifecycle to `completed`, retiring the
+    // active wizard owner before the PATCH promise resolves. Completion is an
+    // idempotent terminal acknowledgement for this exact activation, so that
+    // expected ordering still proceeds to navigation without revalidating an
+    // older activation after a restart. An
+    // explicit X/Escape dismissal transitions to `deferred` instead and keeps
+    // this false, preserving the user's decision not to navigate.
+    if (!completeOnboardingWizard(owner)) return;
+
+    // Always land the user on a board — never the homepage. Prefer the seeded
+    // session, then the board the wizard created, then the user's main board,
+    // then any existing board. The final wizard action always creates/resumes a
+    // board, so the later fallbacks are belt-and-suspenders. Use the
+    // centralized path builders — the old `/b/<board>/<session>/` shape was
+    // removed when we flattened entity URLs.
+    const boardById = agorStore.getState().boardById;
+    const mainBoardId = latestUser.preferences?.mainBoardId;
+    const targetBoardId =
+      result.boardId ||
+      (mainBoardId && boardById.has(mainBoardId) ? mainBoardId : undefined) ||
+      boardById.keys().next().value;
+    if (sessionId) {
+      navigate(sessionPath(sessionId as SessionID));
+    } else if (targetBoardId) {
+      navigate(boardPath(targetBoardId as BoardID, boardById.get(targetBoardId)?.slug));
+    }
+
+    // `currentUser` keeps login gates from the authenticated principal rather
+    // than accepting a possibly-stale directory row. Synchronize it after the
+    // modal is safely terminal. A refresh failure must not trap a user whose
+    // completion is already durable; the next token refresh/reload will read it.
+    const refreshedCurrentUser = await refreshCurrentUserForAuthorityCycle(() =>
+      isAuthenticationOwnerCurrent(owner.userId, owner.authenticationGeneration)
+    );
+    if (
+      !refreshedCurrentUser &&
+      isAuthenticationOwnerCurrent(owner.userId, owner.authenticationGeneration)
+    ) {
+      showWarning('Setup is saved. Reload if your account does not refresh automatically.', {
+        key: 'onboarding-auth-refresh',
+        duration: 8,
+      });
+    }
+  };
+
+  const handleOnboardingDismiss = (
+    owner: OnboardingOperationOwner,
+    progress: Partial<OnboardingState>
+  ) => {
+    // Close synchronously first. Persistence is a defer marker, never a fake
+    // completion, and a transport error cannot make the modal spring open in
+    // this authority generation.
+    if (!deferOnboardingWizard(owner)) return;
+    if (!client) {
+      showError('Onboarding is closed, but “finish later” couldn’t be saved while offline.');
+      return;
+    }
+
+    void (async () => {
+      try {
+        const wizardWrite = onboardingWizardWriteRef.current;
+        if (wizardWrite?.owner === owner) {
+          try {
+            await wizardWrite.promise;
+          } catch {
+            // Deferral still has to be recorded after a failed wizard write.
+          }
+        }
+        // Dismiss may race the narrow completion-commit window. Close remains
+        // immediate, but wait for that authoritative write before reading
+        // preferences so a stale deferral patch cannot erase completion data.
+        const completionWrite = onboardingCompletionWriteRef.current;
+        if (completionWrite?.owner === owner) {
+          try {
+            await completionWrite.promise;
+          } catch {
+            // A failed completion is exactly when the deferral should persist.
+          }
+        }
+        if (!isAuthenticationOwnerCurrent(owner.userId, owner.authenticationGeneration)) return;
+        const latestUser = (await client.service('users').get(owner.userId)) as User;
+        if (!isAuthenticationOwnerCurrent(owner.userId, owner.authenticationGeneration)) return;
+        if (latestUser.onboarding_completed) return;
+        await client.service('users').patch(owner.userId, {
+          preferences: buildDeferredOnboardingPreferences(
+            latestUser.preferences,
+            new Date().toISOString(),
+            progress
+          ),
+        });
+      } catch (error) {
+        if (!isAuthenticationOwnerCurrent(owner.userId, owner.authenticationGeneration)) return;
+        showError(
+          withRawDetail('Onboarding is closed, but “finish later” couldn’t be saved.', error),
+          { key: 'onboarding-defer' }
+        );
+      }
+    })();
+  };
+
+  const handleCheckAuth = useCallback(
+    async (tool: AgenticToolName, apiKey?: string): Promise<AuthCheckResult> => {
+      // A transport failure is NOT proof of missing auth — surface `unknown` so
+      // callers fail safe rather than flashing a "not connected" state.
+      if (!client) return { status: 'unknown', authenticated: false, method: 'none' };
+      try {
+        return (await client.service('check-auth').create({ tool, apiKey })) as AuthCheckResult;
+      } catch {
+        return {
+          status: 'unknown',
+          authenticated: false,
+          method: 'none',
+          hint: 'Connection check failed.',
+        };
+      }
+    },
+    [client]
+  );
+
+  // NOW handle conditional rendering based on state
+  // Show loading while fetching auth config
+  if (authConfigLoading) {
+    return <InitialLoadingScreen message="Loading…" />;
+  }
+
+  // Show auth config error ONLY if we don't have a config yet (first load)
+  // If we already have a config cached, continue with that even if there's an error
+  if (authConfigError && !authConfig) {
+    const unsupportedIdentityContract = identityContractState === IdentityContractState.UNSUPPORTED;
+    return (
+      <div
+        style={{
+          height: '100vh',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          padding: '2rem',
+        }}
+      >
+        <DaemonConfigurationAlert
+          unsupportedIdentityContract={unsupportedIdentityContract}
+          onRetry={retryAuthConfig}
+        />
+      </div>
+    );
+  }
+
+  // Auth is always required (anonymous mode was removed). Show login page
+  // when not authenticated; reconnecting state when we have tokens but the
+  // socket is reconnecting; spinner while authenticating.
+  const hasTokens =
+    typeof window !== 'undefined' &&
+    !!(localStorage.getItem('agor-access-token') || localStorage.getItem('agor-refresh-token'));
+
+  if (!authLoading && !authenticated && !hasTokens) {
+    return (
+      <LoginPage
+        onLogin={login}
+        error={authError}
+        externalLaunchLoginRedirectUrl={
+          authConfig?.externalLaunch?.enabled
+            ? authConfig.externalLaunch.loginRedirectUrl
+            : undefined
+        }
+        externalLaunchReturnHostParam={
+          authConfig?.externalLaunch?.enabled
+            ? authConfig.externalLaunch.returnHostParam
+            : undefined
+        }
+        localLoginEnabled={authConfig?.identity?.localAuth !== AgorLocalAuthMode.DISABLED}
+      />
+    );
+  }
+
+  // Show reconnecting state if we have tokens but lost connection.
+  // ONLY show fullscreen on initial connection, not during reconnections.
+  if (hasTokens && (!connected || !authenticated) && workspaceSurfaceShouldRun && !hasLoadedOnce) {
+    return <InitialLoadingScreen message="Reconnecting to Agor…" />;
+  }
+
+  // Show loading while checking authentication
+  if (authLoading) {
+    return <InitialLoadingScreen message="Authenticating…" />;
+  }
+
+  // Show connection error
+  if (connectionError && !hasLoadedOnce) {
+    return (
+      <div
+        style={{
+          height: '100vh',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          padding: '2rem',
+        }}
+      >
+        <DaemonConnectionAlert message={connectionError} />
+      </div>
+    );
+  }
+
+  // Show loading state ONLY on initial load, not during reconnections
+  // Once data is loaded, keep UI mounted and show connection status in header instead
+  if (workspaceSurfaceShouldRun && (loaderPhase !== 'done' || !routeModuleReady)) {
+    return workspaceLoadingFallback;
+  }
+
+  // Show data error (but not if user needs to change password - let the modal render)
+  if (workspaceSurfaceShouldRun && dataError && !mustChangePassword) {
+    return (
+      <div
+        style={{
+          height: '100vh',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          padding: '2rem',
+        }}
+      >
+        <ActionErrorNotice
+          error={
+            isInFlightConnectionLossError(dataError)
+              ? { message: notConnectedMessage('load your workspace'), raw: dataError }
+              : describeActionError('load your workspace', dataError, { idempotent: true })
+          }
+          action={{ label: 'Try again', onClick: () => void refetchData() }}
+        />
+      </div>
+    );
+  }
+
+  // Handle session creation. The browser owns only the multipart upload gap;
+  // the daemon commits required session configuration, then uses its ordinary
+  // prompt-admission lifecycle. A prompt failure leaves a usable configured
+  // blank session and seeds the normal composer rather than retaining a second
+  // recovery state machine.
+  const handleCreateSession = async (
+    config: NewSessionConfig,
+    _boardId: string
+  ): Promise<SessionCreationResult | null> => {
+    const branch_id = config.branch_id;
+    if (!branch_id) {
+      showError("Couldn't start the session. No branch was selected.");
+      return null;
+    }
+    if (!client) {
+      showError(notConnectedMessage('start the session'));
+      return null;
+    }
+    if (!currentUser) {
+      showError("Couldn't start the session. Sign in again to continue.");
+      return null;
+    }
+
+    const operationUserId = currentUser.user_id;
+    const operationAuthenticationGeneration = authenticationGeneration;
+    const operationAccessToken = accessToken;
+    const shouldContinue = () =>
+      isAuthenticationOwnerCurrent(operationUserId, operationAuthenticationGeneration);
+    const { attachmentFiles, ...sessionConfig } = config;
+    const outcome = await runSessionCreationStages({
+      createSession: () => createSession({ ...sessionConfig, branch_id }),
+      onSessionCreated: (session) => {
+        sessionCreated(session);
+        const warning = getSessionCreationWarning(session);
+        if (warning) showWarning(warning, { duration: 10 });
+        else showSuccess('Session started.');
+      },
+      initialPrompt: config.initialPrompt ?? '',
+      preparePrompt: attachmentFiles?.length
+        ? async (session, prompt) => {
+            const uploaded = await uploadFilesToSession({
+              sessionId: session.session_id,
+              daemonUrl: getDaemonUrl(),
+              files: attachmentFiles,
+              notifyAgent: false,
+              accessToken: operationAccessToken,
+            });
+            return buildPromptWithAttachments(prompt, uploaded.files);
+          }
+        : undefined,
+      initializeSession: (session, prompt) =>
+        client.sessions.initialize(session.session_id, {
+          expectedUserId: operationUserId,
+          mcpServerIds: config.mcpServerIds,
+          envVarNames: config.envVarNames,
+          prompt,
+          permissionMode: config.permissionMode,
+        }),
+      shouldContinue,
+    });
+
+    if (outcome.status === 'cancelled') return null;
+    if (outcome.status === 'create-failed') {
+      if (!shouldContinue()) return null;
+      showError(formatActionError('start the session', outcome.error, { idempotent: false }));
+      return null;
+    }
+
+    if (outcome.status === 'complete') {
+      if (!shouldContinue()) return null;
+      if (isAgenticToolName(config.agent)) {
+        void setPrimaryAgenticToolIfUnset(client, currentUser, config.agent).catch((error) => {
+          console.warn(
+            '[sessions] Failed to seed primary coding agent:',
+            error instanceof Error ? error.message : String(error)
+          );
+        });
+      }
+      return { sessionId: outcome.session.session_id };
+    }
+
+    if (!shouldContinue()) return null;
+    savePromptDraft(operationUserId, outcome.session.session_id, outcome.prompt);
+    showError(sessionStartedMessageNotSent(outcome.error));
+    return { sessionId: outcome.session.session_id };
+  };
+
+  // Handle fork session
+  //
+  // On failure we RETHROW the error so upstream modals (ForkSpawnModal) can
+  // stay open and preserve the user's typed prompt. The error toast is still
+  // surfaced here so the user gets immediate feedback either way.
+  const handleForkSession = async (sessionId: string, prompt: string) => {
+    try {
+      await forkSession(sessionId as SessionID, prompt);
+      showSuccess('Session forked.');
+    } catch (err) {
+      showError(formatActionError('fork the session', err, { idempotent: false }));
+      throw err;
+    }
+  };
+
+  // Handle btw fork session (ephemeral fork for side questions)
+  const handleBtwForkSession = async (sessionId: string, prompt: string) => {
+    try {
+      await btwForkSession(sessionId as SessionID, prompt);
+      showSuccess('Side question started.');
+    } catch (err) {
+      showError(formatActionError('start the side question', err, { idempotent: false }));
+      throw err;
+    }
+  };
+
+  // Handle spawn session
+  const handleSpawnSession = async (sessionId: string, config: string | Partial<SpawnConfig>) => {
+    // Handle both string prompt and full SpawnConfig
+    const spawnConfig = typeof config === 'string' ? { prompt: config } : config;
+    try {
+      await spawnSession(sessionId as SessionID, spawnConfig);
+      showSuccess('Subsession started.');
+    } catch (err) {
+      showError(formatActionError('start the subsession', err, { idempotent: false }));
+      throw err;
+    }
+  };
+
+  // Handle send prompt - calls Claude/Codex via daemon
+  const handleSendPrompt = async (
+    sessionId: string,
+    prompt: string,
+    permissionMode?: PermissionMode
+  ): Promise<boolean> => {
+    if (!client || !currentUser) return false;
+    const operationUserId = currentUser.user_id;
+    const operationAuthenticationGeneration = authenticationGeneration;
+    return sendPromptWithReconciliation({
+      send: () => client.sessions.prompt(sessionId, prompt, { permissionMode }),
+      getClient: () => clientRef.current,
+      attempt: { sessionId, userId: operationUserId, prompt },
+      showError,
+      isCurrent: () =>
+        isAuthenticationOwnerCurrent(operationUserId, operationAuthenticationGeneration),
+    });
+  };
+
+  // Handle update session
+  const handleUpdateSession = async (sessionId: string, updates: Partial<Session>) => {
+    const authority = appAuthorityGuard.begin();
+    await runSessionUpdateWithLatestNotification({
+      sessionId: sessionId as SessionID,
+      updates,
+      latestRequests: latestSessionUpdateRequestsRef.current,
+      authority,
+      updateSession,
+      showSuccess,
+      showError,
+    });
+  };
+
+  // Handle delete session
+  const handleDeleteSession = async (sessionId: string) => {
+    try {
+      await deleteSession(sessionId as SessionID);
+      showSuccess('Session deleted.');
+    } catch (error) {
+      showError(formatActionError('delete the session', error, { idempotent: true }));
+    }
+  };
+
+  // Settings show their own save error inline, so they opt out of the toast.
+  const handleUpdateUserFromSettings = (
+    userId: string,
+    updates: UpdateUserInput,
+    shouldApply?: () => boolean,
+    options?: { errorShownInline?: boolean }
+  ) => handleUpdateUser(userId, updates, { ...options, shouldApply });
+
+  // Handle create user
+  const handleCreateUser = async (data: CreateUserInput, shouldApply?: () => boolean) => {
+    if (!client || (shouldApply && !shouldApply())) return;
+    try {
+      await client.service('users').create(data);
+      if (shouldApply && !shouldApply()) return;
+      showSuccess('User created.');
+    } catch (error) {
+      if (shouldApply && !shouldApply()) return;
+      showError(formatActionError('create the user', error, { idempotent: false }));
+      throw error;
+    }
+  };
+
+  const handleUpdateUser = async (
+    userId: string,
+    updates: UpdateUserInput,
+    options: { silent?: boolean; errorShownInline?: boolean; shouldApply?: () => boolean } = {}
+  ) => {
+    if (!client || (options.shouldApply && !options.shouldApply())) return;
+    const authorityOperation = appAuthorityGuard.begin();
+    try {
+      const newPassword =
+        typeof updates.password === 'string' && updates.password.length > 0
+          ? updates.password
+          : undefined;
+      const changesCurrentPassword = userId === currentUser?.user_id && !!newPassword;
+      let signedIn = true;
+      if (changesCurrentPassword && currentUser && newPassword) {
+        const authorityCycle = captureAuthorityCycle(authorityOperation);
+        if (!authorityCycle) return;
+        const completion = await completeLocalPasswordChange({
+          client,
+          userId,
+          emailAfterChange: updates.email ?? currentUser.email,
+          newPassword,
+          updates: updates as UpdateUserInput & { password: string },
+          authorityCycle,
+          reauthenticate: loginForAuthorityCycle,
+          logout: logoutForAuthorityCycle,
+        });
+        if (!completion) return;
+        signedIn = completion.status === 'signed-in' && completion.authority.isCurrent();
+      } else {
+        // Cast UpdateUserInput to Partial<User> - backend handles encryption/conversion
+        await client.service('users').patch(userId, updates as Partial<User>);
+        if (options.shouldApply && !options.shouldApply()) return;
+      }
+
+      if (updates.agentic_tools || updates.env_vars) {
+        setCredentialVersion((v) => v + 1);
+      }
+      if (!options.silent) {
+        showSuccess(signedIn ? 'User updated.' : 'Password changed. Sign in again to continue.');
+      }
+    } catch (error) {
+      if (options.shouldApply && !options.shouldApply()) return;
+      if (!options.silent && !options.errorShownInline) {
+        showError(formatActionError('update the user', error, { idempotent: true }));
+      }
+      throw error;
+    }
+  };
+
+  const handleReopenOnboarding = async (
+    mode: OnboardingReopenMode,
+    childShouldApply?: () => boolean
+  ) => {
+    const operation = appAuthorityGuard.begin();
+    if (!currentUser || !client || !canRunOnboarding) return;
+    const operationUserId = currentUser.user_id;
+    const operationAuthenticationGeneration = authenticationGeneration;
+    const shouldApply = () =>
+      operation.isCurrent() &&
+      isAuthenticationOwnerCurrent(operationUserId, operationAuthenticationGeneration) &&
+      (childShouldApply ? childShouldApply() : true);
+    if (!shouldApply()) return;
+
+    try {
+      // Resume is distinct from restart: a deferred incomplete run retains its
+      // durable candidate/resource IDs. Completed or non-deferred users who
+      // explicitly choose Restart still get a clean wizard.
+      const latestUser = (await client.service('users').get(currentUser.user_id)) as User;
+      if (!shouldApply()) return;
+      const resumable =
+        latestUser.onboarding_completed !== true && isOnboardingDeferred(latestUser.preferences);
+      if (mode === 'resume' && !resumable) {
+        showError(
+          "Couldn't reopen onboarding. Saved onboarding progress is no longer available, so reopen Settings."
+        );
+        return;
+      }
+      const preferences =
+        mode === 'resume'
+          ? buildResumedOnboardingPreferences(latestUser.preferences)
+          : buildRestartedOnboardingPreferences(latestUser.preferences);
+      await handleUpdateUser(
+        currentUser.user_id,
+        { preferences },
+        {
+          silent: true,
+          shouldApply,
+        }
+      );
+    } catch (error) {
+      if (!shouldApply()) return;
+      showError(formatActionError('reopen onboarding', error, { idempotent: true }));
+      return;
+    }
+
+    if (!shouldApply()) return;
+
+    setOpenUserSettings(false);
+    activateOnboardingWizard(operationUserId, operationAuthenticationGeneration, true);
+  };
+
+  // Handle delete user
+  const handleDeleteUser = async (userId: string, shouldApply?: () => boolean) => {
+    if (!client || (shouldApply && !shouldApply())) return;
+    try {
+      await client.service('users').remove(userId);
+      if (shouldApply && !shouldApply()) return;
+      showSuccess('User deleted.');
+    } catch (error) {
+      if (shouldApply && !shouldApply()) return;
+      showError(formatActionError('delete the user', error, { idempotent: true }));
+    }
+  };
+
+  // Handle board CRUD
+  const handleCreateBoard = async (board: Partial<Board>): Promise<Board | null> => {
+    if (board.board_id) {
+      // Board already exists (clone/import already persisted it) — return
+      // the prebuilt row so callers can navigate to it without re-creating.
+      return board as Board;
+    }
+
+    const created = await createBoard(board);
+    if (created) {
+      showSuccess('Board created.');
+    }
+    return created;
+  };
+
+  const handleUpdateBoard = async (boardId: string, updates: Partial<Board>) => {
+    const updated = await updateBoard(boardId as UUID, updates);
+    if (updated) {
+      showSuccess('Board updated.');
+    }
+    return Boolean(updated);
+  };
+
+  const handleDeleteBoard = async (boardId: string) => {
+    if (await deleteBoard(boardId as UUID)) {
+      showSuccess('Board deleted.');
+    }
+  };
+
+  const handleArchiveBoard = async (boardId: string) => {
+    if (await archiveBoard(boardId as UUID)) {
+      showSuccess('Board archived.');
+    }
+  };
+
+  const handleUnarchiveBoard = async (boardId: string) => {
+    if (await unarchiveBoard(boardId as UUID)) {
+      showSuccess('Board unarchived.');
+    }
+  };
+
+  const handleCreateLocalRepo = async (
+    data: CreateLocalRepoRequest,
+    shouldApply?: () => boolean
+  ) => {
+    if (shouldApply && !shouldApply()) return;
+    if (!client) {
+      showError(notConnectedMessage('add the repository'));
+      return;
+    }
+    try {
+      showLoading('Adding local repository...', { key: 'add-local-repo' });
+
+      await client.service('repos/local').create({
+        path: data.path,
+        slug: data.slug,
+      });
+
+      if (shouldApply && !shouldApply()) return;
+
+      showSuccess('Repository added.', { key: 'add-local-repo' });
+    } catch (error) {
+      if (shouldApply && !shouldApply()) return;
+      showError(formatActionError('add the repository', error, { idempotent: false }), {
+        key: 'add-local-repo',
+      });
+      throw error;
+    }
+  };
+
+  const handleUpdateRepo = async (
+    repoId: string,
+    updates: Partial<Repo>,
+    shouldApply?: () => boolean
+  ) => {
+    if (!client || (shouldApply && !shouldApply())) return;
+    try {
+      await client.service('repos').patch(repoId, updates);
+      if (shouldApply && !shouldApply()) return;
+      showSuccess('Repository updated.');
+    } catch (error) {
+      if (shouldApply && !shouldApply()) return;
+      showError(formatActionError('update the repository', error, { idempotent: true }));
+    }
+  };
+
+  const handleDeleteRepo = async (
+    repoId: string,
+    cleanup: boolean,
+    shouldApply?: () => boolean
+  ) => {
+    if (!client || (shouldApply && !shouldApply())) return;
+    try {
+      await client.service('repos').remove(repoId, {
+        query: { cleanup },
+      });
+      if (shouldApply && !shouldApply()) return;
+      if (cleanup) {
+        showSuccess('Repository and its files deleted.');
+      } else {
+        showSuccess('Repository removed from Agor. Its files were kept.');
+      }
+    } catch (error) {
+      if (shouldApply && !shouldApply()) return;
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      if (errorMessage.includes('Partial deletion occurred:')) {
+        showError(
+          withRawDetail(
+            "Couldn't delete the repository. Some of its files were already removed and need manual cleanup.",
+            error
+          )
+        );
+      } else if (errorMessage.includes('No files were deleted')) {
+        showError(withRawDetail("Couldn't delete the repository. No files were removed.", error));
+      } else {
+        showError(formatActionError('delete the repository', error, { idempotent: true }));
+      }
+    }
+  };
+
+  const handleArchiveOrDeleteBranch = async (
+    branchId: string,
+    options: BranchArchiveOrDeleteOptions
+  ) => {
+    let result: Branch;
+    try {
+      if (!client) throw new Error(CLIENT_NOT_CONNECTED_ERROR);
+      showLoading(`${options.metadataAction === 'archive' ? 'Archiving' : 'Deleting'} branch...`, {
+        key: 'archive-delete',
+      });
+      result = (await client
+        .service(`branches/${branchId}/archive-or-delete`)
+        .create(options)) as Branch;
+    } catch (error) {
+      showError(
+        formatActionError(
+          options.metadataAction === 'archive' ? 'archive the branch' : 'delete the branch',
+          error,
+          { idempotent: true }
+        ),
+        {
+          key: 'archive-delete',
+        }
+      );
+      throw error;
+    }
+    if (result.deletion_status === 'deletion_failed') {
+      showError("Couldn't finish deleting the branch. Check the branch card for details.", {
+        key: 'archive-delete',
+      });
+      throw new Error(result.deletion_error || 'Deletion requires reconciliation');
+    }
+    showSuccess(
+      options.metadataAction === 'archive'
+        ? 'Branch archived.'
+        : 'Deleting the branch. It stays on the board until cleanup finishes.',
+      { key: 'archive-delete' }
+    );
+  };
+
+  const handleUpdateBranch = async (
+    branchId: string,
+    updates: BranchUpdate,
+    options: { silent?: boolean } = {}
+  ) => {
+    if (!client) return;
+    try {
+      // Cast to Partial<Branch> to satisfy Feathers type checking
+      // The backend MCP handler properly handles null values for clearing fields
+      await client.service('branches').patch(branchId, updates as Partial<Branch>);
+      if (!options.silent) showSuccess('Branch updated.');
+    } catch (error) {
+      showError(formatActionError('update the branch', error, { idempotent: true }));
+    }
+  };
+
+  const handleCreateBranch = async (
+    repoId: string,
+    data: {
+      name: string;
+      ref: string;
+      refType?: 'branch' | 'tag';
+      createBranch: boolean;
+      sourceBranch?: string;
+      sourceRemoteUrl?: string;
+      pullLatest: boolean;
+      issue_url?: string;
+      pull_request_url?: string;
+      boardId?: string;
+      custom_context?: Record<string, unknown>;
+      notes?: string | null;
+      position?: { x: number; y: number };
+      storage_mode?: 'worktree' | 'clone';
+      clone_depth?: number;
+    },
+    // Teammate creation composes this with its own success toast, so it opts out
+    // of the generic "Branch created" message to avoid a misleading double toast.
+    options: { silent?: boolean } = {}
+  ): Promise<Branch | null> => {
+    if (!client) return null;
+    try {
+      showLoading('Creating branch...', { key: 'create-branch' });
+
+      const branch = (await client.service(`repos/${repoId}/branches`).create({
+        name: data.name,
+        ref: data.ref,
+        refType: data.refType,
+        createBranch: data.createBranch,
+        pullLatest: data.pullLatest, // Fetch latest from remote before creating
+        sourceBranch: data.sourceBranch, // Base new branch on specified source branch
+        sourceRemoteUrl: data.sourceRemoteUrl, // Qualify a cross-repository base ref
+        issue_url: data.issue_url,
+        pull_request_url: data.pull_request_url,
+        boardId: data.boardId, // Optional: add to board
+        custom_context: data.custom_context,
+        notes: data.notes,
+        position: data.position, // Optional: position on board (defaults to center of viewport)
+        storage_mode: data.storage_mode,
+        clone_depth: data.clone_depth,
+      })) as Branch;
+
+      // Branch appears on the board via WebSocket broadcast; confirm the action
+      // (silent for composed flows like teammate creation, which toast their own).
+      if (options.silent) {
+        destroy('create-branch');
+      } else {
+        showSuccess('Branch created successfully!', { key: 'create-branch' });
+      }
+      return branch;
+    } catch (error) {
+      showError(formatActionError('create the branch', error, { idempotent: false }), {
+        key: 'create-branch',
+      });
+      return null;
+    }
+  };
+
+  // Handle environment control
+  const handleStartEnvironment = async (branchId: string) => {
+    if (!client) {
+      showError(notConnectedMessage('start the environment'));
+      return;
+    }
+    const key = `start-env-${branchId}`;
+    try {
+      pendingEnvironmentToastsRef.current.set(branchId, {
+        action: 'start',
+        key,
+        previousAttemptId: previousEnvironmentAttemptId(branchId),
+      });
+      showLoading('Starting the environment…', { key });
+      if (!(await startEnvironmentWithConfirmation(branchId))) {
+        pendingEnvironmentToastsRef.current.delete(branchId);
+        destroy(key);
+        return;
+      }
+      showInfo('Starting the environment…', { key });
+    } catch (error) {
+      pendingEnvironmentToastsRef.current.delete(branchId);
+      showError(formatActionError('start the environment', error, { idempotent: false }), {
+        key,
+      });
+    }
+  };
+
+  const handleStopEnvironment = async (branchId: string) => {
+    if (!client) {
+      showError(notConnectedMessage('stop the environment'));
+      return;
+    }
+    const key = `stop-env-${branchId}`;
+    try {
+      pendingEnvironmentToastsRef.current.set(branchId, {
+        action: 'stop',
+        key,
+        previousAttemptId: previousEnvironmentAttemptId(branchId),
+      });
+      showLoading('Stopping the environment…', { key });
+      await client.service(`branches/${branchId}/stop`).create({});
+      showInfo('Stopping the environment…', { key });
+    } catch (error) {
+      pendingEnvironmentToastsRef.current.delete(branchId);
+      showError(formatActionError('stop the environment', error, { idempotent: true }), {
+        key,
+      });
+    }
+  };
+
+  const handleNukeEnvironment = async (branchId: string) => {
+    if (!client) {
+      showError(notConnectedMessage('nuke the environment'));
+      return;
+    }
+    const key = `nuke-env-${branchId}`;
+    try {
+      pendingEnvironmentToastsRef.current.set(branchId, {
+        action: 'nuke',
+        key,
+        previousAttemptId: previousEnvironmentAttemptId(branchId),
+      });
+      showLoading('Nuking the environment…', { key });
+      await client.service(`branches/${branchId}/nuke`).create({});
+      showInfo('Nuking the environment…', { key });
+    } catch (error) {
+      pendingEnvironmentToastsRef.current.delete(branchId);
+      showError(formatActionError('nuke the environment', error, { idempotent: true }), {
+        key,
+      });
+    }
+  };
+
+  // Manually trigger a scheduled run for a branch (execute-now).
+  // Reuses the scheduler's spawn path server-side so the session is a
+  // first-class scheduled session, just with triggered_manually=true.
+  const handleExecuteScheduleNow = async (branchId: string) => {
+    if (!client) return;
+    try {
+      showLoading('Starting scheduled run...', { key: 'execute-now' });
+      await client.service(`branches/${branchId}/execute-schedule-now`).create({});
+      showSuccess('Scheduled run started!', { key: 'execute-now' });
+    } catch (error) {
+      // Surface 409 (schedule_busy) and 400 (schedule_disabled/incomplete)
+      // with the server-provided message — it's already user-facing.
+      const msg = error instanceof Error ? error.message : String(error);
+      showError(`Failed to start scheduled run: ${msg}`, { key: 'execute-now' });
+      throw error;
+    }
+  };
+
+  // Handle MCP server CRUD
+  const handleDeleteMCPServer = async (serverId: string, shouldApply?: () => boolean) => {
+    if (!client || (shouldApply && !shouldApply())) return;
+    try {
+      await client.service('mcp-servers').remove(serverId);
+      if (shouldApply && !shouldApply()) return;
+      showSuccess('MCP server deleted.');
+    } catch (error) {
+      if (shouldApply && !shouldApply()) return;
+      showError(formatActionError('delete the MCP server', error, { idempotent: true }));
+    }
+  };
+
+  // Handle gateway channel CRUD
+  const handleCreateGatewayChannel = async (data: GatewayChannelCreateData) => {
+    if (!client) return;
+    try {
+      await client.service('gateway-channels').create(data);
+      showSuccess('Channel created.');
+    } catch (error) {
+      showError(formatActionError('create the channel', error, { idempotent: false }));
+    }
+  };
+
+  const handleUpdateGatewayChannel = async (
+    channelId: string,
+    updates: GatewayChannelPatchData,
+    shouldApply?: () => boolean
+  ) => {
+    if (shouldApply && !shouldApply()) return;
+    // The form stays open and shows the not-connected copy.
+    if (!client) throw new Error(CLIENT_NOT_CONNECTED_ERROR);
+    try {
+      await client.service('gateway-channels').patch(channelId, updates);
+      if (shouldApply && !shouldApply()) return;
+      showSuccess('Channel saved.');
+    } catch (error) {
+      if (shouldApply && !shouldApply()) return;
+      // The form keeps its edits and shows why (GatewayChannelsTable).
+      throw error;
+    }
+  };
+
+  const handleDeleteGatewayChannel = async (channelId: string, shouldApply?: () => boolean) => {
+    if (!client || (shouldApply && !shouldApply())) return;
+    try {
+      await client.service('gateway-channels').remove(channelId);
+      if (shouldApply && !shouldApply()) return;
+      showSuccess('Channel deleted.');
+    } catch (error) {
+      if (shouldApply && !shouldApply()) return;
+      showError(formatActionError('delete the channel', error, { idempotent: true }));
+    }
+  };
+
+  // Handle artifact CRUD (edit + delete only — creation via MCP tools)
+  const handleUpdateArtifact = async (artifactId: string, updates: Partial<Artifact>) => {
+    if (!client) return;
+    try {
+      await client.service('artifacts').patch(artifactId, updates);
+      showSuccess('Artifact updated.');
+    } catch (error) {
+      showError(formatActionError('update the artifact', error, { idempotent: true }));
+    }
+  };
+
+  const handleDeleteArtifact = async (artifactId: string) => {
+    if (!client) return;
+    try {
+      await client.service('artifacts').remove(artifactId);
+      showSuccess('Artifact deleted.');
+    } catch (error) {
+      showError(formatActionError('delete the artifact', error, { idempotent: true }));
+    }
+  };
+
+  // Handle update session env var selections (session-scope vars to export to
+  // the executor process). Only the session's creator or an admin can edit these.
+  const handleUpdateSessionEnvSelections = async (sessionId: string, envVarNames: string[]) => {
+    if (!client) return;
+    try {
+      await client.service(`sessions/${sessionId}/env-selections`).patch(null, {
+        envVarNames,
+      });
+    } catch (error) {
+      showError(
+        formatActionError("update the session's environment variables", error, {
+          idempotent: true,
+        })
+      );
+    }
+  };
+
+  // Handle update session-MCP server relationships
+  const handleUpdateSessionMcpServers = async (
+    sessionId: string,
+    mcpServerIds: string[],
+    baselineIds?: string[]
+  ) => {
+    if (!client) return;
+
+    try {
+      // Diff against the links the user was shown (the settings form's
+      // baseline), never against links that loaded after they last looked.
+      const currentIds =
+        baselineIds ?? agorStore.getState().sessionMcpServerIds.get(sessionId) ?? [];
+      await updateSessionMcpServers(client, sessionId, currentIds, mcpServerIds);
+
+      // Note: Don't show success message here - it's part of the session settings save
+      // The main "Session updated" message will appear from handleUpdateSession
+    } catch (error) {
+      showError(formatActionError('update MCP servers', error, { idempotent: true }));
+    }
+  };
+
+  // Handle board comments
+  const handleSendComment = async (boardId: string, content: string) => {
+    if (!client) return;
+    try {
+      await client.service('board-comments').create({
+        board_id: boardId,
+        content,
+      });
+    } catch (error) {
+      showError(formatActionError('post the comment', error, { idempotent: false }));
+    }
+  };
+
+  const handleResolveComment = async (commentId: string) => {
+    if (!client) return;
+    const resolved = !agorStore.getState().commentById.get(commentId)?.resolved;
+    try {
+      await client.service('board-comments').patch(commentId, { resolved });
+    } catch (error) {
+      showError(
+        formatActionError(resolved ? 'resolve the comment' : 'reopen the comment', error, {
+          idempotent: true,
+        })
+      );
+    }
+  };
+
+  const handleDeleteComment = async (commentId: string) => {
+    if (!client) return;
+    try {
+      await client.service('board-comments').remove(commentId);
+      showSuccess('Comment deleted.');
+    } catch (error) {
+      showError(formatActionError('delete the comment', error, { idempotent: true }));
+    }
+  };
+
+  const handleReplyComment = async (parentId: string, content: string) => {
+    if (!client) return;
+    try {
+      // Use the custom route for creating replies
+      await client.service(`board-comments/${parentId}/reply`).create({
+        content,
+      });
+    } catch (error) {
+      showError(formatActionError('post the reply', error, { idempotent: false }));
+    }
+  };
+
+  const handleToggleReaction = async (commentId: string, emoji: string) => {
+    if (!client) return;
+    try {
+      // Use the custom route for toggling reactions
+      // The server derives the reactor from the authenticated session; do not
+      // send a client user_id (it is ignored).
+      await client.service(`board-comments/${commentId}/toggle-reaction`).create({
+        emoji,
+      });
+    } catch (error) {
+      showError(formatActionError('update your reaction', error, { idempotent: false }));
+    }
+  };
+
+  // Modal close handlers
+  const handleSettingsClose = () => {
+    setSettingsTabToOpen(null);
+  };
+
+  const handleUserSettingsClose = () => {
+    setOpenUserSettings(false);
+    setUserSettingsInitialTab(undefined);
+  };
+
+  const handleNewBranchModalClose = () => {
+    setOpenNewBranch(false);
+  };
+
+  const knowledgePageElement = (
+    <KnowledgePage
+      client={client}
+      currentUser={currentUser}
+      onUserSettingsClick={() => setOpenUserSettings(true)}
+      onLogout={logout}
+      externalAppLink={headerInstanceConfig?.externalAppLink}
+      externalAppLabel={headerInstanceConfig?.externalAppLabel}
+    />
+  );
+
+  const artifactFullscreenElement = (
+    <ArtifactFullscreenPage
+      client={client}
+      currentUser={currentUser}
+      onUserSettingsClick={() => setOpenUserSettings(true)}
+      onLogout={logout}
+      externalAppLink={headerInstanceConfig?.externalAppLink}
+      externalAppLabel={headerInstanceConfig?.externalAppLabel}
+    />
+  );
+
+  const mcpRecoveryElement = <MCPSlackRecoveryPage client={client} />;
+
+  const mcpConnectElement = <MCPOAuthConnectPage client={client} />;
+
+  const mcpOAuthReturnElement = <MCPOAuthReturnPage client={client} />;
+
+  const cliLoginElement = (
+    <CLILoginPage
+      client={client}
+      currentUserId={currentUser?.user_id ?? null}
+      currentUserEmail={currentUser?.email ?? null}
+    />
+  );
+
+  // The post-onboarding connect-AI / integrations banners. Shared verbatim by
+  // both shells so the mobile Home surfaces "AI not connected" proactively
+  // (desktop already shows it above its app content).
+  const onboardingBanners = (
+    <OnboardingBanners
+      authenticationGeneration={authenticationGeneration}
+      user={currentUser}
+      mcpServerCount={mcpServerCount}
+      gatewayChannelCount={gatewayChannelCount}
+      integrationsHydrated={integrationsHydrated}
+      canManageMcp={canManageMcp}
+      onOpenUserSettings={(tab) => {
+        setUserSettingsInitialTab(tab);
+        setOpenUserSettings(true);
+      }}
+      onOpenWorkspaceSettings={(tab) => setSettingsTabToOpen(tab)}
+      onCheckAuth={handleCheckAuth}
+      credentialVersion={credentialVersion}
+      connectionReady={connected && !connecting}
+    />
+  );
+
+  // All desktop entity URLs (/b/, /s/, /w/, /a/) render the same
+  // AgorApp — the multiple routes exist so react-router's useParams
+  // (read inside useUrlState) populates the right named params for
+  // each URL shape (board / session / branch / artifact). Extract
+  // the element once instead of duplicating the (long) prop list.
+  const desktopAppElement = (
+    <AgorApp
+      client={client}
+      user={currentUser}
+      authenticationGeneration={authenticationGeneration}
+      isAuthenticationGenerationCurrent={isAuthenticationGenerationCurrent}
+      connected={connected}
+      connecting={connecting}
+      availableAgents={AVAILABLE_AGENTS}
+      openSettingsTab={settingsTabToOpen}
+      onSettingsClose={handleSettingsClose}
+      openUserSettings={openUserSettings}
+      initialUserSettingsTab={userSettingsInitialTab}
+      onUserSettingsClose={handleUserSettingsClose}
+      openNewBranchModal={openNewBranch}
+      onNewBranchModalClose={handleNewBranchModalClose}
+      suppressLeftPanel={onboardingWizardOpen}
+      topBanner={onboardingBanners}
+      onCreateSession={handleCreateSession}
+      onForkSession={handleForkSession}
+      onBtwForkSession={handleBtwForkSession}
+      onSpawnSession={handleSpawnSession}
+      onSendPrompt={handleSendPrompt}
+      onUpdateSession={handleUpdateSession}
+      onDeleteSession={handleDeleteSession}
+      onCreateBoard={handleCreateBoard}
+      onUpdateBoard={handleUpdateBoard}
+      onDeleteBoard={handleDeleteBoard}
+      onArchiveBoard={handleArchiveBoard}
+      onUnarchiveBoard={handleUnarchiveBoard}
+      onCreateRepo={handleCreateRepo}
+      onCreateLocalRepo={handleCreateLocalRepo}
+      onUpdateRepo={handleUpdateRepo}
+      onDeleteRepo={handleDeleteRepo}
+      onArchiveOrDeleteBranch={handleArchiveOrDeleteBranch}
+      onUnarchiveBranch={handleUnarchiveBranch}
+      onUpdateBranch={handleUpdateBranch}
+      onCreateBranch={handleCreateBranch}
+      onStartEnvironment={handleStartEnvironment}
+      onStopEnvironment={handleStopEnvironment}
+      onNukeEnvironment={handleNukeEnvironment}
+      onExecuteScheduleNow={handleExecuteScheduleNow}
+      onCreateUser={handleCreateUser}
+      onUpdateUser={handleUpdateUserFromSettings}
+      onRefreshCurrentUser={refreshCurrentUserForAuthorityCycle}
+      onDeleteUser={handleDeleteUser}
+      onDeleteMCPServer={handleDeleteMCPServer}
+      onCreateGatewayChannel={handleCreateGatewayChannel}
+      onUpdateGatewayChannel={handleUpdateGatewayChannel}
+      onDeleteGatewayChannel={handleDeleteGatewayChannel}
+      onUpdateArtifact={handleUpdateArtifact}
+      onDeleteArtifact={handleDeleteArtifact}
+      onUpdateSessionMcpServers={handleUpdateSessionMcpServers}
+      onUpdateSessionEnvSelections={handleUpdateSessionEnvSelections}
+      onSendComment={handleSendComment}
+      onReplyComment={handleReplyComment}
+      onResolveComment={handleResolveComment}
+      onToggleReaction={handleToggleReaction}
+      onDeleteComment={handleDeleteComment}
+      onLogout={logout}
+      onRetryConnection={retryConnection}
+      instanceLabel={headerInstanceConfig?.label}
+      instanceDescription={headerInstanceConfig?.description}
+      externalAppLink={headerInstanceConfig?.externalAppLink}
+      externalAppLabel={headerInstanceConfig?.externalAppLabel}
+      webTerminalEnabled={featuresConfig?.webTerminal === true}
+      branchStorageConfig={featuresConfig?.branchStorage}
+      uploadPolicy={featuresConfig?.uploadPolicy}
+      onReopenOnboarding={canRunOnboarding ? handleReopenOnboarding : undefined}
+    />
+  );
+
+  // Render main app
+  return (
+    <ConnectionProvider value={connectionContextValue}>
+      <MCPCatalogModalProvider
+        key={`${currentUser?.user_id ?? 'anonymous'}:${currentUser?.role ?? 'none'}`}
+      >
+        <MCPCatalogModalHost
+          client={client}
+          connected={connected}
+          connecting={connecting}
+          authGeneration={authGeneration}
+          currentUser={currentUser}
+        />
+        {/* Force Password Change Modal - shown when user.must_change_password is true */}
+        <ForcePasswordChangeModal
+          open={!!currentUser?.must_change_password && passwordWriteAvailable}
+          user={currentUser}
+          onChangePassword={handleForcePasswordChange}
+          onLogout={logout}
+        />
+
+        {/* Shared/current-user settings for lightweight surfaces. The full
+            Workspace App still owns its existing settings stack; this wrapper
+            lets Knowledge expose the user menu without mounting Workspace. */}
+        {sharedSurfaceOwnsUserSettings && (
+          <SharedUserSettingsModal
+            open={openUserSettings}
+            onClose={() => {
+              setOpenUserSettings(false);
+              setUserSettingsInitialTab(undefined);
+            }}
+            user={currentUser}
+            client={client}
+            onUpdateUser={handleUpdateUserFromSettings}
+            onRefreshCurrentUser={refreshCurrentUserForAuthorityCycle}
+            onReopenOnboarding={canRunOnboarding ? handleReopenOnboarding : undefined}
+            initialTab={userSettingsInitialTab}
+          />
+        )}
+
+        {isMobileShellPath(location.pathname) && (
+          <SettingsModal
+            open={settingsTabToOpen !== null}
+            onClose={handleSettingsClose}
+            client={client}
+            currentUser={currentUser}
+            activeTab={settingsTabToOpen ?? 'boards'}
+            onTabChange={setSettingsTabToOpen}
+            onCreateBoard={handleCreateBoard}
+            onUpdateBoard={handleUpdateBoard}
+            onDeleteBoard={handleDeleteBoard}
+            onArchiveBoard={handleArchiveBoard}
+            onUnarchiveBoard={handleUnarchiveBoard}
+            onCreateRepo={(data, shouldApply) => handleCreateRepo(data, { shouldApply })}
+            onCreateLocalRepo={handleCreateLocalRepo}
+            onUpdateRepo={handleUpdateRepo}
+            onDeleteRepo={handleDeleteRepo}
+            onArchiveOrDeleteBranch={handleArchiveOrDeleteBranch}
+            onUnarchiveBranch={handleUnarchiveBranch}
+            onUpdateBranch={handleUpdateBranch}
+            onCreateBranch={handleCreateBranch}
+            onStartEnvironment={handleStartEnvironment}
+            onStopEnvironment={handleStopEnvironment}
+            onCreateUser={handleCreateUser}
+            onUpdateUser={handleUpdateUserFromSettings}
+            onDeleteUser={handleDeleteUser}
+            onDeleteMCPServer={handleDeleteMCPServer}
+            onCreateGatewayChannel={handleCreateGatewayChannel}
+            onUpdateGatewayChannel={handleUpdateGatewayChannel}
+            onDeleteGatewayChannel={handleDeleteGatewayChannel}
+            onUpdateArtifact={handleUpdateArtifact}
+            onDeleteArtifact={handleDeleteArtifact}
+            // As on desktop: member-only; close Settings, then the shared create-teammate flow (owned by MobileApp).
+            onCreateTeammate={
+              hasMinimumRole(currentUser?.role, ROLES.MEMBER)
+                ? () => {
+                    handleSettingsClose();
+                    requestShellPicker(OPEN_CREATE_FLOW_EVENT, 'teammate');
+                  }
+                : undefined
+            }
+            branchStorageConfig={featuresConfig?.branchStorage}
+          />
+        )}
+
+        {/* Onboarding Wizard - shown for new users. Both visibility and local
+            React state belong to one authenticated generation, not merely a
+            user ID. Logout/login as the same user and principal changes both
+            invalidate the old wizard and any pending completion work. */}
+        <ConfigProvider theme={ONBOARDING_DARK_THEME}>
+          <OnboardingWizard
+            key={`${onboardingWizardOwner?.userId ?? '__anon__'}:${onboardingWizardOwner?.authenticationGeneration ?? authenticationGeneration}:${onboardingWizardOwner?.activationGeneration ?? 0}`}
+            open={onboardingWizardOpen}
+            repositorySetupNotice={frameworkSetup.error}
+            isCurrent={() =>
+              !!onboardingWizardOwner && isOnboardingOwnerCurrent(onboardingWizardOwner)
+            }
+            onComplete={(result, attempt) => {
+              if (!onboardingWizardOwner || !isOnboardingOwnerCurrent(onboardingWizardOwner))
+                return;
+              return handleOnboardingComplete(
+                onboardingWizardOwner,
+                result,
+                attempt.isCurrent
+              ).then(() => undefined);
+            }}
+            onDismiss={(progress) => {
+              if (!onboardingWizardOwner || !isOnboardingOwnerCurrent(onboardingWizardOwner))
+                return;
+              handleOnboardingDismiss(onboardingWizardOwner, progress);
+            }}
+            user={currentUser}
+            client={client}
+            allowClaudeOAuthSignIn={featuresConfig?.claudeSubscriptionOAuth === true}
+            claudeOAuthCapability={featuresConfig?.claudeOAuthCapability}
+            onUpdateUser={async (userId, updates) => {
+              if (
+                !onboardingWizardOwner ||
+                userId !== onboardingWizardOwner.userId ||
+                !isOnboardingOwnerCurrent(onboardingWizardOwner)
+              ) {
+                return;
+              }
+              const wizardWrite = handleUpdateUser(userId, updates, { silent: true });
+              onboardingWizardWriteRef.current = {
+                owner: onboardingWizardOwner,
+                promise: wizardWrite,
+              };
+              try {
+                await wizardWrite;
+              } finally {
+                if (onboardingWizardWriteRef.current?.promise === wizardWrite) {
+                  onboardingWizardWriteRef.current = null;
+                }
+              }
+            }}
+            onCheckAuth={async (tool, apiKey) => {
+              if (!onboardingWizardOwner || !isOnboardingOwnerCurrent(onboardingWizardOwner)) {
+                return { status: 'unknown', authenticated: false, method: 'none' };
+              }
+              const result = await handleCheckAuth(tool, apiKey);
+              return isOnboardingOwnerCurrent(onboardingWizardOwner)
+                ? result
+                : { status: 'unknown', authenticated: false, method: 'none' };
+            }}
+          />
+        </ConfigProvider>
+
+        <DeviceRouter />
+        <Suspense fallback={routeFallback}>
+          <Routes>
+            {/* Demo routes */}
+            <Route path="/demo/streamdown" element={<StreamdownDemoPage />} />
+            <Route path="/demo/marketing-screenshots" element={<MarketingScreenshotPage />} />
+            <Route path="/demo/marketing-video" element={<MarketingVideoPage />} />
+
+            {/* Knowledge route shell. `/kb` is a short alias for the same surface. */}
+            {KNOWLEDGE_ROUTE_PATHS.map((path) => (
+              <Route key={path} path={path} element={knowledgePageElement} />
+            ))}
+
+            {MCP_RECOVERY_ROUTE_PATHS.map((path) => (
+              <Route key={path} path={path} element={mcpRecoveryElement} />
+            ))}
+
+            {MCP_CONNECT_ROUTE_PATHS.map((path) => (
+              <Route key={path} path={path} element={mcpConnectElement} />
+            ))}
+
+            {MCP_OAUTH_RETURN_ROUTE_PATHS.map((path) => (
+              <Route key={path} path={path} element={mcpOAuthReturnElement} />
+            ))}
+
+            {CLI_LOGIN_ROUTE_PATHS.map((path) => (
+              <Route key={path} path={path} element={cliLoginElement} />
+            ))}
+
+            {/* Lightweight artifact fullscreen surface. Uses the shared auth shell,
+                but does not start the Workspace board/session store on fresh loads. */}
+            {ARTIFACT_FULLSCREEN_ROUTE_PATHS.map((path) => (
+              <Route key={path} path={path} element={artifactFullscreenElement} />
+            ))}
+
+            {/* Mobile routes */}
+            <Route
+              path="/m/*"
+              element={
+                <MobileApp
+                  client={client}
+                  user={user}
+                  authGeneration={authenticationGeneration}
+                  isAuthenticationGenerationCurrent={isAuthenticationGenerationCurrent}
+                  topBanner={onboardingBanners}
+                  onSendPrompt={handleSendPrompt}
+                  onCreateSession={handleCreateSession}
+                  onCreateBranch={handleCreateBranch}
+                  onCreateBoard={handleCreateBoard}
+                  onCreateRepo={handleCreateRepo}
+                  onCreateLocalRepo={handleCreateLocalRepo}
+                  branchStorageConfig={featuresConfig?.branchStorage}
+                  onForkSession={handleForkSession}
+                  onBtwForkSession={handleBtwForkSession}
+                  onSpawnSession={handleSpawnSession}
+                  onUpdateSession={handleUpdateSession}
+                  onDeleteSession={handleDeleteSession}
+                  onUpdateSessionMcpServers={handleUpdateSessionMcpServers}
+                  onUpdateSessionEnvSelections={handleUpdateSessionEnvSelections}
+                  onSendComment={handleSendComment}
+                  onReplyComment={handleReplyComment}
+                  onResolveComment={handleResolveComment}
+                  onToggleReaction={handleToggleReaction}
+                  onDeleteComment={handleDeleteComment}
+                  onLogout={logout}
+                  onRetryConnection={retryConnection}
+                  externalAppLink={headerInstanceConfig?.externalAppLink}
+                  externalAppLabel={headerInstanceConfig?.externalAppLabel}
+                  onOpenWorkspaceSettings={setSettingsTabToOpen}
+                  onOpenUserSettings={() => setOpenUserSettings(true)}
+                  onOpenAgenticToolSettings={(tool) => {
+                    setUserSettingsInitialTab(tool);
+                    setOpenUserSettings(true);
+                  }}
+                  onUpdateBranch={handleUpdateBranch}
+                  onUpdateRepo={handleUpdateRepo}
+                  onArchiveOrDeleteBranch={handleArchiveOrDeleteBranch}
+                  onExecuteScheduleNow={handleExecuteScheduleNow}
+                  onUpdateBoard={handleUpdateBoard}
+                />
+              }
+            />
+
+            {/* Desktop routes — flat entity URLs. Boards have their own
+                path because they're a destination; sub-entities (session,
+                branch, artifact) get top-level paths keyed by short ID
+                so they're stable across board moves. The app resolves the
+                entity at click time, looks up its current board, and
+                switches if needed. Path segments come from the shared
+                `ENTITY_PATH_SEGMENTS` constant so this list and the
+                URL/path builders can't drift. See
+                `packages/core/src/utils/url.ts`. */}
+            <Route
+              path={`/${ENTITY_PATH_SEGMENTS.board}/:boardParam/`}
+              element={desktopAppElement}
+            />
+            <Route
+              path={`/${ENTITY_PATH_SEGMENTS.session}/:sessionShortId/`}
+              element={desktopAppElement}
+            />
+            <Route
+              path={`/${ENTITY_PATH_SEGMENTS.branch}/:branchShortId/`}
+              element={desktopAppElement}
+            />
+            <Route
+              path={`/${ENTITY_PATH_SEGMENTS.artifact}/:artifactShortId/`}
+              element={desktopAppElement}
+            />
+
+            {/* Fallback for unknown / root paths */}
+            <Route path="/*" element={desktopAppElement} />
+          </Routes>
+        </Suspense>
+      </MCPCatalogModalProvider>
+    </ConnectionProvider>
+  );
+}
+
+function AppWrapper() {
+  const { getCurrentThemeConfig } = useTheme();
+  const location = useLocation();
+  const isMarketingScreenshotRoute = location.pathname === '/demo/marketing-screenshots';
+  const isMarketingVideoRoute = location.pathname === '/demo/marketing-video';
+  const isRbacPolicyPrototypeRoute =
+    import.meta.env.DEV && location.pathname === RBAC_POLICY_PROTOTYPE_ROUTE_PATH;
+
+  return (
+    <ConfigProvider theme={getCurrentThemeConfig()}>
+      <TouchTooltipConfig>
+        <StreamdownPortalApp>
+          <ErrorBoundary variant="global">
+            {/* CanvasNavigationProvider lives outside the agor `App` body so
+              hooks called in that body (useUrlState, useAppNavigation) can
+              read the canvas-nav context. The inner App component used to
+              wrap its own JSX in this provider; that's been removed. */}
+            <CanvasNavigationProvider>
+              {isMarketingScreenshotRoute ? (
+                <Suspense fallback={<InitialLoadingScreen message="Loading demo fixture…" />}>
+                  <MarketingScreenshotPage />
+                </Suspense>
+              ) : isMarketingVideoRoute ? (
+                <Suspense fallback={<InitialLoadingScreen message="Loading demo fixture…" />}>
+                  <MarketingVideoPage />
+                </Suspense>
+              ) : isRbacPolicyPrototypeRoute && RbacPolicyPrototypePage ? (
+                <Suspense fallback={<InitialLoadingScreen message="Loading RBAC prototype…" />}>
+                  <RbacPolicyPrototypePage />
+                </Suspense>
+              ) : (
+                <AppContent />
+              )}
+            </CanvasNavigationProvider>
+          </ErrorBoundary>
+        </StreamdownPortalApp>
+      </TouchTooltipConfig>
+    </ConfigProvider>
+  );
+}
+
+function App() {
+  // Determine base path: '/ui' in production (served by daemon at that prefix)
+  // and for branch-dev direct canonical links; '' for normal root-mounted Vite.
+  const basename = getRouterBasename();
+
+  return (
+    <BrowserRouter basename={basename}>
+      <ThemeProvider>
+        <AppWrapper />
+      </ThemeProvider>
+    </BrowserRouter>
+  );
+}
+
+export default App;

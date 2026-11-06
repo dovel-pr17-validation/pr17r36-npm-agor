@@ -1,0 +1,3212 @@
+import type { AgorClient, Message, Session, SessionPromptOptions, Task } from '@agor/core/client';
+import {
+  InputRequestStatus,
+  isTaskExecuting,
+  isTerminalTaskStatus,
+  leanMessage,
+  MESSAGE_PAGINATION,
+  PAGINATION,
+  PermissionStatus,
+  TASK_PAGINATION,
+  TaskStatus,
+} from '@agor/core/client';
+
+export type TaskHydrationMode = 'none' | 'lazy' | 'eager' | 'lean';
+/** A lean history read: first page or resync, an older page, or the missing suffix. */
+type LeanRead = 'sync' | 'older' | 'suffix';
+
+/** POC task page, not a byte limit: an individual turn may still be large. */
+export const LEAN_TRANSCRIPT_TASK_PAGE_SIZE = 10;
+/**
+ * Lean mode keeps full detail (tool payloads, reasoning) for this many recently
+ * loaded or live turns, plus the latest, executing and pinned turns.
+ */
+export const LEAN_TRANSCRIPT_DETAIL_RETENTION_COUNT = 10;
+/**
+ * Lean conversation: the most turns trimOlderTasks() keeps loaded for a reader
+ * parked at the latest turns. Three pages: the detail-retained turns plus two
+ * pages of scrollback, so a reader who pages back once or twice and returns to
+ * the bottom keeps that history. A turn count, not a byte bound.
+ */
+export const LEAN_TRANSCRIPT_TASK_WINDOW = 3 * LEAN_TRANSCRIPT_TASK_PAGE_SIZE;
+/**
+ * Lean mode also evicts recent turns, oldest first, while the full detail it
+ * retains exceeds this many bytes (estimated as string code units: one byte
+ * each for the Latin-1 strings that dominate tool output). Ten ordinary turns
+ * stay far below it, so the count bound normally decides; this catches huge
+ * tool results. Latest, executing and pinned turns count toward it but are
+ * never evicted by it.
+ */
+export const LEAN_TRANSCRIPT_DETAIL_BYTE_BUDGET = 32 * 1024 * 1024;
+const isLeanActive = isTaskExecuting;
+// Attribution only for a bounded late-error delivery window; never retain payloads.
+const MAX_RETIRED_STREAM_IDENTITIES = 256;
+
+// Byte estimates, memoized per immutable message and per bucket array: a new
+// message is walked once, and a changed bucket only re-sums cached messages.
+const detailBytesOf = new WeakMap<object, number>();
+
+function stringBytes(value: unknown, depth = 0): number {
+  if (typeof value === 'string') return value.length;
+  if (!value || typeof value !== 'object' || depth > 32) return 0;
+  let bytes = 0;
+  for (const item of Array.isArray(value) ? value : Object.values(value))
+    bytes += stringBytes(item, depth + 1);
+  return bytes;
+}
+
+function bucketDetailBytes(messages: Message[] | undefined): number {
+  if (!messages) return 0;
+  let bytes = detailBytesOf.get(messages);
+  if (bytes !== undefined) return bytes;
+  bytes = 0;
+  for (const message of messages) {
+    let size = detailBytesOf.get(message);
+    if (size === undefined) {
+      size = stringBytes(message);
+      detailBytesOf.set(message, size);
+    }
+    bytes += size;
+  }
+  detailBytesOf.set(messages, bytes);
+  return bytes;
+}
+
+export interface ReactiveSessionOptions {
+  /**
+   * Message hydration policy:
+   * - none: do not auto-load task messages
+   * - lazy: load messages per task via loadTaskMessages() (default)
+   * - lean: POC, ten recent tasks with SQL-projected history and explicit details
+   * - eager: load all session messages during bootstrap
+   */
+  taskHydration?: TaskHydrationMode;
+  /** Preview owns only latest/active data, never the conversation reader's cache. */
+  cacheScope?: 'session' | 'preview';
+}
+
+export interface StreamingMessageState {
+  message_id: string;
+  session_id: string;
+  task_id?: string;
+  role: 'assistant';
+  content: string;
+  thinkingContent?: string;
+  timestamp: string;
+  isStreaming: boolean;
+  /** Text activity is independent of thinking when both share a message ID. */
+  isTextStreaming?: boolean;
+  isThinking?: boolean;
+  error?: string;
+}
+
+export interface ToolExecutionState {
+  toolUseId: string;
+  toolName: string;
+  status: 'executing' | 'complete';
+}
+
+/**
+ * The Session's latest context-window snapshot: a few fields of the newest
+ * turn that reported one, kept even after that turn leaves the lean
+ * transcript. Never the Task or its raw SDK response.
+ */
+export interface ReactiveContextWindow {
+  task_id: string;
+  computed_context_window: number;
+  model?: string;
+  duration_ms?: number;
+  normalized_sdk_response: NonNullable<Task['normalized_sdk_response']>;
+}
+
+/**
+ * Named collection aliases improve IntelliSense discoverability for nested session state.
+ */
+export type ReactiveMessagesByTask = Map<string, Message[]>;
+export type ReactiveStreamingMessagesById = Map<string, StreamingMessageState>;
+export type ReactiveToolsByTask = Map<string, ToolExecutionState[]>;
+export type ReactiveLoadedTaskIds = Set<string>;
+
+export interface ReactiveSessionState {
+  sessionId: string;
+  session: Session | null;
+  tasks: Task[];
+  messagesByTask: ReactiveMessagesByTask;
+  /**
+   * Queued tasks (status='queued'), ordered by queue_position ascending.
+   * As of never-lose-prompt §C the queue lives on tasks instead of messages,
+   * so this collection holds Task — not Message — and the wire format is the
+   * `/sessions/:id/tasks/queue` endpoint.
+   */
+  queuedTasks: Task[];
+  streamingMessages: ReactiveStreamingMessagesById;
+  toolsByTask: ReactiveToolsByTask;
+  loadedTaskIds: ReactiveLoadedTaskIds;
+  /** POC-only older-history cursor state. */
+  hasOlderTasks?: boolean;
+  /** Independent of which turns are loaded; see ReactiveContextWindow. */
+  latestContextWindow?: ReactiveContextWindow;
+  /**
+   * Lean conversation: the first loaded turn trimOlderTasks() must keep, with
+   * everything after it (running, pinned, or awaiting the reader). It changes
+   * when that protection is released, so a reader parked at the bottom can
+   * trim again without waiting for another turn.
+   */
+  firstProtectedTaskId?: string;
+  connected: boolean;
+  loading: boolean;
+  error: string | null;
+  /**
+   * `true` when `error` represents a non-recoverable condition for this
+   * session. Set when:
+   *
+   * - The server emits a `removed` event for this session (deleted /
+   *   archived out of view).
+   * - `resync()` fails with an HTTP **403** (forbidden — the user lost
+   *   access) or **404** (not found — session no longer exists from this
+   *   user's perspective).
+   *
+   * Callers driving auto-retry (visibilitychange, token refresh, manual
+   * Reload) MUST check this flag before calling `resync()` again,
+   * otherwise they will hammer a doomed endpoint on every focus change.
+   *
+   * Other failures — transient 401 (around-hook will refresh), 5xx, network
+   * drops — leave this `false` so the standard retry paths can heal them.
+   */
+  terminal: boolean;
+  lastSyncedAt: string | null;
+}
+
+type Listener = () => void;
+
+type MessageMutation =
+  | { sequence: number; kind: 'upsert'; message: Message }
+  | { sequence: number; kind: 'remove'; message: Message };
+
+type TaskMutation =
+  | { sequence: number; kind: 'upsert'; task: Task }
+  | { sequence: number; kind: 'remove'; task: Task };
+
+interface QueueFindResult {
+  data?: Task[];
+}
+
+interface ToolStartEvent {
+  task_id: string;
+  session_id: string;
+  tool_use_id: string;
+  tool_name: string;
+}
+
+interface ToolCompleteEvent {
+  task_id: string;
+  session_id: string;
+  tool_use_id: string;
+}
+
+interface StreamingStartEvent {
+  message_id: string;
+  session_id: string;
+  task_id?: string;
+  role: 'assistant';
+  timestamp: string;
+}
+
+interface StreamingChunkEvent {
+  task_id?: string;
+  message_id: string;
+  session_id: string;
+  chunk: string;
+}
+
+interface StreamingEndEvent {
+  task_id?: string;
+  message_id: string;
+  session_id: string;
+}
+
+interface StreamingErrorEvent {
+  task_id?: string;
+  message_id: string;
+  session_id: string;
+  error: string;
+}
+
+interface ThinkingStartEvent {
+  message_id: string;
+  session_id: string;
+  task_id?: string;
+  timestamp: string;
+}
+
+interface ThinkingChunkEvent {
+  task_id?: string;
+  message_id: string;
+  session_id: string;
+  chunk: string;
+}
+
+interface ThinkingEndEvent {
+  task_id?: string;
+  message_id: string;
+  session_id: string;
+}
+
+export class ReactiveSessionHandle {
+  private readonly client: AgorClient;
+  private readonly options: Required<ReactiveSessionOptions>;
+  private readonly listeners = new Set<Listener>();
+  private readonly disposeCallbacks: Array<() => void> = [];
+  private readyPromise: Promise<void>;
+  private disposed = false;
+  private messageMutationSequence = 0;
+  private messageFetchTokenSequence = 0;
+  // A DB snapshot and the realtime stream are two independently scheduled
+  // deliveries. Journal mutations only while a snapshot is in flight, then
+  // replay them over that snapshot so a late stale response cannot erase a
+  // message that was already observed live (or resurrect a removed one).
+  private readonly messageFetches = new Map<number, number>();
+  private readonly streamingAtMessageFetch = new Map<number, ReactiveStreamingMessagesById>();
+  private readonly messageMutations: MessageMutation[] = [];
+  // Loading and unloading are user-visible cache membership decisions, not
+  // Message mutations. Track them separately so a reconnect resync cannot
+  // commit an older membership snapshot over a concurrent expand/collapse.
+  private messageCacheMutationSequence = 0;
+  private readonly messageCacheMutationsByTask = new Map<string, number>();
+  private taskMutationSequence = 0;
+  private taskFetchTokenSequence = 0;
+  private readonly taskFetches = new Map<number, number>();
+  private readonly taskMutations: TaskMutation[] = [];
+  // Queue events are invalidations, not ordered row revisions: a delayed
+  // reorder can follow cancellation or a newer reorder from another daemon.
+  private queueInvalidation = 0;
+  private queueInflight: Promise<void> | null = null;
+  private queueSnapshot: Task[] = [];
+  private queueError: string | null = null;
+  private sessionMutationSequence = 0;
+  private leanConnectionGeneration = 0;
+  private leanOldestTaskId: string | undefined;
+  private leanSyncInflight: Promise<void> | null = null;
+  private readonly detailInflight = new Map<string, Promise<Message[]>>();
+  private readonly leanLiveTaskIds = new Set<string>();
+  // Lean detail retention: insertion-ordered recent turns, per-consumer pins,
+  // and the cached buckets that may still hold full (unprojected) messages.
+  private readonly recentDetailTaskIds = new Set<string>();
+  private readonly detailPins = new Map<string, number>();
+  private readonly detailTaskIds = new Set<string>();
+  // Memoized per Session.tasks array: display rank by Task ID.
+  private displayRanks: { order: readonly string[]; ranks: Map<string, number> } | undefined;
+  // Lean conversation history is read in one order, Session.tasks (display
+  // order), unless the daemon does not report that it lists every dispatched
+  // Task (`legacy`: Session.tasks_complete), or a later list stops extending
+  // the one the window placed. Undecided until the first page.
+  private leanOrder: 'display' | 'legacy' | undefined;
+  // Display order only. The loaded transcript is Session.tasks positions
+  // [start, …): older history is [0, start). `reconciled` ends the positions a
+  // history read has committed; reconnect loads every position after it. Live
+  // Session patches never advance it, only commits and trims.
+  private leanWindow: { start: number; reconciled: number } | undefined;
+  // Display order only: the longest Session.tasks list accepted so far. Every
+  // later list must extend it (or be an older prefix of it).
+  private leanBasis: readonly string[] | undefined;
+  // The next task-ID read starts a fresh cursor (display order was abandoned).
+  private leanCursorReset = false;
+  // A suffix invalidation arrived while a history read was in flight.
+  private leanSuffixInvalidated = false;
+  // Pins changed since firstProtectedTaskId was last computed.
+  private leanPinsChanged = false;
+  private retainedDetailBytes = 0;
+
+  /**
+   * The canonical (full-UUID) session id. When this handle was constructed with
+   * a short id / alias, incoming realtime events still carry the full UUID, so
+   * event matching must accept it too. Learned from the subscribe ack and from
+   * hydration (the fetched session row's `session_id` is always canonical); we
+   * deliberately do NOT overwrite `sessionId`, which echoes back what the
+   * caller passed (API calls resolve short ids server-side anyway).
+   */
+  private canonicalSessionId: string | null = null;
+
+  private stateSnapshot: ReactiveSessionState;
+  private readonly retiredStreamTasks = new Map<string, string>();
+  // One immutable task-array generation only; never a task/history journal.
+  private streamTaskIndex:
+    | {
+        tasks: Task[];
+        byId: Map<string, Task>;
+        terminalIds: Set<string>;
+        executingIds: Set<string>;
+        latestExecutingId?: string;
+        latestHydratableId?: string;
+      }
+    | undefined;
+
+  private indexStreamTasks(tasks: Task[]) {
+    if (this.streamTaskIndex?.tasks === tasks) return this.streamTaskIndex;
+    const byId = new Map<string, Task>();
+    const terminalIds = new Set<string>();
+    const executingIds = new Set<string>();
+    let latestExecutingId: string | undefined;
+    let latestHydratableId: string | undefined;
+    for (const task of tasks) {
+      byId.set(task.task_id, task);
+      if (isTerminalTaskStatus(task.status)) terminalIds.add(task.task_id);
+      if (isTaskExecuting(task)) {
+        executingIds.add(task.task_id);
+        latestExecutingId = task.task_id;
+      }
+      if (task.status !== TaskStatus.QUEUED) latestHydratableId = task.task_id;
+    }
+    this.streamTaskIndex = {
+      tasks,
+      byId,
+      terminalIds,
+      executingIds,
+      latestExecutingId,
+      latestHydratableId,
+    };
+    return this.streamTaskIndex;
+  }
+
+  constructor(client: AgorClient, sessionId: string, options?: ReactiveSessionOptions) {
+    this.client = client;
+    this.options = {
+      taskHydration: options?.taskHydration ?? 'lazy',
+      cacheScope: options?.cacheScope ?? 'session',
+    };
+    this.stateSnapshot = {
+      sessionId,
+      session: null,
+      tasks: [],
+      messagesByTask: new Map(),
+      queuedTasks: [],
+      streamingMessages: new Map(),
+      toolsByTask: new Map(),
+      loadedTaskIds: new Set(),
+      connected: !!client.io?.connected,
+      loading: true,
+      error: null,
+      terminal: false,
+      lastSyncedAt: null,
+    };
+
+    this.attachListeners();
+    // Retain the shared per-connection stream subscription for this session and
+    // AWAIT its ack BEFORE hydrating: a chunk arriving after the ack lands on
+    // top of hydrated state, and anything earlier is captured by the hydration
+    // itself — a viewer opening mid-stream can't fall into the gap where early
+    // chunks arrive with no streaming state and get dropped. Reconnects apply
+    // the same ordering via onSocketConnect (rooms are per-connection; a
+    // reconnect is a new one).
+    this.readyPromise = this.subscribeThenHydrate(
+      retainSessionStream(this.client, this.sessionId),
+      () => this.bootstrap()
+    );
+  }
+
+  /**
+   * Await the streaming subscription ack, then run the hydration step, so chunk
+   * delivery and state hydration can't interleave into a lost-update gap. Used
+   * on both attach (retain) and reconnect (re-subscribe) with the same ordering.
+   */
+  private async subscribeThenHydrate(
+    subscribed: Promise<void>,
+    hydrate: () => Promise<void>
+  ): Promise<void> {
+    try {
+      await subscribed;
+    } catch (error) {
+      if (this.options.taskHydration !== 'lean') throw error;
+      if (this.disposed) return;
+      this.updateState((prev) => ({
+        ...prev,
+        loading: false,
+        terminal: [403, 404].includes(errorStatusCode(error) ?? 0),
+        error: 'Could not subscribe to this conversation. Reload to retry.',
+        tasks: [],
+        messagesByTask: new Map(),
+        loadedTaskIds: new Set(),
+        streamingMessages: new Map(),
+      }));
+      return;
+    }
+    // Learn the canonical id from the ack so events (full-UUID) arriving before
+    // hydration completes already match — the mid-stream chunk case.
+    const canonical = getCanonicalSessionId(this.client, this.sessionId);
+    if (canonical) this.canonicalSessionId = canonical;
+    if (this.disposed) return;
+    await hydrate();
+  }
+
+  get sessionId(): string {
+    return this.stateSnapshot.sessionId;
+  }
+
+  /**
+   * True when a realtime event's session id belongs to this handle — matching
+   * either the id the caller requested or the canonical id learned from the
+   * subscribe ack / hydration. Events always carry the canonical (full-UUID)
+   * id, so a short-id handle relies on the canonical match.
+   */
+  private matchesSession(id: string): boolean {
+    if (this.options.taskHydration === 'lean' && (this.disposed || this.stateSnapshot.terminal))
+      return false;
+    return id === this.sessionId || id === this.canonicalSessionId;
+  }
+
+  get state(): ReactiveSessionState {
+    return this.stateSnapshot;
+  }
+
+  /**
+   * Returns the task model for a task id if currently known in state.
+   */
+  getTask(taskId: string): Task | undefined {
+    return this.stateSnapshot.tasks.find((task) => task.task_id === taskId);
+  }
+
+  /**
+   * Returns task messages currently cached in reactive state.
+   * This does not trigger hydration. Use loadTaskMessages() first in lazy mode.
+   */
+  getTaskMessages(taskId: string): readonly Message[] {
+    return this.stateSnapshot.messagesByTask.get(taskId) || [];
+  }
+
+  /**
+   * Returns whether a task's messages are currently hydrated in state.
+   */
+  isTaskLoaded(taskId: string): boolean {
+    return this.stateSnapshot.loadedTaskIds.has(taskId);
+  }
+
+  /**
+   * Lean mode diagnostics: approximate bytes of cached messages in the turns
+   * that may hold full detail, as charged against
+   * {@link LEAN_TRANSCRIPT_DETAIL_BYTE_BUDGET}.
+   */
+  getRetainedDetailBytes(): number {
+    return this.retainedDetailBytes;
+  }
+
+  /**
+   * Returns tool executions currently tracked for a task.
+   */
+  getTaskTools(taskId: string): readonly ToolExecutionState[] {
+    return this.stateSnapshot.toolsByTask.get(taskId) || [];
+  }
+
+  /**
+   * Returns one streaming message by message id, if present.
+   */
+  getStreamingMessage(messageId: string): StreamingMessageState | undefined {
+    return this.stateSnapshot.streamingMessages.get(messageId);
+  }
+
+  /**
+   * Returns currently tracked streaming messages. Optionally filter by task.
+   */
+  getStreamingMessages(taskId?: string): StreamingMessageState[] {
+    const messages = Array.from(this.stateSnapshot.streamingMessages.values());
+    return taskId ? messages.filter((message) => message.task_id === taskId) : messages;
+  }
+
+  subscribe(listener: Listener): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  async ready(): Promise<void> {
+    await this.readyPromise;
+  }
+
+  async prompt(prompt: string, options?: SessionPromptOptions): Promise<Task> {
+    return this.client.sessions.prompt(this.sessionId, prompt, options);
+  }
+
+  loadTaskMessages(taskId: string): Promise<Message[]> {
+    if (this.options.taskHydration !== 'lean') return this.loadTaskMessagesOnce(taskId);
+    const existing = this.detailInflight.get(taskId);
+    if (existing) return existing;
+    const promise = this.loadTaskMessagesOnce(taskId).finally(() => {
+      if (this.detailInflight.get(taskId) === promise) this.detailInflight.delete(taskId);
+    });
+    this.detailInflight.set(taskId, promise);
+    return promise;
+  }
+
+  /**
+   * Lean mode: keep a turn's full detail while a consumer shows it (an expanded
+   * tool or reasoning disclosure), beyond the recent-turn budget. Each call owns
+   * one pin; the returned release is idempotent.
+   */
+  retainTaskDetails(taskId: string): () => void {
+    if (this.disposed) return () => {};
+    this.detailPins.set(taskId, (this.detailPins.get(taskId) ?? 0) + 1);
+    this.leanPinsChanged = true;
+    let released = false;
+    return () => {
+      if (released || this.disposed) return;
+      released = true;
+      const pins = (this.detailPins.get(taskId) ?? 1) - 1;
+      if (pins > 0) {
+        this.detailPins.set(taskId, pins);
+        return;
+      }
+      this.detailPins.delete(taskId);
+      this.leanPinsChanged = true;
+      // React replaces an effect by running its cleanup before the new setup in
+      // the same commit. Defer so a replacement pin lands before eviction.
+      queueMicrotask(() => {
+        if (!this.disposed && !this.detailPins.has(taskId)) this.updateState((state) => state);
+      });
+    };
+  }
+
+  private touchDetails(taskId: string): void {
+    this.recentDetailTaskIds.delete(taskId);
+    this.recentDetailTaskIds.add(taskId);
+    if (this.recentDetailTaskIds.size > LEAN_TRANSCRIPT_DETAIL_RETENTION_COUNT) {
+      const oldest = this.recentDetailTaskIds.values().next().value;
+      if (oldest !== undefined) this.recentDetailTaskIds.delete(oldest);
+    }
+  }
+
+  private markLeanLive(taskId: string): void {
+    if (!this.leanLiveTaskIds.has(taskId)) this.touchDetails(taskId);
+    this.leanLiveTaskIds.add(taskId);
+  }
+
+  /**
+   * Lean mode only. Project every cached bucket outside the retention set back
+   * to the lean transcript shape and forget that it was loaded, so the UI offers
+   * the persisted detail again on demand. Runs on every update, so late events
+   * and reconnect snapshots cannot regrow full detail for an old turn. Streams
+   * are left to terminal settlement: an unpersisted partial has no reload path.
+   */
+  private boundLeanDetails(
+    previous: ReactiveSessionState,
+    state: ReactiveSessionState
+  ): ReactiveSessionState {
+    // Memoized per Task-array generation: streaming chunks never rescan Tasks.
+    const index = this.indexStreamTasks(state.tasks);
+    if (state.messagesByTask !== previous.messagesByTask) {
+      for (const [taskId, messages] of state.messagesByTask) {
+        if (messages === previous.messagesByTask.get(taskId)) continue;
+        this.detailTaskIds.add(taskId);
+        // Payloads may arrive before their Task; charge them to the budget.
+        if (!index.byId.has(taskId)) this.touchDetails(taskId);
+      }
+    }
+    const keep = new Set([
+      ...this.recentDetailTaskIds,
+      ...this.detailPins.keys(),
+      ...index.executingIds,
+    ]);
+    if (index.latestHydratableId) keep.add(index.latestHydratableId);
+    // Byte budget: every kept bucket counts; only unprotected recent turns are
+    // evicted for it, oldest first, even one that alone exceeds the budget.
+    let bytes = 0;
+    for (const taskId of this.detailTaskIds)
+      if (keep.has(taskId)) bytes += bucketDetailBytes(state.messagesByTask.get(taskId));
+    for (const taskId of this.recentDetailTaskIds) {
+      if (bytes <= LEAN_TRANSCRIPT_DETAIL_BYTE_BUDGET) break;
+      if (
+        !this.detailTaskIds.has(taskId) ||
+        this.detailPins.has(taskId) ||
+        index.executingIds.has(taskId) ||
+        taskId === index.latestHydratableId
+      )
+        continue;
+      this.recentDetailTaskIds.delete(taskId);
+      keep.delete(taskId);
+      bytes -= bucketDetailBytes(state.messagesByTask.get(taskId));
+    }
+    this.retainedDetailBytes = bytes;
+    // Reconnect hydrates live turns fully; an evicted turn rejoins the lean set.
+    for (const taskId of this.leanLiveTaskIds)
+      if (!keep.has(taskId)) this.leanLiveTaskIds.delete(taskId);
+    let { messagesByTask, loadedTaskIds } = state;
+    for (const taskId of this.detailTaskIds) {
+      if (keep.has(taskId)) continue;
+      this.detailTaskIds.delete(taskId);
+      const messages = messagesByTask.get(taskId);
+      if (messages?.length) {
+        if (messagesByTask === state.messagesByTask) messagesByTask = new Map(messagesByTask);
+        messagesByTask.set(taskId, messages.map(leanMessage));
+      }
+      if (loadedTaskIds.has(taskId)) {
+        if (loadedTaskIds === state.loadedTaskIds) loadedTaskIds = new Set(loadedTaskIds);
+        loadedTaskIds.delete(taskId);
+      }
+    }
+    return messagesByTask === state.messagesByTask && loadedTaskIds === state.loadedTaskIds
+      ? state
+      : { ...state, messagesByTask, loadedTaskIds };
+  }
+
+  private async loadTaskMessagesOnce(taskId: string): Promise<Message[]> {
+    this.assertNotDisposed();
+    const generation = this.leanConnectionGeneration;
+    const cacheMutationSequence = this.recordMessageCacheMutation(taskId);
+    const fetchToken = this.beginMessageFetch();
+    try {
+      const snapshot = await this.fetchTaskMessagesAtHighWater(taskId);
+      if (
+        this.disposed ||
+        this.stateSnapshot.terminal ||
+        generation !== this.leanConnectionGeneration ||
+        !this.messageFetches.has(fetchToken)
+      )
+        return [];
+      let committed = snapshot;
+      this.updateState((prev) => {
+        // A later unload (or newer load) owns cache membership. The older
+        // request may resolve to its caller, but must not reverse that choice.
+        if (this.messageCacheMutationsByTask.get(taskId) !== cacheMutationSequence) {
+          return prev;
+        }
+        // A Task removal is journaled separately from Message mutations. Do
+        // not let an older transcript request recreate the removed Task's
+        // bucket after the realtime Task handler deleted it.
+        if (!prev.tasks.some((task) => task.task_id === taskId)) {
+          committed = [];
+          return prev;
+        }
+        committed = this.reconcileMessageFetch(
+          fetchToken,
+          snapshot,
+          (message) => message.task_id === taskId && this.matchesSession(message.session_id)
+        );
+        const nextByTask = new Map(prev.messagesByTask);
+        nextByTask.set(taskId, committed);
+        const nextLoaded = new Set(prev.loadedTaskIds);
+        nextLoaded.add(taskId);
+        // Recency starts at the commit, not the request: newer turns may have
+        // filled the budget while this read was pending, and the reader who
+        // asked must still receive the detail.
+        if (this.options.taskHydration === 'lean') this.touchDetails(taskId);
+        return {
+          ...prev,
+          messagesByTask: nextByTask,
+          loadedTaskIds: nextLoaded,
+          streamingMessages: this.reconcilePersistedStreams(
+            prev.streamingMessages,
+            new Map([[taskId, committed]]),
+            fetchToken
+          ),
+          lastSyncedAt: new Date().toISOString(),
+        };
+      });
+      return committed;
+    } finally {
+      this.cancelMessageFetch(fetchToken);
+    }
+  }
+
+  private beginMessageFetch(): number {
+    this.messageFetchTokenSequence += 1;
+    this.messageFetches.set(this.messageFetchTokenSequence, this.messageMutationSequence);
+    this.streamingAtMessageFetch.set(
+      this.messageFetchTokenSequence,
+      this.stateSnapshot.streamingMessages
+    );
+    return this.messageFetchTokenSequence;
+  }
+
+  private recordMessageMutation(kind: 'upsert' | 'remove', message: Message): void {
+    if (message.task_id === this.retiredStreamTasks.get(message.message_id)) {
+      this.retiredStreamTasks.delete(message.message_id);
+    }
+    this.messageMutationSequence += 1;
+    if (this.messageFetches.size > 0) {
+      this.messageMutations.push({ sequence: this.messageMutationSequence, kind, message });
+    }
+  }
+
+  private reconcileMessageFetch(
+    fetchToken: number,
+    snapshot: Message[],
+    belongsToFetch: (message: Message) => boolean
+  ): Message[] {
+    const fetchSequence = this.messageFetches.get(fetchToken);
+    if (fetchSequence === undefined) return sortMessagesByIndex(snapshot);
+    const byId = new Map(snapshot.map((message) => [message.message_id, message]));
+    for (const mutation of this.messageMutations) {
+      if (mutation.sequence <= fetchSequence || !belongsToFetch(mutation.message)) continue;
+      if (mutation.kind === 'remove') byId.delete(mutation.message.message_id);
+      else byId.set(mutation.message.message_id, mutation.message);
+    }
+    return sortMessagesByIndex([...byId.values()]);
+  }
+
+  private reconcilePersistedStreams(
+    streaming: ReactiveStreamingMessagesById,
+    messagesByTask: ReactiveMessagesByTask,
+    fetchToken: number | null
+  ): ReactiveStreamingMessagesById {
+    const atFetch = fetchToken === null ? undefined : this.streamingAtMessageFetch.get(fetchToken);
+    if (!atFetch || (streaming.size === 0 && this.retiredStreamTasks.size === 0)) return streaming;
+    let next = streaming;
+    for (const [taskId, messages] of messagesByTask) {
+      for (const message of messages) {
+        if (
+          this.matchesSession(message.session_id) &&
+          message.task_id === taskId &&
+          this.retiredStreamTasks.get(message.message_id) === taskId
+        )
+          this.retiredStreamTasks.delete(message.message_id);
+        const current = streaming.get(message.message_id);
+        // A persisted row supersedes only the stream observed before the fetch.
+        // New chunks/starts/thinking events may be newer than the DB snapshot.
+        // Match the existing handle and task boundary, not just the message ID.
+        if (
+          current &&
+          current === atFetch.get(message.message_id) &&
+          this.matchesSession(message.session_id) &&
+          this.matchesSession(current.session_id) &&
+          message.task_id === taskId &&
+          (!current.task_id || current.task_id === taskId)
+        ) {
+          if (next === streaming) next = new Map(streaming);
+          next.delete(message.message_id);
+        }
+      }
+    }
+    return next;
+  }
+
+  /**
+   * A request written to a dropped transport may settle late or never. Retire
+   * every snapshot begun on it: a leaked token would otherwise journal every
+   * later realtime event forever, and a leaked single-flight marker would make
+   * each reconnect wait on the dead request. Paths that settle afterwards see
+   * their token gone and discard the snapshot; the reconnect resync refetches.
+   */
+  private abandonInflightFetches(): void {
+    this.messageFetches.clear();
+    this.streamingAtMessageFetch.clear();
+    this.messageMutations.length = 0;
+    this.taskFetches.clear();
+    this.taskMutations.length = 0;
+    this.queueInflight = null;
+    this.leanSyncInflight = null;
+    this.resyncInflight = null;
+    this.detailInflight.clear();
+  }
+
+  private cancelMessageFetch(fetchToken: number): void {
+    this.messageFetches.delete(fetchToken);
+    this.streamingAtMessageFetch.delete(fetchToken);
+    if (this.messageFetches.size === 0) {
+      this.messageMutations.length = 0;
+      return;
+    }
+    const oldestActiveFetch = Math.min(...this.messageFetches.values());
+    const firstNeeded = this.messageMutations.findIndex(
+      (mutation) => mutation.sequence > oldestActiveFetch
+    );
+    if (firstNeeded === -1) this.messageMutations.length = 0;
+    else if (firstNeeded > 0) this.messageMutations.splice(0, firstNeeded);
+  }
+
+  private async fetchMessagesAtHighWater(query: Record<string, unknown>): Promise<Message[]> {
+    // The shared client's exact-transcript findAll() contract verifies
+    // multi-page Message-ID keyset walks against a second membership pass.
+    // Completeness no longer depends on seeing the matching realtime event;
+    // the journal is retained until the stable membership view is committed.
+    return this.client.service('messages').findAll({
+      query: { ...query, $limit: MESSAGE_PAGINATION.MAX_LIMIT },
+    });
+  }
+
+  private async fetchTaskMessagesAtHighWater(taskId: string): Promise<Message[]> {
+    return this.fetchMessagesAtHighWater({ task_id: taskId, $sort: { index: 1 } });
+  }
+
+  private beginTaskFetch(): number {
+    this.taskFetchTokenSequence += 1;
+    this.taskFetches.set(this.taskFetchTokenSequence, this.taskMutationSequence);
+    return this.taskFetchTokenSequence;
+  }
+
+  private recordTaskMutation(kind: 'upsert' | 'remove', task: Task): void {
+    this.taskMutationSequence += 1;
+    if (this.taskFetches.size > 0) {
+      this.taskMutations.push({ sequence: this.taskMutationSequence, kind, task });
+    }
+  }
+
+  private cancelTaskFetch(fetchToken: number): void {
+    this.taskFetches.delete(fetchToken);
+    if (this.taskFetches.size === 0) {
+      this.taskMutations.length = 0;
+      return;
+    }
+    const oldestActiveFetch = Math.min(...this.taskFetches.values());
+    const firstNeeded = this.taskMutations.findIndex(
+      (mutation) => mutation.sequence > oldestActiveFetch
+    );
+    if (firstNeeded === -1) this.taskMutations.length = 0;
+    else if (firstNeeded > 0) this.taskMutations.splice(0, firstNeeded);
+  }
+
+  private reconcileTaskFetch(fetchToken: number, snapshot: Task[]): Task[] {
+    const fetchSequence = this.taskFetches.get(fetchToken);
+    if (fetchSequence === undefined) return sortTasksByCreatedAt(snapshot);
+    const byId = new Map(snapshot.map((task) => [task.task_id, task]));
+    for (const mutation of this.taskMutations) {
+      if (mutation.sequence <= fetchSequence) continue;
+      if (mutation.kind === 'remove') byId.delete(mutation.task.task_id);
+      else byId.set(mutation.task.task_id, mutation.task);
+    }
+    return sortTasksByCreatedAt([...byId.values()]);
+  }
+
+  private async fetchTasksAtHighWater(): Promise<Task[]> {
+    // Exact-Session findAll() is a stable ID-membership keyset scan in
+    // @agor/core. The surrounding bootstrap/resync journal stays open through
+    // commit so mutable Task fields also reconcile with realtime delivery.
+    return this.client.service('tasks').findAll({
+      query: {
+        session_id: this.sessionId,
+        $sort: { created_at: 1, task_id: 1 },
+        $limit: PAGINATION.MAX_LIMIT,
+      },
+    });
+  }
+
+  private async fetchSessionMessagesAtHighWater(): Promise<Message[]> {
+    return this.fetchMessagesAtHighWater({
+      session_id: this.sessionId,
+      $sort: { index: 1 },
+    });
+  }
+
+  unloadTaskMessages(taskId: string): void {
+    this.assertNotDisposed();
+    if (this.options.taskHydration === 'lean') return; // Disclosure is not cache eviction.
+    // Record the intent even when no bucket exists yet. A resync may currently
+    // be fetching this Task as its automatic latest-Task hydration target.
+    this.recordMessageCacheMutation(taskId);
+    this.updateState((prev) => {
+      if (!prev.loadedTaskIds.has(taskId) && !prev.messagesByTask.has(taskId)) {
+        return prev;
+      }
+      const nextByTask = new Map(prev.messagesByTask);
+      nextByTask.delete(taskId);
+      const nextLoaded = new Set(prev.loadedTaskIds);
+      nextLoaded.delete(taskId);
+      return {
+        ...prev,
+        messagesByTask: nextByTask,
+        loadedTaskIds: nextLoaded,
+      };
+    });
+  }
+
+  private recordMessageCacheMutation(taskId: string): number {
+    this.messageCacheMutationSequence += 1;
+    this.messageCacheMutationsByTask.set(taskId, this.messageCacheMutationSequence);
+    return this.messageCacheMutationSequence;
+  }
+
+  dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    // Release this handle's refcount on the shared per-connection subscription.
+    // The last handle for the session sends the actual `remove`; disposing one
+    // of several handles must NOT evict the shared connection from the room and
+    // kill the others' streams.
+    releaseSessionStream(this.client, this.sessionId);
+    for (const cleanup of this.disposeCallbacks) {
+      cleanup();
+    }
+    this.disposeCallbacks.length = 0;
+    this.listeners.clear();
+    this.stateSnapshot = {
+      ...this.stateSnapshot,
+      session: null,
+      tasks: [],
+      queuedTasks: [],
+      messagesByTask: new Map(),
+      loadedTaskIds: new Set(),
+      streamingMessages: new Map(),
+      toolsByTask: new Map(),
+      loading: false,
+      connected: false,
+      hasOlderTasks: false,
+      latestContextWindow: undefined,
+    };
+    this.streamTaskIndex = undefined;
+    this.displayRanks = undefined;
+    this.leanWindow = undefined;
+    this.leanBasis = undefined;
+    this.retiredStreamTasks.clear();
+    this.queueSnapshot = [];
+    this.detailInflight.clear();
+    this.leanLiveTaskIds.clear();
+    this.recentDetailTaskIds.clear();
+    this.detailPins.clear();
+    this.detailTaskIds.clear();
+    this.retainedDetailBytes = 0;
+    this.messageFetches.clear();
+    this.streamingAtMessageFetch.clear();
+    this.messageMutations.length = 0;
+    this.messageCacheMutationsByTask.clear();
+    this.taskFetches.clear();
+    this.taskMutations.length = 0;
+  }
+
+  private refreshQueue(): Promise<void> {
+    this.queueInvalidation += 1;
+    if (this.queueInflight) return this.queueInflight;
+    let settledInvalidation = -1;
+    const promise = Promise.resolve()
+      .then(async () => {
+        // A disconnect retires this loop; a reconnect starts its own.
+        const retired = () =>
+          this.disposed ||
+          this.stateSnapshot.terminal ||
+          !this.stateSnapshot.connected ||
+          this.queueInflight !== promise;
+        while (!retired()) {
+          const invalidation = this.queueInvalidation;
+          try {
+            const result = (await this.client
+              .service(`/sessions/${this.sessionId}/tasks/queue`)
+              .find()) as QueueFindResult;
+            if (retired()) return;
+            // A request-order counter alone is insufficient: even the newest
+            // request can have read before a cancellation/reorder observed live.
+            // Discard it and read again after ALL observed invalidations.
+            if (invalidation !== this.queueInvalidation) continue;
+            this.queueSnapshot = sortTasksByQueuePosition(
+              (result.data ?? []).filter(
+                (task) => this.matchesSession(task.session_id) && task.status === TaskStatus.QUEUED
+              )
+            );
+            const previousError = this.queueError;
+            this.queueError = null;
+            this.updateState((prev) => ({
+              ...prev,
+              error: previousError !== null && prev.error === previousError ? null : prev.error,
+            }));
+          } catch (error) {
+            if (retired()) return;
+            if (invalidation !== this.queueInvalidation) continue;
+            // Keep confirmed rows on a transient failure. The shared hook's
+            // auth/visibility recovery and socket reconnect retry the read.
+            const previousError = this.queueError;
+            this.queueError = error instanceof Error ? error.message : 'Failed to refresh queue';
+            this.updateState((prev) => ({
+              ...prev,
+              // Advance only a queue-owned banner so recovery can clear it.
+              error:
+                prev.error === null || prev.error === previousError ? this.queueError : prev.error,
+            }));
+          }
+          settledInvalidation = invalidation;
+          if (invalidation === this.queueInvalidation) return;
+        }
+      })
+      .finally(() => {
+        if (this.queueInflight !== promise) return;
+        this.queueInflight = null;
+        // An event can also land between the async loop settling and this
+        // promise's cleanup microtask. Do not lose that final invalidation.
+        if (
+          settledInvalidation !== this.queueInvalidation &&
+          !this.disposed &&
+          !this.stateSnapshot.terminal &&
+          this.stateSnapshot.connected
+        )
+          return this.refreshQueue();
+      });
+    this.queueInflight = promise;
+    return promise;
+  }
+
+  private invalidateQueue(task: Task, removed = false): void {
+    const inQueue = this.queueSnapshot.some((row) => row.task_id === task.task_id);
+    if (task.status !== TaskStatus.QUEUED && !inQueue && !this.queueInflight) return;
+    if (inQueue && (removed || task.status !== TaskStatus.QUEUED)) {
+      // Removal/dispatch is immediately safe to project. Never insert or
+      // reorder from an event payload, including a late created/queued event.
+      this.queueSnapshot = this.queueSnapshot.filter((row) => row.task_id !== task.task_id);
+    }
+    void this.refreshQueue();
+  }
+
+  private assertNotDisposed(): void {
+    if (this.disposed) {
+      throw new Error(`Reactive session ${this.sessionId} is disposed`);
+    }
+  }
+
+  private notify(): void {
+    for (const listener of this.listeners) {
+      listener();
+    }
+  }
+
+  /** The wire stamps task_id on every event, including chunks after reconnect. */
+  private acceptsStreamActivity(event: { message_id: string; task_id?: string }): boolean {
+    if (this.stateSnapshot.terminal) return false;
+    const current = this.stateSnapshot.streamingMessages.get(event.message_id);
+    const observedTaskId = current?.task_id ?? this.retiredStreamTasks.get(event.message_id);
+    if (event.task_id && observedTaskId && event.task_id !== observedTaskId) return false;
+    const taskId = event.task_id ?? observedTaskId;
+    const index = this.indexStreamTasks(this.stateSnapshot.tasks);
+    if (taskId && (index.terminalIds.has(taskId) || this.outsideLeanWindow(taskId))) return false;
+    // Old transports omitted task_id. Do not attribute their late chunks to a
+    // completed turn; preserve pre-bootstrap and active mid-stream attachment.
+    return !!taskId || this.stateSnapshot.loading || !!index.latestExecutingId;
+  }
+
+  private settleTerminalStreams(state: ReactiveSessionState): ReactiveSessionState {
+    const { terminalIds } = this.indexStreamTasks(state.tasks);
+    if (state.streamingMessages.size === 0) return state;
+    let streams = state.streamingMessages;
+    for (const [id, stream] of streams) {
+      if (!stream.task_id || !terminalIds.has(stream.task_id)) continue;
+      // Unlike a same-task assistant row, terminal state proves there can be
+      // no newer legitimate thinking stream in this turn. Claude's temporary
+      // thinking ID need not match the saved text ID. Never guess that pairing
+      // from arrival order: several assistant messages can overlap persistence.
+      if (!stream.content && !stream.error) {
+        if (streams === state.streamingMessages) streams = new Map(streams);
+        streams.delete(id);
+        this.retiredStreamTasks.delete(id);
+        this.retiredStreamTasks.set(id, stream.task_id);
+        if (this.retiredStreamTasks.size > MAX_RETIRED_STREAM_IDENTITIES) {
+          const oldest = this.retiredStreamTasks.keys().next().value;
+          if (oldest !== undefined) this.retiredStreamTasks.delete(oldest);
+        }
+      } else if (stream.isStreaming || stream.isThinking || stream.isTextStreaming) {
+        if (streams === state.streamingMessages) streams = new Map(streams);
+        streams.set(id, {
+          ...stream,
+          isStreaming: false,
+          isThinking: false,
+          isTextStreaming: false,
+        });
+      }
+    }
+    return streams === state.streamingMessages ? state : { ...state, streamingMessages: streams };
+  }
+
+  private updateState(
+    updater: (previous: ReactiveSessionState) => ReactiveSessionState
+  ): ReactiveSessionState {
+    if (this.disposed) return this.stateSnapshot;
+    let next = updater(this.stateSnapshot);
+    if (next.error === null && this.queueError !== null) next = { ...next, error: this.queueError };
+    // Bootstrap, history paging and reconnect also read Tasks. Their older
+    // snapshots/journals must not become a second source of queue membership.
+    const queuedTasks = next.terminal ? [] : this.queueSnapshot;
+    if (next.tasks !== this.stateSnapshot.tasks || next.queuedTasks !== queuedTasks) {
+      const queuedIds = new Set(queuedTasks.map((task) => task.task_id));
+      next = {
+        ...next,
+        queuedTasks,
+        tasks: orderTasksBySession(
+          [
+            ...next.tasks.filter(
+              (task) => task.status !== TaskStatus.QUEUED && !queuedIds.has(task.task_id)
+            ),
+            ...queuedTasks,
+          ],
+          next.session?.tasks
+        ),
+      };
+    }
+    next = this.settleTerminalStreams(next);
+    if (next.tasks !== this.stateSnapshot.tasks || next.terminal !== this.stateSnapshot.terminal)
+      next = this.projectContextWindow(next);
+    if (this.options.cacheScope === 'preview') {
+      const latest = next.tasks.filter((task) => task.status !== TaskStatus.QUEUED).at(-1);
+      const keep = new Set<string>(next.tasks.filter(isTaskExecuting).map((task) => task.task_id));
+      if (latest) keep.add(latest.task_id);
+      next = {
+        ...next,
+        hasOlderTasks: false,
+        tasks: next.tasks.filter((task) => keep.has(task.task_id)),
+        messagesByTask: new Map([...next.messagesByTask].filter(([id]) => keep.has(id))),
+        loadedTaskIds: new Set([...next.loadedTaskIds].filter((id) => keep.has(id))),
+        toolsByTask: new Map([...next.toolsByTask].filter(([id]) => keep.has(id))),
+        streamingMessages: new Map(
+          [...next.streamingMessages].filter(
+            ([, message]) => !message.task_id || keep.has(message.task_id)
+          )
+        ),
+      };
+      for (const id of this.leanLiveTaskIds) if (!keep.has(id)) this.leanLiveTaskIds.delete(id);
+    }
+    if (this.options.taskHydration === 'lean')
+      next = this.boundLeanDetails(this.stateSnapshot, next);
+    if (
+      this.followsDisplayOrder() &&
+      (this.leanPinsChanged ||
+        next.tasks !== this.stateSnapshot.tasks ||
+        next.messagesByTask !== this.stateSnapshot.messagesByTask)
+    ) {
+      this.leanPinsChanged = false;
+      const first = next.tasks.find(
+        (task) => task.status !== TaskStatus.QUEUED && this.leanProtected(task, next.messagesByTask)
+      )?.task_id;
+      if (first !== next.firstProtectedTaskId) next = { ...next, firstProtectedTaskId: first };
+    }
+    if (next.terminal) {
+      this.streamTaskIndex = undefined;
+      this.retiredStreamTasks.clear();
+    } else {
+      const index = this.indexStreamTasks(next.tasks);
+      if (next.tasks !== this.stateSnapshot.tasks) {
+        for (const [id, taskId] of this.retiredStreamTasks) {
+          if (!index.byId.has(taskId) || !index.terminalIds.has(taskId)) {
+            this.retiredStreamTasks.delete(id);
+          }
+        }
+      }
+    }
+    this.stateSnapshot = next;
+    this.notify();
+    return next;
+  }
+
+  /**
+   * Follow the newest turn that reported a context-window snapshot. A loaded
+   * turn replaces the projection unless the projected turn has left the
+   * transcript and is displayed after it (an older page loading back).
+   */
+  private projectContextWindow(state: ReactiveSessionState): ReactiveSessionState {
+    if (state.terminal)
+      return state.latestContextWindow ? { ...state, latestContextWindow: undefined } : state;
+    const current = state.latestContextWindow;
+    for (let i = state.tasks.length - 1; i >= 0; i--) {
+      const task = state.tasks[i];
+      const used = task.computed_context_window;
+      const normalized = task.normalized_sdk_response;
+      if (used === undefined || used <= 0 || !normalized) continue;
+      if (
+        current &&
+        current.task_id !== task.task_id &&
+        !state.tasks.some((loaded) => loaded.task_id === current.task_id) &&
+        (this.displayRank(task.task_id, state.session) ?? Number.POSITIVE_INFINITY) <
+          (this.displayRank(current.task_id, state.session) ?? Number.POSITIVE_INFINITY)
+      )
+        return state;
+      if (
+        current?.task_id === task.task_id &&
+        current.computed_context_window === used &&
+        current.normalized_sdk_response === normalized &&
+        current.model === task.model &&
+        current.duration_ms === task.duration_ms
+      )
+        return state;
+      return {
+        ...state,
+        latestContextWindow: {
+          task_id: task.task_id,
+          computed_context_window: used,
+          model: task.model,
+          duration_ms: task.duration_ms,
+          normalized_sdk_response: normalized,
+        },
+      };
+    }
+    return state;
+  }
+
+  private commitBootstrapState(args: {
+    previous: ReactiveSessionState;
+    fetchedSession: Session;
+    sessionFetchSequence: number;
+    taskFetchToken: number;
+    taskSnapshot: Task[];
+    messageFetchToken: number | null;
+    eagerMessageSnapshot: Message[] | null;
+    lazyMessageSnapshot: { taskId: string; messages: Message[]; cacheSequence: number } | null;
+  }): ReactiveSessionState {
+    const sessionChanged = this.sessionMutationSequence > args.sessionFetchSequence;
+    if (sessionChanged && args.previous.session === null && args.previous.terminal) {
+      return { ...args.previous, loading: false };
+    }
+    const session = sessionChanged ? args.previous.session : args.fetchedSession;
+    const reconciledTasks = this.reconcileTaskFetch(args.taskFetchToken, args.taskSnapshot);
+    const tasks = orderTasksBySession(reconciledTasks, session?.tasks);
+
+    let messagesByTask = new Map(args.previous.messagesByTask);
+    let loadedTaskIds = new Set(args.previous.loadedTaskIds);
+    const fetchedMessagesByTask = new Map<string, Message[]>();
+    if (args.eagerMessageSnapshot) {
+      const messages =
+        args.messageFetchToken === null
+          ? args.eagerMessageSnapshot
+          : this.reconcileMessageFetch(
+              args.messageFetchToken,
+              args.eagerMessageSnapshot,
+              (message) => this.matchesSession(message.session_id)
+            );
+      messagesByTask = groupMessagesByTask(messages);
+      loadedTaskIds = new Set(messagesByTask.keys());
+      for (const [taskId, messages] of messagesByTask) fetchedMessagesByTask.set(taskId, messages);
+    } else if (
+      args.lazyMessageSnapshot &&
+      (this.messageCacheMutationsByTask.get(args.lazyMessageSnapshot.taskId) ?? 0) ===
+        args.lazyMessageSnapshot.cacheSequence
+    ) {
+      const { taskId, messages: snapshot } = args.lazyMessageSnapshot;
+      const messages =
+        args.messageFetchToken === null
+          ? snapshot
+          : this.reconcileMessageFetch(
+              args.messageFetchToken,
+              snapshot,
+              (message) => message.task_id === taskId && this.matchesSession(message.session_id)
+            );
+      messagesByTask.set(taskId, messages);
+      fetchedMessagesByTask.set(taskId, messages);
+      loadedTaskIds.add(taskId);
+    }
+
+    const liveTaskIds = new Set<string>(tasks.map((task) => task.task_id));
+    messagesByTask = new Map([...messagesByTask].filter(([taskId]) => liveTaskIds.has(taskId)));
+    loadedTaskIds = new Set([...loadedTaskIds].filter((taskId) => liveTaskIds.has(taskId)));
+
+    return {
+      ...args.previous,
+      session,
+      tasks,
+      messagesByTask,
+      loadedTaskIds,
+      // Repair task_id on any stream initialized from a chunk that arrived
+      // before Tasks were hydrated (task_id was undefined then).
+      streamingMessages: restampStreamingTaskIds(
+        this.reconcilePersistedStreams(
+          args.previous.streamingMessages,
+          new Map([...fetchedMessagesByTask].filter(([taskId]) => liveTaskIds.has(taskId))),
+          args.messageFetchToken
+        ),
+        tasks
+      ),
+      loading: false,
+      error: null,
+      lastSyncedAt: new Date().toISOString(),
+    };
+  }
+
+  /** Older paging is single-flight, never findAll() over the entire Session. */
+  loadOlderTasks(): Promise<void> {
+    if (
+      this.options.cacheScope === 'preview' ||
+      this.options.taskHydration !== 'lean' ||
+      !this.stateSnapshot.hasOlderTasks
+    )
+      return Promise.resolve();
+    return this.syncLeanHistory('older');
+  }
+
+  /**
+   * Lean conversation: drop the oldest displayed turns beyond
+   * LEAN_TRANSCRIPT_TASK_WINDOW, for a reader parked at the latest turns. They
+   * become not-yet-loaded history again; loadOlderTasks() pages them back.
+   *
+   * The transcript is a contiguous run of Session.tasks, the display order
+   * (appended at dispatch), never task-ID order: a callback or auto-resume
+   * Task keeps its source's UUIDv7 timestamp, and a queued prompt promoted
+   * after newer ones runs last with an older ID. Only an unbroken run from the
+   * top goes, never the latest window. It stops at the first protected turn
+   * (see leanProtected) or `keepFromTaskId` (the first turn the reader sees).
+   * Refused while a history read is in flight, so no page or resync snapshot
+   * commits across a trim, and in task-ID order (a legacy Session).
+   * Returns whether anything was dropped.
+   */
+  trimOlderTasks(keepFromTaskId?: string): boolean {
+    const { tasks, loading, terminal } = this.stateSnapshot;
+    const window = this.leanWindow;
+    if (
+      this.disposed ||
+      !this.followsDisplayOrder() ||
+      !window ||
+      this.leanSyncInflight ||
+      loading ||
+      terminal
+    )
+      return false;
+    const loaded = tasks.filter((task) => task.status !== TaskStatus.QUEUED);
+    const excess = loaded.length - LEAN_TRANSCRIPT_TASK_WINDOW;
+    if (excess <= 0) return false;
+    const visible =
+      keepFromTaskId === undefined
+        ? loaded.length
+        : loaded.findIndex((task) => task.task_id === keepFromTaskId);
+    if (visible === -1) return false;
+    let count = 0;
+    while (count < Math.min(excess, visible) && !this.leanProtected(loaded[count])) count++;
+    const start = count > 0 ? this.displayRank(loaded[count].task_id) : undefined;
+    if (start === undefined) return false;
+    this.leanWindow = { start, reconciled: Math.max(window.reconciled, start) };
+    const dropped = new Set(loaded.slice(0, count).map((task) => task.task_id));
+    this.updateState((prev) => ({ ...this.forgetLeanTurns(prev, dropped), hasOlderTasks: true }));
+    return true;
+  }
+
+  /** The lean conversation reader, once its first page chose display order. */
+  private followsDisplayOrder(): boolean {
+    return (
+      this.options.taskHydration === 'lean' &&
+      this.options.cacheScope === 'session' &&
+      this.leanOrder === 'display'
+    );
+  }
+
+  /**
+   * Display order relies on Session.tasks only growing: the daemon appends at
+   * dispatch and callers cannot replace it. A list that neither extends the
+   * accepted one nor is an older prefix of it (a delayed event) moved placed
+   * positions. Display order is then abandoned for this handle: the next read
+   * pages by task ID from a fresh cursor, keeping every turn shown, so no
+   * history is hidden or wrongly declared exhausted. Returns false then.
+   */
+  private acceptLeanOrder(order: readonly string[] | undefined): boolean {
+    const basis = this.leanBasis;
+    if (!this.followsDisplayOrder() || !basis || !order || order === basis) return true;
+    const shared = Math.min(order.length, basis.length);
+    for (let i = 0; i < shared; i++) {
+      if (order[i] !== basis[i]) {
+        this.leanOrder = 'legacy';
+        this.leanWindow = undefined;
+        this.leanBasis = undefined;
+        this.leanOldestTaskId = undefined;
+        this.leanCursorReset = true;
+        return false;
+      }
+    }
+    if (order.length > basis.length) this.leanBasis = order;
+    return true;
+  }
+
+  /**
+   * A turn the window keeps, with everything displayed after it: not terminal
+   * (running, streaming, stopping, awaiting permission/input), pinned through
+   * retainTaskDetails (expanded disclosures, focus, selection, portaled
+   * overlays), or holding an open permission, input or widget request.
+   * Terminal settlement has already stopped every stream of a terminal turn.
+   */
+  private leanProtected(task: Task, messagesByTask = this.stateSnapshot.messagesByTask): boolean {
+    return (
+      !isTerminalTaskStatus(task.status) ||
+      this.detailPins.has(task.task_id) ||
+      awaitsReader(messagesByTask.get(task.task_id))
+    );
+  }
+
+  /** Display rank of the first protected loaded turn; trims and rebases stop there. */
+  private leanProtectedRank(state = this.stateSnapshot): number | undefined {
+    for (const task of state.tasks) {
+      if (task.status !== TaskStatus.QUEUED && this.leanProtected(task, state.messagesByTask))
+        return this.displayRank(task.task_id, state.session);
+    }
+    return undefined;
+  }
+
+  /**
+   * Remove turns from the lean transcript and every per-turn record of them,
+   * including detail retention: the byte budget's total is re-summed from the
+   * remaining buckets by the update that commits this state.
+   */
+  private forgetLeanTurns(state: ReactiveSessionState, dropped: ReadonlySet<string>) {
+    if (dropped.size === 0) return state;
+    for (const id of dropped) {
+      this.recentDetailTaskIds.delete(id);
+      this.detailTaskIds.delete(id);
+      this.leanLiveTaskIds.delete(id);
+      // Fences a detail read still in flight for the turn, and lets a reload
+      // after the turn pages back in start its own read instead of joining it.
+      this.messageCacheMutationsByTask.delete(id);
+      this.detailInflight.delete(id);
+    }
+    const kept = <V>(map: Map<string, V>) => new Map([...map].filter(([id]) => !dropped.has(id)));
+    return {
+      ...state,
+      tasks: state.tasks.filter((task) => !dropped.has(task.task_id)),
+      messagesByTask: kept(state.messagesByTask),
+      toolsByTask: kept(state.toolsByTask),
+      loadedTaskIds: new Set([...state.loadedTaskIds].filter((id) => !dropped.has(id))),
+      // A settled partial has no reload path; it goes with its turn, as on a reload.
+      streamingMessages: new Map(
+        [...state.streamingMessages].filter(
+          ([, stream]) => !stream.task_id || !dropped.has(stream.task_id)
+        )
+      ),
+    };
+  }
+
+  /** A Task's position in Session.tasks (dispatch order); undefined before dispatch. */
+  private displayRank(taskId: string, session = this.stateSnapshot.session): number | undefined {
+    const order = session?.tasks;
+    if (!order?.length) return undefined;
+    if (this.displayRanks?.order !== order)
+      this.displayRanks = { order, ranks: new Map(order.map((id, rank) => [id, rank])) };
+    return this.displayRanks.ranks.get(taskId);
+  }
+
+  /**
+   * Lean conversation: true for traffic about a settled turn displayed above
+   * the loaded transcript (never loaded, or trimmed). Applying it would re-add
+   * that turn above an invisible gap; it returns through loadOlderTasks().
+   * Unsettled Tasks, Tasks not yet in Session.tasks (Session patches can trail
+   * Task events), and turns displayed at or after the top are new, so
+   * callbacks and promoted queued prompts are always admitted. Before the first
+   * page commits, a settled Task cannot be placed at all; the page snapshot
+   * carries what it needs.
+   */
+  private outsideLeanWindow(taskId: string, task?: Task): boolean {
+    if (this.options.taskHydration !== 'lean' || this.options.cacheScope !== 'session')
+      return false;
+    if (this.indexStreamTasks(this.stateSnapshot.tasks).byId.has(taskId)) return false;
+    if (task && !isTerminalTaskStatus(task.status)) return false;
+    if (task && this.stateSnapshot.loading) return true;
+    if (!this.leanWindow || !this.followsDisplayOrder()) return false;
+    const rank = this.displayRank(taskId);
+    return rank !== undefined && rank < this.leanWindow.start;
+  }
+
+  /**
+   * The one suffix planner: every Session.tasks position after the reconciled
+   * marker that the transcript does not hold (turns dispatched while offline, a
+   * turn that settled before the first page could place it, wherever its ID
+   * sorts). Live Session patches never move the marker, so they cannot hide
+   * one. Past a window of them, rebase onto the newest window, keeping
+   * everything from the first protected turn.
+   */
+  private planLeanSuffix(
+    order: readonly string[],
+    window: { start: number; reconciled: number },
+    shown: ReadonlySet<string>,
+    session: Session | null
+  ): { start: number; wanted: string[] } {
+    let start = window.start;
+    let wanted = order.slice(window.reconciled).filter((id) => !shown.has(id));
+    if (wanted.length > LEAN_TRANSCRIPT_TASK_WINDOW) {
+      start = Math.max(
+        start,
+        Math.min(
+          this.leanProtectedRank({ ...this.stateSnapshot, session }) ?? order.length,
+          order.length - LEAN_TRANSCRIPT_TASK_WINDOW
+        )
+      );
+      wanted = order.slice(Math.max(start, window.reconciled)).filter((id) => !shown.has(id));
+    }
+    return { start, wanted };
+  }
+
+  /** Whether the accepted Session.tasks holds an unloaded position after the marker. */
+  private leanSuffixGap(): boolean {
+    const window = this.leanWindow;
+    const order = this.stateSnapshot.session?.tasks;
+    if (!window || !order || this.stateSnapshot.loading || !this.followsDisplayOrder())
+      return false;
+    const loaded = this.indexStreamTasks(this.stateSnapshot.tasks).byId;
+    return order.slice(window.reconciled).some((id) => !loaded.has(id));
+  }
+
+  /**
+   * A Session.tasks extension may list turns the transcript does not hold.
+   * Like refreshQueue's invalidation: a running read re-checks the gap after
+   * it commits (and once more as it settles), so only an idle handle starts a
+   * suffix read, which reads just the missing rows.
+   */
+  private invalidateLeanSuffix(): void {
+    if (this.leanSyncInflight) {
+      this.leanSuffixInvalidated = true;
+      return;
+    }
+    if (!this.stateSnapshot.connected || !this.leanSuffixGap()) return;
+    void this.syncLeanHistory('suffix').catch(() => {});
+  }
+
+  private syncLeanHistory(mode: LeanRead = 'sync'): Promise<void> {
+    if (this.disposed || this.stateSnapshot.terminal) return Promise.resolve();
+    // A running read drains the suffix itself; a resync runs after it.
+    if (this.leanSyncInflight)
+      return mode === 'sync'
+        ? this.leanSyncInflight.then(() => this.syncLeanHistory())
+        : this.leanSyncInflight;
+    this.leanSuffixInvalidated = false;
+    const operation = this.doSyncLeanHistory(mode).then(
+      (completed) => {
+        if (this.leanSyncInflight !== operation) return;
+        this.leanSyncInflight = null;
+        // An extension can land between the last gap check and this cleanup.
+        // After a failed read, retry once only for an invalidation that
+        // arrived during it, as refreshQueue does; a persistent failure with
+        // none waits for the next extension or the reconnect/auth/visibility
+        // resync, never an immediate loop.
+        if (completed || this.leanSuffixInvalidated) this.invalidateLeanSuffix();
+      },
+      (error) => {
+        if (this.leanSyncInflight === operation) this.leanSyncInflight = null;
+        throw error;
+      }
+    );
+    this.leanSyncInflight = operation;
+    return operation;
+  }
+
+  /** This Session's Tasks by ID, in bounded pages. Queued Tasks are absent. */
+  private async fetchLeanTasks(taskIds: readonly string[], stale: () => boolean): Promise<Task[]> {
+    const tasks: Task[] = [];
+    for (let offset = 0; offset < taskIds.length; offset += TASK_PAGINATION.MAX_TASK_IDS) {
+      if (stale()) break;
+      const ids = taskIds.slice(offset, offset + TASK_PAGINATION.MAX_TASK_IDS);
+      const result = await this.client.service('tasks').find({
+        query: {
+          session_id: this.sessionId,
+          task_id: { $in: ids },
+          status: { $ne: TaskStatus.QUEUED },
+          $limit: ids.length,
+        },
+      });
+      tasks.push(...(Array.isArray(result) ? result : result.data));
+    }
+    return tasks;
+  }
+
+  private async fetchLeanTaskMessages(taskIds: string[], stale: () => boolean): Promise<Message[]> {
+    const messages: Message[] = [];
+    // Bound reconnect hydration as well as the initial ten-turn page.
+    for (let offset = 0; offset < taskIds.length; offset += MESSAGE_PAGINATION.MAX_TASK_IDS) {
+      if (stale()) break;
+      messages.push(
+        ...(await this.fetchMessagesAtHighWater({
+          session_id: this.sessionId,
+          task_id: { $in: taskIds.slice(offset, offset + MESSAGE_PAGINATION.MAX_TASK_IDS) },
+          transcript: 'lean',
+          $sort: { index: 1 },
+        }))
+      );
+    }
+    return messages;
+  }
+
+  /**
+   * One lean history read: the first page, a reconnect/resync, or an older
+   * page. The conversation reader follows display order (Session.tasks) once
+   * its first page confirms the Session can place its history; the preview and
+   * a legacy Session page by task ID.
+   *
+   * Display order: the transcript is Session.tasks positions [start, …). The
+   * first page loads the last page of positions; an older page the page above
+   * `start`. A resync/reconnect refreshes the turns it holds and reads the
+   * suffix plan (planLeanSuffix); a `suffix` read only the plan's missing rows.
+   * After every commit the read drains the suffix while the accepted list still
+   * extends past the marker, so `ready()` covers a turn listed in flight. Tasks
+   * are read by ID in bounded, session-scoped pages.
+   */
+  private async doSyncLeanHistory(mode: LeanRead): Promise<boolean> {
+    let next: LeanRead | undefined = mode;
+    let outcome: Awaited<ReturnType<ReactiveSessionHandle['readLeanHistory']>> = 'ended';
+    while (next) {
+      outcome = await this.readLeanHistory(next);
+      if (outcome === 'replan') continue;
+      next = outcome === 'committed' && this.leanSuffixGap() ? 'suffix' : undefined;
+    }
+    // Whether the drain completed: false after a failed or abandoned read.
+    return outcome === 'committed';
+  }
+
+  /** One read and commit; `replan` when it must plan again (see below). */
+  private async readLeanHistory(mode: LeanRead): Promise<'replan' | 'committed' | 'ended'> {
+    const older = mode === 'older';
+    const generation = this.leanConnectionGeneration;
+    const stale = () =>
+      this.disposed || this.stateSnapshot.terminal || generation !== this.leanConnectionGeneration;
+    const taskToken = this.beginTaskFetch();
+    const messageToken = this.beginMessageFetch();
+    const sessionSequence = this.sessionMutationSequence;
+    try {
+      const pageSize = this.options.cacheScope === 'preview' ? 1 : LEAN_TRANSCRIPT_TASK_PAGE_SIZE;
+      const window = this.followsDisplayOrder() ? this.leanWindow : undefined;
+      // The first page asks the daemon whether Session.tasks lists every
+      // dispatched Task. A daemon that does not answer (older) means legacy.
+      const decides = !older && this.options.cacheScope === 'session' && !this.leanOrder;
+      const cursor = older ? this.leanOldestTaskId : undefined;
+      const shownIds = this.stateSnapshot.tasks
+        .filter((task) => task.status !== TaskStatus.QUEUED)
+        .map((task) => task.task_id);
+      const [fetchedSession, result, refreshed] = await Promise.all([
+        mode !== 'sync' && !decides && this.stateSnapshot.session
+          ? Promise.resolve(this.stateSnapshot.session)
+          : this.client
+              .service('sessions')
+              .get(this.sessionId, decides ? { query: { include_tasks_complete: true } } : {}),
+        // Display order reads Tasks by position below. The task-ID page is the
+        // legacy and preview path; the first page reads it before it decides.
+        window
+          ? Promise.resolve(undefined)
+          : this.client.service('tasks').find({
+              query: {
+                session_id: this.sessionId,
+                $sort: { task_id: -1 },
+                $limit: pageSize + 1,
+                status: { $ne: TaskStatus.QUEUED },
+                ...(cursor ? { task_id: { $lte: cursor } } : {}),
+              },
+            }),
+        window && mode === 'sync'
+          ? this.fetchLeanTasks(shownIds, stale)
+          : Promise.resolve([] as Task[]),
+        mode === 'sync' ? this.refreshQueue() : Promise.resolve(),
+      ]);
+      if (stale()) return 'ended';
+      const session = fetchedSession;
+      const rows = !result ? [] : Array.isArray(result) ? result : result.data;
+      const display = window ? true : decides && session.tasks_complete === true;
+      // A list that moved placed positions: plan again in task-ID order.
+      if (window && !this.acceptLeanOrder(session.tasks)) return 'replan';
+      this.canonicalSessionId = session.session_id;
+      const byId = new Map(this.stateSnapshot.tasks.map((task) => [task.task_id, task]));
+      for (const task of this.queueSnapshot) byId.set(task.task_id, task);
+      let page: Task[];
+      let hasOlder = false;
+      let plan: { start: number; reconciled: number } | undefined;
+      if (display) {
+        const order = session.tasks ?? [];
+        const shown = new Set(shownIds);
+        let start: number;
+        let wanted: string[];
+        if (!window) {
+          start = Math.max(0, order.length - pageSize);
+          wanted = order.slice(start);
+        } else if (older) {
+          start = Math.max(0, window.start - pageSize);
+          wanted = order.slice(start, window.start);
+        } else {
+          ({ start, wanted } = this.planLeanSuffix(order, window, shown, session));
+        }
+        // The first page's task-ID page usually holds these turns already.
+        const known = new Map<string, Task>(rows.map((task) => [task.task_id, task]));
+        const missing = wanted.filter((id) => !known.has(id));
+        for (const task of await this.fetchLeanTasks(missing, stale)) known.set(task.task_id, task);
+        if (stale()) return 'ended';
+        page = wanted.flatMap((id) => {
+          const task = known.get(id);
+          return task && task.status !== TaskStatus.QUEUED ? [task] : [];
+        });
+        if (window && mode === 'sync') {
+          // A loaded turn the refresh no longer returns is gone.
+          for (const id of shownIds) byId.delete(id);
+          for (const task of refreshed) byId.set(task.task_id, task);
+        }
+        plan = { start, reconciled: window && older ? window.reconciled : order.length };
+      } else {
+        const candidates = rows.filter((task) => task.task_id !== cursor);
+        page = candidates.slice(0, pageSize);
+        hasOlder = cursor ? candidates.length >= pageSize : candidates.length > pageSize;
+        if (mode === 'sync') {
+          // A reconnect can span more than ten newly completed turns. Fill the
+          // already-open ID window so advancing the latest page cannot strand
+          // an invisible gap above the older-history cursor. Never walk before
+          // the oldest turn the reader has reached.
+          const through = rows[0]?.task_id;
+          let after = this.leanOldestTaskId;
+          while (this.options.cacheScope !== 'preview' && through && after && after < through) {
+            if (stale()) return 'ended';
+            const window = await this.client.service('tasks').find({
+              query: {
+                session_id: this.sessionId,
+                task_id: { $gt: after, $lte: through },
+                status: { $ne: TaskStatus.QUEUED },
+                $sort: { task_id: 1 },
+                $limit: 100,
+              },
+            });
+            const windowTasks = Array.isArray(window) ? window : window.data;
+            if (!windowTasks.length) break;
+            for (const task of windowTasks) byId.set(task.task_id, task);
+            const next = windowTasks.at(-1)!.task_id;
+            if (next <= after) throw new Error('History cursor did not advance');
+            after = next;
+          }
+          // Refresh previously reached history without widening its membership:
+          // one bounded read; a turn it no longer returns is gone.
+          const reached = this.stateSnapshot.tasks
+            .filter(
+              (task) =>
+                task.status !== TaskStatus.QUEUED &&
+                !page.some((item) => item.task_id === task.task_id)
+            )
+            .map((task) => task.task_id);
+          for (const id of reached) byId.delete(id);
+          for (const task of await this.fetchLeanTasks(reached, stale))
+            byId.set(task.task_id, task);
+          if (stale()) return 'ended';
+        }
+      }
+      for (const task of page) byId.set(task.task_id, task);
+      const fetchedIds = new Set(byId.keys());
+      // A settled turn displayed above the plan's start is about to leave.
+      const leaving = (task: Task) =>
+        !!plan &&
+        isTerminalTaskStatus(task.status) &&
+        (this.displayRank(task.task_id, session) ?? Number.POSITIVE_INFINITY) < plan.start;
+      const tasks = this.reconcileTaskFetch(taskToken, [...byId.values()]);
+      const fullIds = new Set(this.stateSnapshot.loadedTaskIds);
+      const snapshots = new Map<string, Message[]>();
+      const sequences = new Map<string, number>();
+      // The executing turn belongs to the latest nonqueued page; hydrate it fully
+      // without a separate active-task lookup. Queued prompts do not consume page slots.
+      const hydrateTasks = tasks.filter(
+        (task) =>
+          task.status !== TaskStatus.QUEUED &&
+          (mode === 'sync' || page.some((item) => item.task_id === task.task_id)) &&
+          !leaving(task)
+      );
+      for (const task of hydrateTasks) {
+        if (isLeanActive(task)) this.markLeanLive(task.task_id);
+        if (this.leanLiveTaskIds.has(task.task_id)) fullIds.add(task.task_id);
+        sequences.set(task.task_id, this.messageCacheMutationsByTask.get(task.task_id) ?? 0);
+        snapshots.set(task.task_id, []);
+      }
+      const leanIds = hydrateTasks
+        .filter((task) => !fullIds.has(task.task_id))
+        .map((task) => task.task_id);
+      const leanMessages = await this.fetchLeanTaskMessages(leanIds, stale);
+      if (stale()) return 'ended';
+      for (const message of leanMessages) {
+        if (message.task_id) snapshots.get(message.task_id)?.push(message);
+      }
+      for (const task of hydrateTasks) {
+        if (stale()) return 'ended';
+        if (fullIds.has(task.task_id))
+          snapshots.set(task.task_id, await this.fetchTaskMessagesAtHighWater(task.task_id));
+      }
+      if (
+        this.disposed ||
+        this.stateSnapshot.terminal ||
+        generation !== this.leanConnectionGeneration
+      )
+        return 'ended';
+      // A rebase drops the turns above its start. If one became protected while
+      // this read was in flight, plan again: never drop it, nor keep it above a gap.
+      if (
+        plan &&
+        window &&
+        plan.start > window.start &&
+        (this.leanProtectedRank({ ...this.stateSnapshot, session }) ?? plan.start) < plan.start
+      )
+        return 'replan';
+      // Display order abandoned while this read was in flight: plan again.
+      if (display && this.leanOrder === 'legacy') return 'replan';
+      const reset = !display && this.leanCursorReset;
+      if (!display && page.length && (older || reset || !this.leanOldestTaskId))
+        this.leanOldestTaskId = page.at(-1)!.task_id;
+      if (reset) this.leanCursorReset = false;
+      if (this.options.cacheScope === 'session' && !this.leanOrder)
+        this.leanOrder = display ? 'display' : 'legacy';
+      this.updateState((prev) => {
+        // Commit the snapshot's rows and turns already shown. A journaled event
+        // alone names a turn its live handler refused (trimmed, or above the
+        // transcript). In display order the transcript starts at the plan's
+        // position.
+        const shown = new Set(prev.tasks.map((task) => task.task_id));
+        const start = plan?.start;
+        const reconciled = this.reconcileTaskFetch(taskToken, tasks).filter(
+          (task) =>
+            (shown.has(task.task_id) || fetchedIds.has(task.task_id)) &&
+            (start === undefined ||
+              !isTerminalTaskStatus(task.status) ||
+              (this.displayRank(task.task_id, session) ?? Number.POSITIVE_INFINITY) >= start)
+        );
+        const kept = new Set(reconciled.map((task) => task.task_id));
+        prev = this.forgetLeanTurns(prev, new Set([...shown].filter((id) => !kept.has(id))));
+        if (plan && start !== undefined) {
+          this.leanWindow = { start, reconciled: Math.max(plan.reconciled, start) };
+          if ((session.tasks?.length ?? 0) >= (this.leanBasis?.length ?? 0))
+            this.leanBasis = session.tasks ?? [];
+        }
+        const committedTasks = orderTasksBySession(reconciled, session.tasks);
+        const ids = new Set<string>(committedTasks.map((task) => task.task_id));
+        const messagesByTask = new Map([...prev.messagesByTask].filter(([id]) => ids.has(id)));
+        const loadedTaskIds = new Set([...prev.loadedTaskIds].filter((id) => ids.has(id)));
+        const fetched = new Map<string, Message[]>();
+        for (const [id, snapshot] of snapshots) {
+          if (!ids.has(id) || sequences.get(id) !== (this.messageCacheMutationsByTask.get(id) ?? 0))
+            continue;
+          // A full expansion may have completed while this lean query was in flight.
+          // Never replace its tools with a projected snapshot while keeping the loaded bit.
+          if (!fullIds.has(id) && prev.loadedTaskIds.has(id)) continue;
+          const merged = this.reconcileMessageFetch(
+            messageToken,
+            snapshot,
+            (message) => message.task_id === id && this.matchesSession(message.session_id)
+          );
+          messagesByTask.set(id, merged);
+          fetched.set(id, merged);
+          if (fullIds.has(id)) loadedTaskIds.add(id);
+        }
+        return {
+          ...prev,
+          session: this.sessionMutationSequence > sessionSequence ? prev.session : session,
+          tasks: committedTasks,
+          messagesByTask,
+          loadedTaskIds,
+          streamingMessages: restampStreamingTaskIds(
+            this.reconcilePersistedStreams(prev.streamingMessages, fetched, messageToken),
+            committedTasks
+          ),
+          hasOlderTasks:
+            start !== undefined
+              ? start > 0
+              : older || reset || prev.hasOlderTasks === undefined
+                ? hasOlder
+                : prev.hasOlderTasks,
+          loading: false,
+          error: null,
+          lastSyncedAt: new Date().toISOString(),
+        };
+      });
+      return 'committed';
+    } catch (error) {
+      if (stale()) return 'ended';
+      const terminal = [403, 404].includes(errorStatusCode(error) ?? 0);
+      this.updateState((prev) => ({
+        ...prev,
+        loading: false,
+        terminal: prev.terminal || terminal,
+        error: error instanceof Error ? error.message : 'Could not load history',
+        ...(terminal
+          ? {
+              messagesByTask: new Map(),
+              tasks: [],
+              loadedTaskIds: new Set(),
+              streamingMessages: new Map(),
+            }
+          : {}),
+      }));
+      if (older) throw error;
+    } finally {
+      this.cancelTaskFetch(taskToken);
+      this.cancelMessageFetch(messageToken);
+    }
+    return 'ended';
+  }
+
+  private async bootstrap(): Promise<void> {
+    if (this.options.taskHydration === 'lean') return this.syncLeanHistory();
+    const taskFetchToken = this.beginTaskFetch();
+    const sessionFetchSequence = this.sessionMutationSequence;
+    let messageFetchToken: number | null = null;
+    try {
+      const [session, taskSnapshot] = await Promise.all([
+        this.client.service('sessions').get(this.sessionId),
+        this.fetchTasksAtHighWater(),
+        this.refreshQueue(),
+      ]);
+
+      // The fetched row's id is canonical even when we asked by short id — the
+      // authoritative source for event matching.
+      if (session?.session_id) this.canonicalSessionId = session.session_id;
+      if (!this.taskFetches.has(taskFetchToken)) return this.endAbandonedBootstrap();
+
+      // Use journaled Tasks to choose the lazy target, but do not close the
+      // journal yet. It stays live through every slower bootstrap request and
+      // the final state commit below.
+      const provisionalTasks = this.reconcileTaskFetch(taskFetchToken, taskSnapshot);
+      let eagerMessageSnapshot: Message[] | null = null;
+      let lazyMessageSnapshot: {
+        taskId: string;
+        messages: Message[];
+        cacheSequence: number;
+      } | null = null;
+
+      if (this.options.taskHydration === 'eager') {
+        messageFetchToken = this.beginMessageFetch();
+        eagerMessageSnapshot = await this.fetchSessionMessagesAtHighWater();
+      } else if (this.options.taskHydration === 'lazy') {
+        // The conversation view expands the latest non-queued task by default
+        // and auto-scrolls to it. Hydrating that task's messages here — before
+        // we flip loading:false so ready() resolves with them in place —
+        // guarantees the scroll target exists in the first render, instead of
+        // landing on a header placeholder while TaskBlock lazy-loads the
+        // messages afterward.
+        const latestTask = findLatestHydratableTask(provisionalTasks);
+        if (latestTask) {
+          messageFetchToken = this.beginMessageFetch();
+          try {
+            // Like resync, bootstrap must not reverse a load/unload decision
+            // made while its automatic latest-Task fetch was pending.
+            const cacheSequence = this.messageCacheMutationsByTask.get(latestTask.task_id) ?? 0;
+            const latestMessages = await this.fetchTaskMessagesAtHighWater(latestTask.task_id);
+            lazyMessageSnapshot = {
+              taskId: latestTask.task_id,
+              messages: latestMessages,
+              cacheSequence,
+            };
+          } catch {
+            this.cancelMessageFetch(messageFetchToken);
+            messageFetchToken = null;
+            // Non-fatal: leave the latest task unhydrated so the rest of
+            // bootstrap still succeeds; TaskBlock will lazy-load it as before.
+          }
+        }
+      }
+
+      if (!this.taskFetches.has(taskFetchToken)) return this.endAbandonedBootstrap();
+      this.updateState((prev) =>
+        this.commitBootstrapState({
+          previous: prev,
+          fetchedSession: session,
+          sessionFetchSequence,
+          taskFetchToken,
+          taskSnapshot,
+          messageFetchToken,
+          eagerMessageSnapshot,
+          lazyMessageSnapshot,
+        })
+      );
+    } catch (error) {
+      // Mirror doResync()'s terminal classification — a 403/404 on the
+      // initial mount is just as "doomed to retry" as on reconnect, and
+      // without this the UI's auto-retry loop would keep poking a deleted/
+      // forbidden session on every focus change until the component
+      // remounts.
+      const status = errorStatusCode(error);
+      const terminal = status === 403 || status === 404;
+      this.updateState((prev) => ({
+        ...prev,
+        loading: false,
+        error: error instanceof Error ? error.message : 'Failed to bootstrap reactive session',
+        terminal: prev.terminal || terminal,
+      }));
+    } finally {
+      this.cancelTaskFetch(taskFetchToken);
+      if (messageFetchToken !== null) this.cancelMessageFetch(messageFetchToken);
+    }
+  }
+
+  /** Disconnected mid-bootstrap: the reconnect resync owns the data. */
+  private endAbandonedBootstrap(): void {
+    this.updateState((prev) => ({ ...prev, loading: false }));
+  }
+
+  private attachListeners(): void {
+    const sessionsService = this.client.service('sessions');
+    const tasksService = this.client.service('tasks');
+    const messagesService = this.client.service('messages');
+
+    const onSocketConnect = () => {
+      if (this.disposed) return;
+      this.updateState((prev) => ({ ...prev, connected: true }));
+      // A reconnect is a new connection with no room membership. Await the
+      // shared re-subscribe (deduped to one join per session across handles)
+      // BEFORE resyncing — the same subscribe-then-hydrate ordering as attach,
+      // so a chunk arriving after the join lands on top of the resynced state.
+      this.readyPromise = this.subscribeThenHydrate(
+        resubscribeSessionStream(this.client, this.sessionId),
+        () => this.resync()
+      );
+    };
+    const onSocketDisconnect = () => {
+      if (this.disposed) return;
+      this.queueInvalidation += 1;
+      if (this.options.taskHydration === 'lean') this.leanConnectionGeneration += 1;
+      this.abandonInflightFetches();
+      this.updateState((prev) => ({ ...prev, connected: false }));
+    };
+    this.client.io.on('connect', onSocketConnect);
+    this.client.io.on('disconnect', onSocketDisconnect);
+    this.disposeCallbacks.push(() => this.client.io.off('connect', onSocketConnect));
+    this.disposeCallbacks.push(() => this.client.io.off('disconnect', onSocketDisconnect));
+
+    const onSessionPatched = (session: Session) => {
+      if (!this.matchesSession(session.session_id)) return;
+      this.sessionMutationSequence += 1;
+      // Rebuild in task-ID order, keeping every turn shown.
+      if (!this.acceptLeanOrder(session.tasks)) void this.syncLeanHistory().catch(() => {});
+      this.updateState((prev) => ({
+        ...prev,
+        session,
+        tasks: orderTasksBySession(prev.tasks, session.tasks),
+        lastSyncedAt: new Date().toISOString(),
+      }));
+      this.invalidateLeanSuffix();
+    };
+    const onSessionRemoved = (session: Session) => {
+      if (!this.matchesSession(session.session_id)) return;
+      this.sessionMutationSequence += 1;
+      this.updateState((prev) => ({
+        ...prev,
+        session: null,
+        ...(this.options.taskHydration === 'lean'
+          ? {
+              tasks: [],
+              messagesByTask: new Map(),
+              loadedTaskIds: new Set(),
+              streamingMessages: new Map(),
+              toolsByTask: new Map(),
+            }
+          : {}),
+        error: 'Session was removed',
+        terminal: true,
+        lastSyncedAt: new Date().toISOString(),
+      }));
+    };
+    sessionsService.on('patched', onSessionPatched);
+    sessionsService.on('updated', onSessionPatched);
+    sessionsService.on('removed', onSessionRemoved);
+    this.disposeCallbacks.push(() => sessionsService.removeListener('patched', onSessionPatched));
+    this.disposeCallbacks.push(() => sessionsService.removeListener('updated', onSessionPatched));
+    this.disposeCallbacks.push(() => sessionsService.removeListener('removed', onSessionRemoved));
+
+    const onTaskCreated = (task: Task) => {
+      if (!this.matchesSession(task.session_id)) return;
+      this.invalidateQueue(task);
+      if (task.status === TaskStatus.QUEUED) return;
+      if (isLeanActive(task)) this.markLeanLive(task.task_id);
+      this.recordTaskMutation('upsert', task);
+      if (this.outsideLeanWindow(task.task_id, task)) return;
+      this.updateState((prev) => {
+        const tasks = prev.tasks.some((t) => t.task_id === task.task_id)
+          ? prev.tasks
+          : orderTasksBySession([...prev.tasks, task], prev.session?.tasks);
+        return {
+          ...prev,
+          tasks,
+          lastSyncedAt: new Date().toISOString(),
+        };
+      });
+    };
+    const onTaskPatched = (task: Task) => {
+      if (!this.matchesSession(task.session_id)) return;
+      this.invalidateQueue(task);
+      if (task.status === TaskStatus.QUEUED) return;
+      if (isLeanActive(task)) this.markLeanLive(task.task_id);
+      this.recordTaskMutation('upsert', task);
+      if (this.outsideLeanWindow(task.task_id, task)) return;
+      this.updateState((prev) => {
+        const index = prev.tasks.findIndex((t) => t.task_id === task.task_id);
+        const nextTasks = index === -1 ? [...prev.tasks, task] : [...prev.tasks];
+        if (index !== -1) {
+          nextTasks[index] = task;
+        }
+
+        return {
+          ...prev,
+          tasks: orderTasksBySession(nextTasks, prev.session?.tasks),
+          lastSyncedAt: new Date().toISOString(),
+        };
+      });
+    };
+    const onTaskRemoved = (task: Task) => {
+      if (!this.matchesSession(task.session_id)) return;
+      this.invalidateQueue(task, true);
+      this.recordTaskMutation('remove', task);
+      this.updateState((prev) => {
+        const nextByTask = new Map(prev.messagesByTask);
+        nextByTask.delete(task.task_id);
+        const nextLoaded = new Set(prev.loadedTaskIds);
+        nextLoaded.delete(task.task_id);
+        const nextTools = new Map(prev.toolsByTask);
+        nextTools.delete(task.task_id);
+        return {
+          ...prev,
+          tasks: prev.tasks.filter((t) => t.task_id !== task.task_id),
+          messagesByTask: nextByTask,
+          loadedTaskIds: nextLoaded,
+          toolsByTask: nextTools,
+          lastSyncedAt: new Date().toISOString(),
+        };
+      });
+    };
+    // The daemon emits a custom 'queued' event in addition to the standard
+    // 'created' event, so subscribers can distinguish "task entered the queue"
+    // from "task was created but is already running". onTaskCreated handles
+    // the invalidation too as a safety net for clients that miss the event.
+    const onTaskQueued = (task: Task) => onTaskCreated(task);
+
+    tasksService.on('created', onTaskCreated);
+    tasksService.on('patched', onTaskPatched);
+    tasksService.on('updated', onTaskPatched);
+    tasksService.on('removed', onTaskRemoved);
+    tasksService.on('queued', onTaskQueued as (...args: unknown[]) => void);
+    this.disposeCallbacks.push(() => tasksService.removeListener('created', onTaskCreated));
+    this.disposeCallbacks.push(() => tasksService.removeListener('patched', onTaskPatched));
+    this.disposeCallbacks.push(() => tasksService.removeListener('updated', onTaskPatched));
+    this.disposeCallbacks.push(() => tasksService.removeListener('removed', onTaskRemoved));
+    this.disposeCallbacks.push(() =>
+      tasksService.removeListener('queued', onTaskQueued as (...args: unknown[]) => void)
+    );
+
+    const onToolStart = (event: ToolStartEvent) => {
+      if (!this.matchesSession(event.session_id) || this.outsideLeanWindow(event.task_id)) return;
+      if (this.options.taskHydration === 'lean') this.markLeanLive(event.task_id);
+      this.updateState((prev) => {
+        const existing = prev.toolsByTask.get(event.task_id) || [];
+        if (existing.some((t) => t.toolUseId === event.tool_use_id)) return prev;
+        const nextTools = new Map(prev.toolsByTask);
+        nextTools.set(event.task_id, [
+          ...existing,
+          {
+            toolUseId: event.tool_use_id,
+            toolName: event.tool_name,
+            status: 'executing',
+          },
+        ]);
+        return {
+          ...prev,
+          toolsByTask: nextTools,
+        };
+      });
+    };
+    const onToolComplete = (event: ToolCompleteEvent) => {
+      if (!this.matchesSession(event.session_id) || this.outsideLeanWindow(event.task_id)) return;
+      if (this.options.taskHydration === 'lean') this.markLeanLive(event.task_id);
+      this.updateState((prev) => {
+        const existing = prev.toolsByTask.get(event.task_id) || [];
+        if (existing.length === 0) return prev;
+        const nextTools = new Map(prev.toolsByTask);
+        nextTools.set(
+          event.task_id,
+          existing.map((tool) =>
+            tool.toolUseId === event.tool_use_id ? { ...tool, status: 'complete' as const } : tool
+          )
+        );
+        return {
+          ...prev,
+          toolsByTask: nextTools,
+        };
+      });
+    };
+    tasksService.on('tool:start', onToolStart as (...args: unknown[]) => void);
+    tasksService.on('tool:complete', onToolComplete as (...args: unknown[]) => void);
+    this.disposeCallbacks.push(() =>
+      tasksService.removeListener('tool:start', onToolStart as (...args: unknown[]) => void)
+    );
+    this.disposeCallbacks.push(() =>
+      tasksService.removeListener('tool:complete', onToolComplete as (...args: unknown[]) => void)
+    );
+
+    const onMessageCreated = (message: Message) => {
+      if (!this.matchesSession(message.session_id)) return;
+      this.recordMessageMutation('upsert', message);
+      this.updateState((prev) => {
+        const nextStreaming = new Map(prev.streamingMessages);
+        nextStreaming.delete(message.message_id);
+        if (!message.task_id) {
+          return {
+            ...prev,
+            streamingMessages: nextStreaming,
+            lastSyncedAt: new Date().toISOString(),
+          };
+        }
+
+        const shouldTrackMessages =
+          (this.options.taskHydration === 'lean' && !this.outsideLeanWindow(message.task_id)) ||
+          this.options.taskHydration === 'eager' ||
+          prev.loadedTaskIds.has(message.task_id);
+
+        if (!shouldTrackMessages) {
+          return {
+            ...prev,
+            streamingMessages: nextStreaming,
+            lastSyncedAt: new Date().toISOString(),
+          };
+        }
+
+        const nextByTask = upsertMessageInTaskMap(prev.messagesByTask, message);
+
+        return {
+          ...prev,
+          messagesByTask: nextByTask,
+          streamingMessages: nextStreaming,
+          lastSyncedAt: new Date().toISOString(),
+        };
+      });
+    };
+
+    const onMessagePatched = (message: Message) => {
+      const taskId = message.task_id;
+      if (!this.matchesSession(message.session_id) || !taskId) return;
+      this.recordMessageMutation('upsert', message);
+      this.updateState((prev) => {
+        const shouldTrackMessages =
+          (this.options.taskHydration === 'lean' && !this.outsideLeanWindow(taskId)) ||
+          this.options.taskHydration === 'eager' ||
+          prev.loadedTaskIds.has(taskId);
+        if (!shouldTrackMessages) return prev;
+        const nextByTask = upsertMessageInTaskMap(prev.messagesByTask, message);
+        return {
+          ...prev,
+          messagesByTask: nextByTask,
+          lastSyncedAt: new Date().toISOString(),
+        };
+      });
+    };
+
+    const onMessageRemoved = (message: Message) => {
+      if (!this.matchesSession(message.session_id)) return;
+      this.recordMessageMutation('remove', message);
+      const taskId = message.task_id;
+      this.updateState((prev) => {
+        const nextStreaming = new Map(prev.streamingMessages);
+        nextStreaming.delete(message.message_id);
+        if (!taskId || this.outsideLeanWindow(taskId)) {
+          return {
+            ...prev,
+            streamingMessages: nextStreaming,
+            lastSyncedAt: new Date().toISOString(),
+          };
+        }
+        const current = prev.messagesByTask.get(taskId) || [];
+        const nextByTask = new Map(prev.messagesByTask);
+        nextByTask.set(
+          taskId,
+          current.filter((m) => m.message_id !== message.message_id)
+        );
+        return {
+          ...prev,
+          streamingMessages: nextStreaming,
+          messagesByTask: nextByTask,
+          lastSyncedAt: new Date().toISOString(),
+        };
+      });
+    };
+
+    const onStreamingStart = (event: StreamingStartEvent) => {
+      if (!this.matchesSession(event.session_id) || !this.acceptsStreamActivity(event)) return;
+      this.updateState((prev) => {
+        const nextStreaming = new Map(prev.streamingMessages);
+        const existing = nextStreaming.get(event.message_id);
+        nextStreaming.set(event.message_id, {
+          ...existing,
+          message_id: event.message_id,
+          session_id: event.session_id,
+          task_id: event.task_id ?? existing?.task_id,
+          role: event.role,
+          content: existing?.content || '',
+          thinkingContent: existing?.thinkingContent || '',
+          timestamp: existing?.timestamp || event.timestamp,
+          isStreaming: true,
+          isTextStreaming: true,
+        });
+        return {
+          ...prev,
+          streamingMessages: nextStreaming,
+        };
+      });
+    };
+
+    const onStreamingChunk = (event: StreamingChunkEvent) => {
+      if (!this.matchesSession(event.session_id) || !this.acceptsStreamActivity(event)) return;
+      this.updateState((prev) => {
+        const current = prev.streamingMessages.get(event.message_id);
+        const nextStreaming = new Map(prev.streamingMessages);
+        if (current) {
+          nextStreaming.set(event.message_id, {
+            ...current,
+            content: current.content + event.chunk,
+            isTextStreaming: true,
+            isStreaming: true,
+          });
+        } else {
+          // Attached or reconnected after streaming:start already fired: the
+          // start event won't repeat, so initialize the stream from this chunk
+          // instead of dropping it. Content begins here; earlier text arrives
+          // when the message row lands at the next boundary (onMessageCreated
+          // then clears this entry). task_id is inferred from the active task
+          // so the live text groups under the right TaskBlock.
+          nextStreaming.set(event.message_id, {
+            message_id: event.message_id,
+            session_id: event.session_id,
+            task_id: event.task_id ?? this.indexStreamTasks(prev.tasks).latestExecutingId,
+            role: 'assistant',
+            content: event.chunk,
+            thinkingContent: '',
+            timestamp: new Date().toISOString(),
+            isStreaming: true,
+            isTextStreaming: true,
+          });
+        }
+        return {
+          ...prev,
+          streamingMessages: nextStreaming,
+        };
+      });
+    };
+
+    const onStreamingEnd = (event: StreamingEndEvent) => {
+      if (!this.matchesSession(event.session_id)) return;
+      this.updateState((prev) => {
+        const current = prev.streamingMessages.get(event.message_id);
+        if (!current || (event.task_id && current.task_id && event.task_id !== current.task_id))
+          return prev;
+        const nextStreaming = new Map(prev.streamingMessages);
+        nextStreaming.set(event.message_id, {
+          ...current,
+          isStreaming: !!current.isThinking,
+          isTextStreaming: false,
+        });
+        return {
+          ...prev,
+          streamingMessages: nextStreaming,
+        };
+      });
+    };
+
+    const onStreamingError = (event: StreamingErrorEvent) => {
+      if (!this.matchesSession(event.session_id) || this.stateSnapshot.terminal) return;
+      this.updateState((prev) => {
+        const current = prev.streamingMessages.get(event.message_id);
+        if (event.task_id && current?.task_id && event.task_id !== current.task_id) return prev;
+        // Terminal settlement discarded the payload, not permission to attribute
+        // a late error. Require an exact observed ID/task pair, never latest-task
+        // inference or an arbitrary unknown message on a known terminal task.
+        const retiredTaskId = this.retiredStreamTasks.get(event.message_id);
+        if (!current && (!event.task_id || event.task_id !== retiredTaskId)) return prev;
+        const nextStreaming = new Map(prev.streamingMessages);
+        nextStreaming.set(event.message_id, {
+          ...(current ?? {
+            message_id: event.message_id,
+            session_id: event.session_id,
+            task_id: retiredTaskId,
+            role: 'assistant' as const,
+            content: '',
+            timestamp: new Date().toISOString(),
+          }),
+          error: event.error,
+          isStreaming: false,
+          isThinking: false,
+          isTextStreaming: false,
+        });
+        this.retiredStreamTasks.delete(event.message_id);
+        return { ...prev, streamingMessages: nextStreaming };
+      });
+    };
+
+    const onThinkingStart = (event: ThinkingStartEvent) => {
+      if (!this.matchesSession(event.session_id) || !this.acceptsStreamActivity(event)) return;
+      this.updateState((prev) => {
+        const nextStreaming = new Map(prev.streamingMessages);
+        const existing = nextStreaming.get(event.message_id);
+        nextStreaming.set(event.message_id, {
+          ...existing,
+          message_id: event.message_id,
+          session_id: event.session_id,
+          task_id: event.task_id ?? existing?.task_id,
+          role: 'assistant',
+          content: existing?.content || '',
+          thinkingContent: existing?.thinkingContent || '',
+          timestamp: existing?.timestamp || event.timestamp,
+          isStreaming: true,
+          isThinking: true,
+        });
+        return {
+          ...prev,
+          streamingMessages: nextStreaming,
+        };
+      });
+    };
+
+    const onThinkingChunk = (event: ThinkingChunkEvent) => {
+      if (!this.matchesSession(event.session_id) || !this.acceptsStreamActivity(event)) return;
+      this.updateState((prev) => {
+        const current = prev.streamingMessages.get(event.message_id);
+        const nextStreaming = new Map(prev.streamingMessages);
+        if (current) {
+          nextStreaming.set(event.message_id, {
+            ...current,
+            isThinking: true,
+            isStreaming: true,
+            thinkingContent: (current.thinkingContent || '') + event.chunk,
+          });
+        } else {
+          // Attached mid-thinking (a long thinking block, no start replay):
+          // initialize from this chunk so live thinking renders under the
+          // active task instead of being dropped.
+          nextStreaming.set(event.message_id, {
+            message_id: event.message_id,
+            session_id: event.session_id,
+            task_id: event.task_id ?? this.indexStreamTasks(prev.tasks).latestExecutingId,
+            role: 'assistant',
+            content: '',
+            thinkingContent: event.chunk,
+            timestamp: new Date().toISOString(),
+            isStreaming: true,
+            isThinking: true,
+          });
+        }
+        return {
+          ...prev,
+          streamingMessages: nextStreaming,
+        };
+      });
+    };
+
+    const onThinkingEnd = (event: ThinkingEndEvent) => {
+      if (!this.matchesSession(event.session_id)) return;
+      this.updateState((prev) => {
+        const current = prev.streamingMessages.get(event.message_id);
+        if (!current || (event.task_id && current.task_id && event.task_id !== current.task_id))
+          return prev;
+        const nextStreaming = new Map(prev.streamingMessages);
+        nextStreaming.set(event.message_id, {
+          ...current,
+          isThinking: false,
+          isStreaming: !!current.isTextStreaming,
+        });
+        return {
+          ...prev,
+          streamingMessages: nextStreaming,
+        };
+      });
+    };
+
+    messagesService.on('created', onMessageCreated);
+    messagesService.on('patched', onMessagePatched);
+    messagesService.on('updated', onMessagePatched);
+    messagesService.on('removed', onMessageRemoved);
+    messagesService.on('streaming:start', onStreamingStart as (...args: unknown[]) => void);
+    messagesService.on('streaming:chunk', onStreamingChunk as (...args: unknown[]) => void);
+    messagesService.on('streaming:end', onStreamingEnd as (...args: unknown[]) => void);
+    messagesService.on('streaming:error', onStreamingError as (...args: unknown[]) => void);
+    messagesService.on('thinking:start', onThinkingStart as (...args: unknown[]) => void);
+    messagesService.on('thinking:chunk', onThinkingChunk as (...args: unknown[]) => void);
+    messagesService.on('thinking:end', onThinkingEnd as (...args: unknown[]) => void);
+
+    this.disposeCallbacks.push(() => messagesService.removeListener('created', onMessageCreated));
+    this.disposeCallbacks.push(() => messagesService.removeListener('patched', onMessagePatched));
+    this.disposeCallbacks.push(() => messagesService.removeListener('updated', onMessagePatched));
+    this.disposeCallbacks.push(() => messagesService.removeListener('removed', onMessageRemoved));
+    this.disposeCallbacks.push(() =>
+      messagesService.removeListener(
+        'streaming:start',
+        onStreamingStart as (...args: unknown[]) => void
+      )
+    );
+    this.disposeCallbacks.push(() =>
+      messagesService.removeListener(
+        'streaming:chunk',
+        onStreamingChunk as (...args: unknown[]) => void
+      )
+    );
+    this.disposeCallbacks.push(() =>
+      messagesService.removeListener(
+        'streaming:end',
+        onStreamingEnd as (...args: unknown[]) => void
+      )
+    );
+    this.disposeCallbacks.push(() =>
+      messagesService.removeListener(
+        'streaming:error',
+        onStreamingError as (...args: unknown[]) => void
+      )
+    );
+    this.disposeCallbacks.push(() =>
+      messagesService.removeListener(
+        'thinking:start',
+        onThinkingStart as (...args: unknown[]) => void
+      )
+    );
+    this.disposeCallbacks.push(() =>
+      messagesService.removeListener(
+        'thinking:chunk',
+        onThinkingChunk as (...args: unknown[]) => void
+      )
+    );
+    this.disposeCallbacks.push(() =>
+      messagesService.removeListener('thinking:end', onThinkingEnd as (...args: unknown[]) => void)
+    );
+  }
+
+  /**
+   * In-flight `resync()` promise, if any. Used to single-flight overlapping
+   * callers (socket `connect`, visibilitychange, manual Reload) so a slow
+   * failure cannot stomp on a later success and re-stamp a stale error.
+   */
+  private resyncInflight: Promise<void> | null = null;
+  private resyncGeneration = -1;
+
+  /**
+   * Re-fetch session/tasks/queue (and loaded message buckets) from the daemon.
+   *
+   * Called automatically on socket `connect` events (see {@link attachListeners})
+   * so a reconnect after sleep / network drop pulls fresh DB state. Also
+   * exposed publicly so the UI can re-trigger hydration manually — e.g. a
+   * "Reload" button on the conversation panel's error banner, or a
+   * `visibilitychange` / token-refresh listener that wants to recover from a
+   * sticky error without forcing the user to refresh the tab.
+   *
+   * Errors land in `state.error`; success clears it.
+   *
+   * Single-flighted: concurrent callers join the same in-flight promise rather
+   * than racing one another. Without this, a slow failing fetch could land
+   * after a faster successful fetch and overwrite the cleared error with a
+   * stale one. Callers should still check `state.terminal` before re-calling
+   * after a failure — see {@link ReactiveSessionState.terminal}.
+   */
+  async resync(): Promise<void> {
+    if (this.disposed) return;
+    if (this.resyncInflight) {
+      if (this.resyncGeneration === this.leanConnectionGeneration) return this.resyncInflight;
+      await this.resyncInflight;
+      return this.resync();
+    }
+    this.resyncGeneration = this.leanConnectionGeneration;
+    const promise = this.doResync();
+    this.resyncInflight = promise;
+    try {
+      await promise;
+    } finally {
+      if (this.resyncInflight === promise) {
+        this.resyncInflight = null;
+      }
+    }
+  }
+
+  private async doResync(): Promise<void> {
+    if (this.options.taskHydration === 'lean') return this.syncLeanHistory();
+    const taskFetchToken = this.beginTaskFetch();
+    const sessionFetchSequence = this.sessionMutationSequence;
+    let messageFetchToken: number | null = null;
+    try {
+      const [session, taskSnapshot] = await Promise.all([
+        this.client.service('sessions').get(this.sessionId),
+        this.fetchTasksAtHighWater(),
+        this.refreshQueue(),
+      ]);
+
+      // The fetched row's id is canonical even when we asked by short id.
+      if (session?.session_id) this.canonicalSessionId = session.session_id;
+      if (this.disposed || !this.taskFetches.has(taskFetchToken)) return;
+
+      const provisionalTasks = this.reconcileTaskFetch(taskFetchToken, taskSnapshot);
+      let eagerMessageSnapshot: Message[] | null = null;
+      let lazyMessageSnapshots: Map<string, Message[]> | null = null;
+      let lazyMessageCacheSequences: Map<string, number> | null = null;
+
+      if (this.options.taskHydration === 'eager') {
+        messageFetchToken = this.beginMessageFetch();
+        eagerMessageSnapshot = await this.fetchSessionMessagesAtHighWater();
+      } else if (this.options.taskHydration === 'lazy') {
+        // Preserve the bootstrap invariant across reconnect: the latest
+        // (expanded / scroll-target) task must stay hydrated even if a new task
+        // became the latest while disconnected, or bootstrap's hydration failed
+        // and left loadedTaskIds empty.
+        const latestId = findLatestHydratableTask(provisionalTasks)?.task_id;
+        const toRefresh = new Set(this.stateSnapshot.loadedTaskIds);
+        if (latestId) toRefresh.add(latestId);
+        if (toRefresh.size > 0) {
+          messageFetchToken = this.beginMessageFetch();
+          lazyMessageSnapshots = new Map<string, Message[]>();
+          lazyMessageCacheSequences = new Map(
+            [...toRefresh].map((taskId) => [
+              taskId,
+              this.messageCacheMutationsByTask.get(taskId) ?? 0,
+            ])
+          );
+          for (const taskId of toRefresh) {
+            const taskMessages = await this.fetchTaskMessagesAtHighWater(taskId);
+            lazyMessageSnapshots.set(taskId, taskMessages);
+          }
+        }
+      }
+
+      if (this.disposed || !this.taskFetches.has(taskFetchToken)) return;
+      this.updateState((prev) => {
+        const sessionChanged = this.sessionMutationSequence > sessionFetchSequence;
+        if (sessionChanged && prev.session === null && prev.terminal) return prev;
+        const committedSession = sessionChanged ? prev.session : session;
+        const tasks = orderTasksBySession(
+          this.reconcileTaskFetch(taskFetchToken, taskSnapshot),
+          committedSession?.tasks
+        );
+
+        let messagesByTask = prev.messagesByTask;
+        let loadedTaskIds = prev.loadedTaskIds;
+        const fetchedMessagesByTask = new Map<string, Message[]>();
+        if (eagerMessageSnapshot) {
+          const messages =
+            messageFetchToken === null
+              ? eagerMessageSnapshot
+              : this.reconcileMessageFetch(messageFetchToken, eagerMessageSnapshot, (message) =>
+                  this.matchesSession(message.session_id)
+                );
+          messagesByTask = groupMessagesByTask(messages);
+          for (const [taskId, taskMessages] of messagesByTask)
+            fetchedMessagesByTask.set(taskId, taskMessages);
+          loadedTaskIds = new Set(messagesByTask.keys());
+        } else if (lazyMessageSnapshots) {
+          // Start from commit-time cache membership. Buckets loaded while the
+          // resync was in flight stay present, and buckets unloaded during the
+          // resync stay absent. Apply a refreshed snapshot only when this Task
+          // has had no intervening load/unload decision.
+          const refreshedByTask = new Map(prev.messagesByTask);
+          const refreshedTaskIds = new Set(prev.loadedTaskIds);
+          for (const [taskId, snapshot] of lazyMessageSnapshots) {
+            const sequenceAtFetch = lazyMessageCacheSequences?.get(taskId) ?? 0;
+            const currentSequence = this.messageCacheMutationsByTask.get(taskId) ?? 0;
+            if (currentSequence !== sequenceAtFetch) continue;
+            refreshedByTask.set(
+              taskId,
+              messageFetchToken === null
+                ? sortMessagesByIndex(snapshot)
+                : this.reconcileMessageFetch(
+                    messageFetchToken,
+                    snapshot,
+                    (message) =>
+                      message.task_id === taskId && this.matchesSession(message.session_id)
+                  )
+            );
+            fetchedMessagesByTask.set(taskId, refreshedByTask.get(taskId)!);
+            refreshedTaskIds.add(taskId);
+          }
+          messagesByTask = refreshedByTask;
+          loadedTaskIds = refreshedTaskIds;
+        }
+
+        const liveTaskIds = new Set<string>(tasks.map((task) => task.task_id));
+        messagesByTask = new Map([...messagesByTask].filter(([taskId]) => liveTaskIds.has(taskId)));
+        loadedTaskIds = new Set([...loadedTaskIds].filter((taskId) => liveTaskIds.has(taskId)));
+
+        return {
+          ...prev,
+          session: committedSession,
+          tasks,
+          messagesByTask,
+          loadedTaskIds,
+          streamingMessages: restampStreamingTaskIds(
+            this.reconcilePersistedStreams(
+              prev.streamingMessages,
+              new Map([...fetchedMessagesByTask].filter(([taskId]) => liveTaskIds.has(taskId))),
+              messageFetchToken
+            ),
+            tasks
+          ),
+          error: null,
+          terminal: false,
+          lastSyncedAt: new Date().toISOString(),
+        };
+      });
+    } catch (error) {
+      // An abandoned resync failed with its transport; the reconnect retries.
+      if (this.disposed || !this.taskFetches.has(taskFetchToken)) return;
+      const status = errorStatusCode(error);
+      // 403 (forbidden) and 404 (not found) mean this session is gone
+      // from the user's perspective — retrying will keep failing. Mark
+      // terminal so the UI stops auto-refetching on every focus change.
+      // 401 is intentionally NOT terminal: the around-hook on the socket
+      // client will refresh and the next retry can succeed.
+      const terminal = status === 403 || status === 404;
+      this.updateState((prev) => ({
+        ...prev,
+        error: error instanceof Error ? error.message : 'Failed to resync reactive session',
+        terminal: prev.terminal || terminal,
+      }));
+    } finally {
+      this.cancelTaskFetch(taskFetchToken);
+      if (messageFetchToken !== null) this.cancelMessageFetch(messageFetchToken);
+    }
+  }
+}
+
+/**
+ * Best-effort HTTP status extraction for arbitrary errors thrown by the
+ * Feathers client / fetch / socket transport. Mirrors the field-soup that
+ * `apps/agor-ui`'s `authErrors.ts` walks, but inlined here to avoid a UI →
+ * client cross-package dependency for what is just three property reads.
+ */
+function errorStatusCode(err: unknown): number | undefined {
+  if (!err || typeof err !== 'object') return undefined;
+  const e = err as { code?: unknown; statusCode?: unknown; status?: unknown };
+  if (typeof e.code === 'number') return e.code;
+  if (typeof e.statusCode === 'number') return e.statusCode;
+  if (typeof e.status === 'number') return e.status;
+  return undefined;
+}
+
+export interface ReactiveAgorClient extends AgorClient {
+  session(sessionId: string, options?: ReactiveSessionOptions): ReactiveSessionHandle;
+}
+
+export function attachReactiveSessionApi(client: AgorClient): ReactiveAgorClient {
+  const reactiveClient = client as ReactiveAgorClient;
+  const target = reactiveClient as ReactiveAgorClient & {
+    session?: (sessionId: string, options?: ReactiveSessionOptions) => ReactiveSessionHandle;
+  };
+
+  if (typeof target.session === 'function') {
+    return reactiveClient;
+  }
+
+  target.session = (sessionId: string, options?: ReactiveSessionOptions) => {
+    return new ReactiveSessionHandle(client, sessionId, options);
+  };
+
+  return reactiveClient;
+}
+
+// --- Per-connection stream subscription registry ---------------------------
+//
+// A session-stream room membership is per socket CONNECTION, but several
+// ReactiveSessionHandles (e.g. a board peek, an open panel, and a transcript,
+// each with its own taskHydration) share ONE connection for the same session.
+// If every handle sent its own `remove` on dispose, disposing any one would
+// evict the shared connection from the room and silently kill the others'
+// streams. So subscription is refcounted; a single shared op chain orders
+// create/remove across handles (a late create from a disposing handle can't
+// land after a newer handle's create), and on reconnect every still-wanted
+// session re-subscribes exactly once.
+//
+// The room is keyed by the CANONICAL session id the daemon echoes from
+// `create` — not the caller-supplied id — because deep-link URLs carry short
+// ids while other surfaces use the full UUID, and both resolve to one room.
+// Two mechanisms keep exactly ONE refcounted membership per (client, canonical
+// room): (1) `keyToCanonical` re-keys/aliases an entry to the canonical id once
+// its ack returns, so a later retain of either id form reuses it without a
+// second `create`; (2) `roomWanters` counts the entries currently joined to a
+// canonical room, so `remove` fires only when the LAST retainer across all id
+// forms releases — even in the race where both forms subscribe before either
+// ack lands (their entries merge, and the count still gates the single remove).
+
+interface StreamSubscription {
+  refCount: number;
+  chain: Promise<void>;
+  /** Canonical room id echoed by create; used so `remove` leaves the right room. */
+  roomId: string | null;
+  wantSubscribed: boolean;
+  /** True once this entry has contributed +1 to `roomWanters[roomId]`. */
+  joined: boolean;
+  /** Set when this entry was folded into the canonical entry; its ops no-op. */
+  superseded: boolean;
+  /**
+   * The re-subscribe op for the CURRENT connection, shared by every handle so a
+   * reconnect re-subscribes each session exactly once. Reset to null on socket
+   * disconnect so the next reconnect issues a fresh join.
+   */
+  reconnect: Promise<void> | null;
+}
+
+interface ClientStreamState {
+  subs: Map<string, StreamSubscription>;
+  /** Caller-supplied id (short or full) → canonical room id, learned from acks. */
+  keyToCanonical: Map<string, string>;
+  /** Canonical room id → count of entries currently joined to it. */
+  roomWanters: Map<string, number>;
+  disconnectHandler: (() => void) | null;
+}
+
+const CLIENT_STREAM_STATE = new WeakMap<AgorClient, ClientStreamState>();
+
+function getClientStreamState(client: AgorClient): ClientStreamState {
+  let state = CLIENT_STREAM_STATE.get(client);
+  if (!state) {
+    state = {
+      subs: new Map(),
+      keyToCanonical: new Map(),
+      roomWanters: new Map(),
+      disconnectHandler: null,
+    };
+    CLIENT_STREAM_STATE.set(client, state);
+  }
+  return state;
+}
+
+function resolveStreamKey(state: ClientStreamState, sessionId: string): string {
+  return state.keyToCanonical.get(sessionId) ?? sessionId;
+}
+
+/**
+ * The canonical session id the daemon echoed for a caller-supplied id, learned
+ * from a `create` ack, or null if not yet known. Lets a short-id handle match
+ * incoming events (which carry the full UUID) once its subscription is acked.
+ */
+function getCanonicalSessionId(client: AgorClient, sessionId: string): string | null {
+  const state = CLIENT_STREAM_STATE.get(client);
+  const canonical = state?.keyToCanonical.get(sessionId);
+  return canonical && canonical !== sessionId ? canonical : null;
+}
+
+/** Serialize a create/remove op onto the subscription's shared chain. */
+function runSubscriptionOp(sub: StreamSubscription, op: () => Promise<void>): Promise<void> {
+  const next = sub.chain.then(op, op);
+  sub.chain = next.then(
+    () => undefined,
+    () => undefined
+  );
+  return next;
+}
+
+async function createSubscription(
+  client: AgorClient,
+  sessionId: string,
+  sub: StreamSubscription,
+  key: string
+): Promise<void> {
+  // Released or folded before this op ran — nothing to join.
+  if (!sub.wantSubscribed || sub.superseded) return;
+  let canonical: string | undefined;
+  try {
+    const result = (await client.service('session-streams').create({ session_id: sessionId })) as
+      | { session_id?: string }
+      | undefined;
+    canonical = typeof result?.session_id === 'string' ? result.session_id : undefined;
+  } catch {
+    // Deploy skew / access error: the daemon's owner fallback covers the
+    // creator's own tabs, and access errors also surface via bootstrap/resync.
+  }
+  if (!canonical) return;
+
+  const state = CLIENT_STREAM_STATE.get(client);
+  if (!state) return;
+
+  // Learn the mapping so future retains of either id form resolve to the room.
+  state.keyToCanonical.set(sessionId, canonical);
+  state.keyToCanonical.set(canonical, canonical);
+  if (key !== canonical) state.keyToCanonical.set(key, canonical);
+
+  // Normalize this entry onto the canonical id.
+  let target = sub;
+  if (key !== canonical && state.subs.get(canonical) !== sub) {
+    const existing = state.subs.get(canonical);
+    if (existing) {
+      // Race: another id form already established the canonical entry. Fold
+      // this entry's refcount into it and retire this one (its pending ops
+      // no-op via `superseded`); both joined the same room, so the count is
+      // taken from the canonical entry only.
+      existing.refCount += sub.refCount;
+      existing.wantSubscribed = existing.wantSubscribed || sub.wantSubscribed;
+      sub.superseded = true;
+      if (state.subs.get(key) === sub) state.subs.delete(key);
+      target = existing;
+    } else {
+      if (state.subs.get(key) === sub) state.subs.delete(key);
+      state.subs.set(canonical, sub);
+    }
+  }
+
+  target.roomId = canonical;
+  // The server-side join actually happened, so account for it even if the
+  // entry was released mid-flight — the pending remove (enqueued after this
+  // create) will then leave the room. Skipping this would leak the membership.
+  if (!target.joined) {
+    target.joined = true;
+    state.roomWanters.set(canonical, (state.roomWanters.get(canonical) ?? 0) + 1);
+  }
+}
+
+async function removeSubscription(client: AgorClient, sub: StreamSubscription): Promise<void> {
+  if (sub.superseded) return;
+  const state = CLIENT_STREAM_STATE.get(client);
+  const roomId = sub.roomId;
+  // Never joined (create failed / not yet acked): nothing to leave.
+  if (!sub.joined || !roomId || !state) return;
+  sub.joined = false;
+  const remaining = (state.roomWanters.get(roomId) ?? 1) - 1;
+  if (remaining > 0) {
+    // Another id-form entry still wants the room — keep the membership.
+    state.roomWanters.set(roomId, remaining);
+    return;
+  }
+  state.roomWanters.delete(roomId);
+  try {
+    await client.service('session-streams').remove(roomId);
+  } catch {
+    // Ignore — socket teardown removes room membership regardless.
+  }
+}
+
+// A reconnect is a new connection with no room membership. Reset each sub's
+// re-subscribe token on disconnect so the next `resubscribeSessionStream` (one
+// per session, driven by the handles' connect listeners) issues a fresh join.
+function ensureStreamDisconnectHandler(client: AgorClient, state: ClientStreamState): void {
+  if (state.disconnectHandler) return;
+  const handler = () => {
+    for (const sub of state.subs.values()) {
+      sub.reconnect = null;
+    }
+  };
+  state.disconnectHandler = handler;
+  client.io.on('disconnect', handler);
+}
+
+function retainSessionStream(client: AgorClient, sessionId: string): Promise<void> {
+  const state = getClientStreamState(client);
+  const key = resolveStreamKey(state, sessionId);
+  let sub = state.subs.get(key);
+  if (!sub) {
+    sub = {
+      refCount: 0,
+      chain: Promise.resolve(),
+      roomId: null,
+      wantSubscribed: false,
+      joined: false,
+      superseded: false,
+      reconnect: null,
+    };
+    state.subs.set(key, sub);
+  }
+  const was = sub.refCount;
+  sub.refCount += 1;
+  sub.wantSubscribed = true;
+  ensureStreamDisconnectHandler(client, state);
+  // First attach (including re-attach while a prior remove is still draining on
+  // the shared chain) enqueues the create; it lands after any pending remove.
+  if (was === 0) {
+    const target = sub;
+    return runSubscriptionOp(target, () => createSubscription(client, sessionId, target, key));
+  }
+  return sub.chain;
+}
+
+/**
+ * Re-subscribe a still-wanted session on reconnect and return the shared op
+ * promise so the caller can await the join BEFORE resyncing. Deduped per
+ * connection: the first handle to call it enqueues the create; every other
+ * handle for the same session awaits the same promise (exactly one join).
+ */
+function resubscribeSessionStream(client: AgorClient, sessionId: string): Promise<void> {
+  const state = CLIENT_STREAM_STATE.get(client);
+  if (!state) return Promise.resolve();
+  const key = resolveStreamKey(state, sessionId);
+  const sub = state.subs.get(key);
+  if (!sub?.wantSubscribed) return Promise.resolve();
+  if (!sub.reconnect) {
+    sub.reconnect = runSubscriptionOp(sub, () => createSubscription(client, sessionId, sub, key));
+  }
+  return sub.reconnect;
+}
+
+function releaseSessionStream(client: AgorClient, sessionId: string): void {
+  const state = CLIENT_STREAM_STATE.get(client);
+  if (!state) return;
+  const key = resolveStreamKey(state, sessionId);
+  const sub = state.subs.get(key);
+  if (!sub || sub.refCount === 0) return;
+  sub.refCount -= 1;
+  if (sub.refCount > 0) return;
+  sub.wantSubscribed = false;
+  void runSubscriptionOp(sub, () => removeSubscription(client, sub)).then(() => {
+    // Re-resolve the key: the create ack (which ran before this remove on the
+    // shared chain) may have re-keyed the entry from the id we captured to its
+    // canonical id — e.g. a short-id handle disposed before its ack. Consulting
+    // the stale key would leave the entry (and the connect-handler lifecycle)
+    // orphaned. Drop it only if nothing re-attached while the remove drained.
+    const currentKey = resolveStreamKey(state, sessionId);
+    if (sub.refCount === 0 && !sub.wantSubscribed && state.subs.get(currentKey) === sub) {
+      state.subs.delete(currentKey);
+      if (state.subs.size === 0 && state.disconnectHandler) {
+        client.io.off('disconnect', state.disconnectHandler);
+        state.disconnectHandler = null;
+        CLIENT_STREAM_STATE.delete(client);
+      }
+    }
+  });
+}
+
+/**
+ * @internal Test-only: number of live stream-subscription registry entries for
+ * a client (0 once the last release has torn the client's state down). Lets
+ * tests assert the registry doesn't leak entries across re-key / dispose races.
+ */
+export function __streamSubscriptionCountForTest(client: AgorClient): number {
+  return CLIENT_STREAM_STATE.get(client)?.subs.size ?? 0;
+}
+
+interface SharedReactiveSessionEntry {
+  handle: ReactiveSessionHandle;
+  refCount: number;
+}
+
+const SHARED_REACTIVE_SESSIONS = new WeakMap<AgorClient, Map<string, SharedReactiveSessionEntry>>();
+
+function normalizeReactiveSessionOptions(
+  options?: ReactiveSessionOptions
+): Required<ReactiveSessionOptions> {
+  return {
+    taskHydration: options?.taskHydration ?? 'lazy',
+    cacheScope: options?.cacheScope ?? 'session',
+  };
+}
+
+function getSharedSessionKey(sessionId: string, options: Required<ReactiveSessionOptions>): string {
+  return `${sessionId}:${options.taskHydration}:${options.cacheScope}`;
+}
+
+/**
+ * Retain a shared reactive session handle for a given client/session/options tuple.
+ * The handle is reference-counted and disposed when the last caller releases it.
+ */
+export function retainReactiveSession(
+  client: AgorClient,
+  sessionId: string,
+  options?: ReactiveSessionOptions
+): ReactiveSessionHandle {
+  const normalizedOptions = normalizeReactiveSessionOptions(options);
+  const cacheKey = getSharedSessionKey(sessionId, normalizedOptions);
+
+  let clientSessions = SHARED_REACTIVE_SESSIONS.get(client);
+  if (!clientSessions) {
+    clientSessions = new Map();
+    SHARED_REACTIVE_SESSIONS.set(client, clientSessions);
+  }
+
+  const existing = clientSessions.get(cacheKey);
+  if (existing) {
+    existing.refCount += 1;
+    return existing.handle;
+  }
+
+  const handle = new ReactiveSessionHandle(client, sessionId, normalizedOptions);
+  clientSessions.set(cacheKey, { handle, refCount: 1 });
+  return handle;
+}
+
+/**
+ * Release a retained shared reactive session handle.
+ * Disposes the underlying handle when ref count reaches zero.
+ */
+export function releaseReactiveSession(
+  client: AgorClient,
+  sessionId: string,
+  options?: ReactiveSessionOptions
+): void {
+  const normalizedOptions = normalizeReactiveSessionOptions(options);
+  const cacheKey = getSharedSessionKey(sessionId, normalizedOptions);
+  const clientSessions = SHARED_REACTIVE_SESSIONS.get(client);
+  if (!clientSessions) {
+    return;
+  }
+
+  const entry = clientSessions.get(cacheKey);
+  if (!entry) {
+    return;
+  }
+
+  entry.refCount -= 1;
+  if (entry.refCount <= 0) {
+    entry.handle.dispose();
+    clientSessions.delete(cacheKey);
+  }
+
+  if (clientSessions.size === 0) {
+    SHARED_REACTIVE_SESSIONS.delete(client);
+  }
+}
+
+/**
+ * The task the conversation view expands (and scrolls to) by default: the last
+ * task in the created_at-ascending list whose status isn't QUEUED. Queued tasks
+ * have no messages yet, so they are never the hydration / scroll target.
+ */
+function findLatestHydratableTask(tasks: Task[]): Task | undefined {
+  for (let i = tasks.length - 1; i >= 0; i--) {
+    if (tasks[i].status !== TaskStatus.QUEUED) return tasks[i];
+  }
+  return undefined;
+}
+
+/**
+ * Fill in task_id for streaming messages initialized from a chunk that arrived
+ * before task state was hydrated (task_id left undefined). Once tasks are known
+ * the latest hydratable task is the active one, so grouping repairs and the
+ * live text renders under the right TaskBlock. Returns the same map reference
+ * when nothing changed, to preserve downstream memoization.
+ */
+function restampStreamingTaskIds(
+  streamingMessages: ReactiveStreamingMessagesById,
+  tasks: Task[]
+): ReactiveStreamingMessagesById {
+  const activeTaskId = findLatestHydratableTask(tasks)?.task_id;
+  if (!activeTaskId) return streamingMessages;
+  let next = streamingMessages;
+  for (const [id, message] of streamingMessages) {
+    if (!message.task_id) {
+      if (next === streamingMessages) next = new Map(streamingMessages);
+      next.set(id, { ...message, task_id: activeTaskId });
+    }
+  }
+  return next;
+}
+
+/** A turn still waiting on the reader: an open permission, input or widget request. */
+function awaitsReader(messages: readonly Message[] | undefined): boolean {
+  return !!messages?.some(({ type, content, metadata }) => {
+    if (type === 'widget_request')
+      return metadata?.widget?.status === 'pending' || metadata?.widget?.status === 'resolving';
+    if (!content || typeof content !== 'object' || Array.isArray(content)) return false;
+    return (
+      (type === 'permission_request' && content.status === PermissionStatus.PENDING) ||
+      (type === 'input_request' && content.status === InputRequestStatus.PENDING)
+    );
+  });
+}
+
+function sortMessagesByIndex(messages: Message[]): Message[] {
+  return [...messages].sort(
+    (a, b) => a.index - b.index || a.message_id.localeCompare(b.message_id)
+  );
+}
+
+function upsertMessageInTaskMap(
+  messagesByTask: ReactiveMessagesByTask,
+  message: Message
+): ReactiveMessagesByTask {
+  if (!message.task_id) return messagesByTask;
+  const next = new Map(messagesByTask);
+
+  const current = next.get(message.task_id) || [];
+  const index = current.findIndex((candidate) => candidate.message_id === message.message_id);
+  const updated = index === -1 ? [...current, message] : [...current];
+  if (index !== -1) updated[index] = message;
+  next.set(message.task_id, sortMessagesByIndex(updated));
+  return next;
+}
+
+function sortTasksByCreatedAt(tasks: Task[]): Task[] {
+  return [...tasks].sort(
+    (a, b) =>
+      new Date(a.created_at).getTime() - new Date(b.created_at).getTime() ||
+      a.task_id.localeCompare(b.task_id)
+  );
+}
+
+function orderTasksBySession(tasks: Task[], taskIds?: readonly string[]): Task[] {
+  if (!taskIds || taskIds.length === 0) return sortTasksByCreatedAt(tasks);
+  const byId = new Map<string, Task>(tasks.map((task) => [task.task_id, task]));
+  const ordered: Task[] = [];
+  for (const taskId of taskIds) {
+    const task = byId.get(taskId);
+    if (!task) continue;
+    ordered.push(task);
+    byId.delete(taskId);
+  }
+  // A Task can become visible just before the Session.tasks append is observed.
+  // Keep it rather than dropping it; the next Session patch/resync supplies its
+  // canonical position.
+  ordered.push(...sortTasksByCreatedAt([...byId.values()]));
+  return ordered;
+}
+
+function sortTasksByQueuePosition(tasks: Task[]): Task[] {
+  return [...tasks].sort((a, b) => (a.queue_position || 0) - (b.queue_position || 0));
+}
+
+function groupMessagesByTask(messages: Message[]): Map<string, Message[]> {
+  const grouped = new Map<string, Message[]>();
+  for (const message of messages) {
+    if (!message.task_id) continue;
+    const current = grouped.get(message.task_id) || [];
+    current.push(message);
+    grouped.set(message.task_id, current);
+  }
+  for (const [taskId, taskMessages] of grouped.entries()) {
+    grouped.set(taskId, sortMessagesByIndex(taskMessages));
+  }
+  return grouped;
+}

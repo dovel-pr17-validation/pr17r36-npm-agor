@@ -1,0 +1,1554 @@
+import { lockBranchForAdmission } from '../branch-admission';
+import { lockBranchReferenceMutation } from '../branch-reference-admission';
+/**
+ * Board Repository
+ *
+ * Type-safe CRUD operations for boards with short ID support.
+ */
+
+import type {
+  Board,
+  BoardAccessMode,
+  BoardExportBlob,
+  BoardID,
+  BoardImportResult,
+  BoardImportSkippedObject,
+  BoardObject,
+  BoardObjectType,
+  Branch,
+  BranchPermissionLevel,
+  EffectiveCapabilityPolicyAccess,
+  UserID,
+  UUID,
+  ZoneLayout,
+} from '@agor/core/types';
+import { isTeammate } from '@agor/core/types';
+import {
+  and,
+  asc,
+  desc,
+  eq,
+  getTableColumns,
+  inArray,
+  isNull,
+  like,
+  ne,
+  type SQL,
+  sql,
+} from 'drizzle-orm';
+import * as yaml from 'js-yaml';
+import { getBaseUrl } from '../../config/config-manager';
+import { generateId, isValidUUID } from '../../lib/ids';
+import { generateSlug } from '../../lib/slugs';
+import { normalizeExactEmojiShortcode } from '../../utils/emoji-shortcodes';
+import { getBoardUrl } from '../../utils/url';
+import { sanitizeZoneOrder, ZONE_LAYOUTS } from '../../utils/zone-layout';
+import type { Database } from '../client';
+import {
+  deleteFrom,
+  insert,
+  isPostgresDatabase,
+  runDatabaseTransaction,
+  select,
+  update,
+} from '../database-wrapper';
+import { type BoardInsert, type BoardRow, boards, users } from '../schema';
+import { ArtifactRepository } from './artifacts';
+import {
+  AmbiguousIdError,
+  attachHiddenTenant,
+  type BaseRepository,
+  EntityNotFoundError,
+  RESOLVE_SHORT_ID_FETCH_LIMIT,
+  RepositoryError,
+  resolveByShortIdPrefix,
+} from './base';
+import { visibleBoardAccessCondition, visibleBoardReferenceAccessExists } from './branch-access';
+import { BranchRepository } from './branches';
+import { CapabilityPolicyRepository } from './capability-policies';
+
+const BOARD_ACCESS_MODES = ['private', 'shared'] as const;
+const BOARD_DEFAULT_FS_ACCESS = ['none', 'read', 'write'] as const;
+const BOARD_DEFAULT_OTHERS_CAN = ['none', 'view', 'session', 'prompt', 'all'] as const;
+
+function validateBoardPermissionDefaults(board: Partial<Board>): void {
+  if (board.access_mode !== undefined && !BOARD_ACCESS_MODES.includes(board.access_mode)) {
+    throw new RepositoryError(`Invalid board access_mode: ${board.access_mode}`);
+  }
+  if (
+    board.default_others_can !== undefined &&
+    !BOARD_DEFAULT_OTHERS_CAN.includes(board.default_others_can)
+  ) {
+    throw new RepositoryError(`Invalid board default_others_can: ${board.default_others_can}`);
+  }
+  if (
+    board.default_others_fs_access !== undefined &&
+    !BOARD_DEFAULT_FS_ACCESS.includes(board.default_others_fs_access)
+  ) {
+    throw new RepositoryError(
+      `Invalid board default_others_fs_access: ${board.default_others_fs_access}`
+    );
+  }
+}
+
+const isFiniteNumber = (value: unknown): boolean =>
+  typeof value === 'number' && Number.isFinite(value);
+const hasNumbers = (object: Record<string, unknown>, fields: readonly string[]): boolean =>
+  fields.every((field) => isFiniteNumber(object[field]));
+const isStringRecord = (value: unknown): boolean =>
+  !!value &&
+  typeof value === 'object' &&
+  !Array.isArray(value) &&
+  Object.values(value).every((entry) => typeof entry === 'string');
+
+/**
+ * Per-type import rules: return null to keep the object, or a reason to skip it.
+ * Keyed by every BoardObjectType so a new canvas type fails typecheck here
+ * until import decides how to handle it (export emits board.objects verbatim).
+ */
+const BOARD_OBJECT_IMPORT_RULES: Record<
+  BoardObjectType,
+  (object: Record<string, unknown>) => string | null
+> = {
+  // Legacy annotation type; no required fields.
+  text: () => null,
+  zone: (o) =>
+    hasNumbers(o, ['x', 'y', 'width', 'height']) ? null : 'missing position/dimensions',
+  markdown: (o) =>
+    hasNumbers(o, ['x', 'y', 'width']) && typeof o.content === 'string'
+      ? null
+      : 'missing position/width/content',
+  app: (o) =>
+    hasNumbers(o, ['x', 'y', 'width', 'height']) &&
+    typeof o.template === 'string' &&
+    isStringRecord(o.files)
+      ? null
+      : 'missing position/dimensions/template/files',
+  // Shape only. Whether the referenced artifact resolves is checked against
+  // the importing tenant/user in resolveImportedArtifactReferences.
+  artifact: (o) =>
+    hasNumbers(o, ['x', 'y', 'width', 'height']) &&
+    typeof o.artifact_id === 'string' &&
+    isValidUUID(o.artifact_id)
+      ? null
+      : 'missing position/dimensions/artifact_id',
+};
+
+/**
+ * Keep the board objects import can use; skip the rest with a warning.
+ * A single unusable object must never fail the whole board import.
+ */
+export function sanitizeImportedBoardObjects(objects: Record<string, unknown>): {
+  objects: Record<string, BoardObject>;
+  skipped: BoardImportSkippedObject[];
+} {
+  const kept: Record<string, BoardObject> = {};
+  const skipped: BoardImportSkippedObject[] = [];
+  for (const [id, object] of Object.entries(objects)) {
+    if (!object || typeof object !== 'object' || Array.isArray(object)) {
+      skipped.push({ object_id: id, reason: 'invalid', detail: 'must be an object' });
+      continue;
+    }
+    const type = (object as { type?: unknown }).type;
+    if (typeof type !== 'string' || !Object.hasOwn(BOARD_OBJECT_IMPORT_RULES, type)) {
+      skipped.push({
+        object_id: id,
+        type: typeof type === 'string' ? type : undefined,
+        reason: 'unsupported_type',
+        detail: `unsupported type ${JSON.stringify(type ?? null)}`,
+      });
+      continue;
+    }
+    const reason = BOARD_OBJECT_IMPORT_RULES[type as BoardObjectType](
+      object as Record<string, unknown>
+    );
+    if (reason) {
+      skipped.push({ object_id: id, type, reason: 'invalid', detail: reason });
+      continue;
+    }
+    kept[id] = object as BoardObject;
+  }
+  return { objects: kept, skipped };
+}
+
+/** Canonical portable Board template → create payload mapping. */
+export function mapBoardExportBlobToCreateData(
+  blob: BoardExportBlob,
+  userId: string,
+  nameOverride?: string
+): Partial<Board> {
+  const name = nameOverride ?? blob.name;
+  return {
+    name,
+    slug: nameOverride ? nameOverride : (blob.slug ?? blob.name),
+    description: blob.description,
+    icon: blob.icon,
+    color: blob.color,
+    background_color: blob.background_color,
+    custom_css: blob.custom_css,
+    objects: blob.objects,
+    custom_context: blob.custom_context,
+    access_mode: blob.access_mode,
+    default_others_can: blob.default_others_can,
+    default_others_fs_access: blob.default_others_fs_access,
+    created_by: userId,
+  };
+}
+
+/**
+ * Board repository implementation
+ */
+/**
+ * A zone written without a layout or order keeps the ones it has, so an agent
+ * editing a zone's label or colour doesn't reset how its cards are arranged.
+ */
+function keepZoneArrangement(
+  existing: BoardObject | undefined,
+  incoming: BoardObject
+): BoardObject {
+  if (existing?.type !== 'zone' || incoming?.type !== 'zone') return incoming;
+  return {
+    ...incoming,
+    ...(incoming.layout === undefined && existing.layout !== undefined
+      ? { layout: existing.layout }
+      : {}),
+    ...(incoming.order === undefined && existing.order !== undefined
+      ? { order: existing.order }
+      : {}),
+  };
+}
+
+export class BoardRepository implements BaseRepository<Board, Partial<Board>> {
+  constructor(private db: Database) {}
+
+  /** Keep every column (including hidden tenant identity), projecting only lean annotations.
+   * Use the column decoder: SQLite returns JSON text; PostgreSQL returns JSONB.
+   * Non-object JSON is left alone to preserve legacy conversion/error behavior.
+   */
+  private listSelection(lean?: boolean) {
+    if (!lean) return getTableColumns(boards);
+    const data = isPostgresDatabase(this.db)
+      ? sql`CASE WHEN jsonb_typeof(${boards.data}) = 'object'
+          THEN ${boards.data} - 'objects' - 'custom_css' ELSE ${boards.data} END`
+      : sql`json_remove(${boards.data}, '$.objects', '$.custom_css')`;
+    return { ...getTableColumns(boards), data: data.mapWith(boards.data) };
+  }
+
+  /**
+   * Convert database row to Board type
+   *
+   * @param row - Database row
+   * @param baseUrl - Base URL for generating board URLs
+   * @param options.lean - Omit the heavy `objects` / `custom_css` annotations
+   *   (used by the boards list path; single-board reads always stay full).
+   */
+  private rowToBoard(row: BoardRow, baseUrl?: string, options?: { lean?: boolean }): Board {
+    const data = row.data as {
+      description?: string;
+      color?: string;
+      icon?: string;
+      background_color?: string;
+      custom_css?: string;
+      objects?: Record<string, BoardObject>;
+      custom_context?: Record<string, unknown>;
+      access_mode?: BoardAccessMode;
+      default_others_can?: BranchPermissionLevel;
+      default_others_fs_access?: 'none' | 'read' | 'write';
+    };
+
+    const boardId = row.board_id as UUID;
+    const slug = row.slug !== null ? row.slug : undefined;
+    const url = baseUrl ? getBoardUrl(boardId, slug, baseUrl) : '';
+
+    // Lean projection drops the two heavy JSON fields nested in `data` (zones /
+    // text / markdown annotations + per-board CSS). A client `$select` can't do
+    // this — they live inside the `data` column, not as top-level columns.
+    const { objects: _objects, custom_css: _customCss, ...leanData } = data;
+    const effectiveData = options?.lean ? leanData : data;
+
+    return attachHiddenTenant(
+      {
+        board_id: boardId,
+        name: row.name,
+        slug,
+        primary_teammate_id:
+          ((row.primary_teammate_id ?? row.primary_assistant_id) as Board['primary_teammate_id']) ??
+          undefined,
+        created_at: new Date(row.created_at).toISOString(),
+        last_updated: row.updated_at
+          ? new Date(row.updated_at).toISOString()
+          : new Date(row.created_at).toISOString(),
+        created_by: row.created_by,
+        primary_owner_user_id: row.primary_owner_user_id,
+        url,
+        archived: Boolean(row.archived),
+        archived_at: row.archived_at ? new Date(row.archived_at).toISOString() : undefined,
+        archived_by: row.archived_by ?? undefined,
+        ...effectiveData,
+        icon: normalizeExactEmojiShortcode(data.icon),
+        // Legacy fields are a fail-closed compatibility view. Callers that
+        // need current permissions use boards/:id/permissions.
+        access_mode: data.access_mode ?? 'private',
+        default_others_can: data.default_others_can ?? 'none',
+        default_others_fs_access: data.default_others_fs_access ?? 'none',
+      },
+      row
+    );
+  }
+
+  /**
+   * Convert Board to database insert format
+   */
+  private boardToInsert(board: Partial<Board>): BoardInsert {
+    validateBoardPermissionDefaults(board);
+    const now = Date.now();
+    const boardId = board.board_id ?? generateId();
+    if (!board.created_by) {
+      throw new RepositoryError('Board must have a created_by');
+    }
+
+    return {
+      board_id: boardId,
+      name: board.name ?? 'Untitled Board',
+      slug: board.slug !== undefined ? board.slug : null,
+      primary_teammate_id: board.primary_teammate_id ?? null,
+      created_at: new Date(board.created_at ?? now),
+      updated_at: board.last_updated ? new Date(board.last_updated) : new Date(now),
+      created_by: board.created_by,
+      primary_owner_user_id: board.primary_owner_user_id ?? board.created_by,
+      data: {
+        description: board.description,
+        color: board.color,
+        icon: normalizeExactEmojiShortcode(board.icon),
+        // No default is persisted: an unset background_color means "use the
+        // theme-aware default", resolved at render time. This keeps the
+        // product default improvable without rewriting stored boards.
+        background_color: board.background_color,
+        custom_css: board.custom_css,
+        objects: board.objects,
+        custom_context: board.custom_context,
+      },
+    };
+  }
+
+  private rejectGenericPrimaryTeammateWrite(data: Partial<Board>, operation: string): void {
+    if (Object.hasOwn(data, 'primary_teammate_id')) {
+      throw new RepositoryError(
+        `Cannot ${operation} primary_teammate_id via generic board writes; use setPrimaryTeammate() or clearPrimaryTeammate()`
+      );
+    }
+  }
+
+  /**
+   * Resolve short ID to full ID via the centralized helper.
+   */
+  private async resolveId(id: string): Promise<string> {
+    return resolveByShortIdPrefix(id, 'Board', async (pattern) => {
+      const rows = await select(this.db)
+        .from(boards)
+        .where(like(boards.board_id, pattern))
+        .limit(RESOLVE_SHORT_ID_FETCH_LIMIT)
+        .all();
+      return rows.map((r: { board_id: string }) => r.board_id);
+    });
+  }
+
+  /**
+   * Generate a unique slug for a board.
+   * Returns empty string if the name contains no alphanumeric characters.
+   *
+   * @param name - Board name to slugify
+   * @param excludeId - Optional board ID to exclude from uniqueness check
+   * @returns Unique slug, or empty string if name has no alphanumeric chars
+   */
+  private async generateUniqueSlug(name: string, excludeId?: string): Promise<string> {
+    const baseSlug = generateSlug(name);
+    if (!baseSlug) {
+      // Name contains no alphanumeric chars (e.g., emoji-only)
+      // Return empty string - caller will store null
+      return '';
+    }
+
+    // Check if base slug is available
+    const existingQuery = excludeId
+      ? select(this.db)
+          .from(boards)
+          .where(and(eq(boards.slug, baseSlug), ne(boards.board_id, excludeId)))
+      : select(this.db).from(boards).where(eq(boards.slug, baseSlug));
+
+    const existing = await existingQuery.one();
+    if (!existing) return baseSlug;
+
+    // Find next available suffix
+    let counter = 1;
+    while (true) {
+      const candidateSlug = `${baseSlug}-${counter}`;
+      const checkQuery = excludeId
+        ? select(this.db)
+            .from(boards)
+            .where(and(eq(boards.slug, candidateSlug), ne(boards.board_id, excludeId)))
+        : select(this.db).from(boards).where(eq(boards.slug, candidateSlug));
+
+      const found = await checkQuery.one();
+      if (!found) return candidateSlug;
+      counter++;
+    }
+  }
+
+  /**
+   * Create a new board
+   */
+  async create(data: Partial<Board>): Promise<Board> {
+    try {
+      this.rejectGenericPrimaryTeammateWrite(data, 'set');
+      const boardId = data.board_id ?? generateId();
+      const baseUrl = await getBaseUrl(this.db);
+      let finalSlug: string | undefined;
+
+      if (data.slug === null) {
+        finalSlug = undefined;
+      } else {
+        const slugSource = data.slug ?? data.name ?? 'board';
+        if (slugSource) {
+          const uniqueSlug = await this.generateUniqueSlug(slugSource);
+          if (uniqueSlug) {
+            finalSlug = uniqueSlug;
+          }
+        }
+      }
+
+      const insertData = this.boardToInsert({
+        ...data,
+        board_id: boardId,
+        slug: finalSlug,
+      });
+
+      await runDatabaseTransaction(
+        this.db,
+        async (tx) => {
+          const owner = await select(tx, { user_id: users.user_id })
+            .from(users)
+            .where(eq(users.user_id, insertData.primary_owner_user_id))
+            .one();
+          if (!owner) {
+            throw new RepositoryError(
+              `Cannot create Board: primary owner ${insertData.primary_owner_user_id} does not exist in this tenant`
+            );
+          }
+          await insert(tx, boards).values(insertData).run();
+          await new CapabilityPolicyRepository(tx).initializeBoardInTransaction(
+            tx,
+            boardId as BoardID,
+            insertData.primary_owner_user_id as UserID,
+            {
+              shared: (data.access_mode ?? 'shared') === 'shared',
+              defaultOthersCan: data.default_others_can,
+              defaultOthersFsAccess: data.default_others_fs_access,
+            }
+          );
+        },
+        { sqliteImmediate: true }
+      );
+
+      const row = await select(this.db)
+        .from(boards)
+        .where(eq(boards.board_id, insertData.board_id))
+        .one();
+
+      if (!row) {
+        throw new RepositoryError('Failed to retrieve created board');
+      }
+
+      return this.rowToBoard(row, baseUrl);
+    } catch (error) {
+      if (error instanceof RepositoryError) throw error;
+      throw new RepositoryError(
+        `Failed to create board: ${error instanceof Error ? error.message : String(error)}`,
+        error
+      );
+    }
+  }
+
+  /**
+   * Find board by ID (supports short ID)
+   */
+  async findById(id: string): Promise<Board | null> {
+    try {
+      const fullId = await this.resolveId(id);
+      const baseUrl = await getBaseUrl(this.db);
+      const row = await select(this.db).from(boards).where(eq(boards.board_id, fullId)).one();
+
+      return row ? this.rowToBoard(row, baseUrl) : null;
+    } catch (error) {
+      if (error instanceof EntityNotFoundError) return null;
+      if (error instanceof AmbiguousIdError) throw error;
+      throw new RepositoryError(
+        `Failed to find board: ${error instanceof Error ? error.message : String(error)}`,
+        error
+      );
+    }
+  }
+
+  /**
+   * Find board by slug
+   */
+  async findBySlug(slug: string): Promise<Board | null> {
+    try {
+      const baseUrl = await getBaseUrl(this.db);
+      const row = await select(this.db).from(boards).where(eq(boards.slug, slug)).one();
+
+      return row ? this.rowToBoard(row, baseUrl) : null;
+    } catch (error) {
+      throw new RepositoryError(
+        `Failed to find board by slug: ${error instanceof Error ? error.message : String(error)}`,
+        error
+      );
+    }
+  }
+
+  /**
+   * Find board by slug or ID (for URL routing)
+   *
+   * Always tries slug lookup first, then falls back to ID lookup.
+   * This enables beautiful URLs like /b/my-board while still supporting /b/550e8400
+   * and handles edge cases like hex-looking slugs (e.g., board named "deadbeef")
+   */
+  async findBySlugOrId(param: string): Promise<Board | null> {
+    // A canonical UUID is always an ID, so a board slugged with another board's ID cannot shadow it.
+    if (isValidUUID(param)) return this.findById(param);
+    // Otherwise try slug first; this handles hex-looking slugs (e.g., "deadbeef").
+    const bySlug = await this.findBySlug(param);
+    if (bySlug) return bySlug;
+
+    // Fall back to ID lookup (short or full UUID)
+    return this.findById(param);
+  }
+
+  private visibleBoardCondition(userId: UUID): SQL {
+    return visibleBoardAccessCondition(this.db, userId);
+  }
+
+  /**
+   * Find all boards (with optional filters and projection).
+   *
+   * The `boardIds`, `archived`, and `visibleToUserId` filters let the list read
+   * path (`BoardsService.find` via the adapter's `fetchData`) push
+   * high-selectivity predicates — including board RBAC visibility — into SQL so
+   * it no longer materializes the whole table before filtering in memory.
+   *
+   * @param filter - Optional filters and projection
+   * @param filter.archived - Filter to an exact archived state
+   * @param filter.boardIds - Restrict to a set of board IDs (empty set yields no
+   *   rows, matching an `{ $in: [] }` filter)
+   * @param filter.visibleToUserId - Restrict to boards visible to this user
+   *   under the board's own normalized policy.
+   * @param filter.lean - Omit each board's heavy `objects` / `custom_css`
+   *   annotations from the result. The displayed board's full record is fetched
+   *   separately via `findById`, so the list path never needs them. RBAC and
+   *   the id pushdown stay in force, so the lean list can never widen visibility.
+   */
+  async findAll(filter?: {
+    archived?: boolean;
+    boardIds?: BoardID[];
+    visibleToUserId?: UUID;
+    lean?: boolean;
+  }): Promise<Board[]> {
+    try {
+      // An explicit empty id set can never match a row; short-circuit so we skip
+      // the read entirely and avoid emitting an empty `IN ()` predicate.
+      if (filter?.boardIds !== undefined && filter.boardIds.length === 0) {
+        return [];
+      }
+
+      const conditions = [];
+      if (filter?.archived !== undefined) {
+        conditions.push(eq(boards.archived, filter.archived));
+      }
+      if (filter?.boardIds !== undefined) {
+        conditions.push(inArray(boards.board_id, filter.boardIds));
+      }
+      if (filter?.visibleToUserId) {
+        conditions.push(this.visibleBoardCondition(filter.visibleToUserId));
+      }
+
+      const baseUrl = await getBaseUrl(this.db);
+      const query = select(this.db, this.listSelection(filter?.lean)).from(boards);
+      const rows =
+        conditions.length > 0 ? await query.where(and(...conditions)).all() : await query.all();
+      return rows.map((row: BoardRow) => this.rowToBoard(row, baseUrl, { lean: filter?.lean }));
+    } catch (error) {
+      throw new RepositoryError(
+        `Failed to find all boards: ${error instanceof Error ? error.message : String(error)}`,
+        error
+      );
+    }
+  }
+
+  /**
+   * Count and fetch a board page in SQL. The generic Feathers adapter keeps
+   * pagination in memory, which is unnecessarily expensive once a tenant has
+   * many archived boards. Callers only use this for simple list shapes; richer
+   * operator queries continue through `findAll` and the adapter's compatibility
+   * pipeline.
+   */
+  async findPage(opts: {
+    archived?: boolean;
+    boardIds?: BoardID[];
+    visibleToUserId?: UUID;
+    lean?: boolean;
+    limit?: number;
+    offset?: number;
+    sort?: Record<string, 1 | -1>;
+  }): Promise<{ data: Board[]; total: number }> {
+    if (opts.boardIds?.length === 0) return { data: [], total: 0 };
+
+    const conditions: SQL[] = [];
+    if (opts.archived !== undefined) conditions.push(eq(boards.archived, opts.archived));
+    if (opts.boardIds) conditions.push(inArray(boards.board_id, opts.boardIds));
+    if (opts.visibleToUserId) conditions.push(this.visibleBoardCondition(opts.visibleToUserId));
+    const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
+
+    let countQuery = select(this.db, { count: sql<number>`count(*)` }).from(boards);
+    if (whereClause) countQuery = countQuery.where(whereClause);
+    const countRow = await countQuery.one();
+    const total = Number(countRow?.count ?? 0);
+
+    const sortColumns = {
+      board_id: boards.board_id,
+      name: boards.name,
+      slug: boards.slug,
+      created_at: boards.created_at,
+    } as const;
+    const orderBy: SQL[] = [];
+    for (const [field, direction] of Object.entries(opts.sort ?? {})) {
+      if (field === 'updated_at') {
+        const logicalUpdatedAt = sql`COALESCE(${boards.updated_at}, ${boards.created_at})`;
+        orderBy.push(direction === -1 ? desc(logicalUpdatedAt) : asc(logicalUpdatedAt));
+        continue;
+      }
+      const column = sortColumns[field as keyof typeof sortColumns];
+      if (!column) continue;
+      // PostgreSQL sorts NULL first for ASC while SQLite sorts NULL first as
+      // well but differs for DESC. Explicitly put nullable slugs last on both
+      // dialects before applying the requested value direction.
+      if (field === 'slug') {
+        orderBy.push(asc(sql`CASE WHEN ${column} IS NULL THEN 1 ELSE 0 END`));
+      }
+      orderBy.push(direction === -1 ? desc(column) : asc(column));
+    }
+    if (orderBy.length === 0) orderBy.push(asc(boards.created_at));
+    if (!Object.hasOwn(opts.sort ?? {}, 'board_id')) orderBy.push(asc(boards.board_id));
+
+    let dataQuery = select(this.db, this.listSelection(opts.lean)).from(boards);
+    if (whereClause) dataQuery = dataQuery.where(whereClause);
+    dataQuery = dataQuery.orderBy(...orderBy);
+    if (opts.limit !== undefined) dataQuery = dataQuery.limit(opts.limit);
+    if (opts.offset) dataQuery = dataQuery.offset(opts.offset);
+
+    const baseUrl = await getBaseUrl(this.db);
+    const rows = await dataQuery.all();
+    return {
+      data: (rows as BoardRow[]).map((row) => this.rowToBoard(row, baseUrl, { lean: opts.lean })),
+      total,
+    };
+  }
+
+  /**
+   * Find board ids visible through the board's own normalized policy. Branch
+   * visibility never makes a board visible implicitly.
+   *
+   * @param userId - User ID to check board visibility for
+   * @returns Array of board ids the user can see
+   */
+  async findVisibleBoardIds(userId: UUID): Promise<string[]> {
+    const rows = await select(this.db, { board_id: boards.board_id })
+      .from(boards)
+      .where(this.visibleBoardCondition(userId))
+      .all();
+    return rows.map((r: { board_id: string }) => r.board_id);
+  }
+
+  /** Materialize the exact current board audience in one set-based query. */
+  async findRealtimeViewUserIds(boardId: BoardID): Promise<UUID[]> {
+    const rows = await select(this.db, { user_id: users.user_id })
+      .from(users)
+      .where(visibleBoardReferenceAccessExists(this.db, users.user_id, sql`${boardId}`))
+      .all();
+    return rows.map((row: { user_id: string }) => row.user_id as UUID);
+  }
+
+  async isOwner(boardId: string, userId: UUID): Promise<boolean> {
+    const row = await select(this.db, { owner: boards.primary_owner_user_id })
+      .from(boards)
+      .where(eq(boards.board_id, boardId))
+      .one();
+    return row?.owner === userId;
+  }
+
+  async canMutate(boardId: string, userId: UUID): Promise<boolean> {
+    const board = await this.findById(boardId);
+    if (!board) throw new EntityNotFoundError('Board', boardId);
+    return this.canMutateResolved(board, userId);
+  }
+
+  /** Resolve current edit authority for a canonical board loaded by this request. */
+  async canMutateResolved(board: Pick<Board, 'board_id'>, userId: UUID): Promise<boolean> {
+    const access = await new CapabilityPolicyRepository(this.db).resolveBoardAccess(
+      board.board_id,
+      userId as UserID
+    );
+    return access.capabilities.includes('board.edit');
+  }
+
+  async canAttachBranch(boardId: string, userId: UUID): Promise<boolean> {
+    const board = await this.findById(boardId);
+    if (!board) throw new EntityNotFoundError('Board', boardId);
+    const access = await new CapabilityPolicyRepository(this.db).resolveBoardAccess(
+      board.board_id,
+      userId as UserID
+    );
+    return access.capabilities.includes('board.attach_branch');
+  }
+
+  async canView(boardId: string, userId: UUID): Promise<boolean> {
+    const board = await this.findById(boardId);
+    if (!board) throw new EntityNotFoundError('Board', boardId);
+    return this.canViewResolved(board, userId);
+  }
+
+  /** Resolve current view authority for a canonical board loaded by this request. */
+  async canViewResolved(board: Pick<Board, 'board_id'>, userId: UUID): Promise<boolean> {
+    const access = await new CapabilityPolicyRepository(this.db).resolveBoardAccess(
+      board.board_id,
+      userId as UserID
+    );
+    return access.capabilities.includes('board.view');
+  }
+
+  /**
+   * Resolve a user's effective capability-policy access to a board.
+   *
+   * Mirrors `BranchRepository.resolveUserAccess` — the central app-layer
+   * resolver for point checks. Callers that need the full effective-access
+   * payload (not just a single boolean like `canMutate`/`canView`) use this.
+   */
+  async resolveUserAccess(board: Board, userId: UUID): Promise<EffectiveCapabilityPolicyAccess> {
+    return new CapabilityPolicyRepository(this.db).resolveBoardAccess(
+      board.board_id,
+      userId as UserID
+    );
+  }
+
+  /** Resolve a board only when the caller can currently view it. */
+  async findVisibleById(userId: UUID, boardId: string): Promise<Board | null> {
+    try {
+      const resolvedId = await resolveByShortIdPrefix(boardId, 'Board', async (pattern) => {
+        const rows = await select(this.db, { board_id: boards.board_id })
+          .from(boards)
+          .where(and(like(boards.board_id, pattern), this.visibleBoardCondition(userId)))
+          .limit(RESOLVE_SHORT_ID_FETCH_LIMIT)
+          .all();
+        return rows.map((row: { board_id: string }) => row.board_id);
+      });
+      const [board] = await this.findAll({
+        boardIds: [resolvedId as BoardID],
+        visibleToUserId: userId,
+      });
+      return board ?? null;
+    } catch (error) {
+      if (error instanceof EntityNotFoundError) return null;
+      throw error;
+    }
+  }
+
+  async getOwners(boardId: string): Promise<UUID[]> {
+    const board = await this.findById(boardId);
+    if (!board) throw new EntityNotFoundError('Board', boardId);
+    return [board.primary_owner_user_id as UUID];
+  }
+
+  async addOwner(boardId: string, userId: UUID): Promise<void> {
+    const board = await this.findById(boardId);
+    if (!board) throw new EntityNotFoundError('Board', boardId);
+    if (await this.isOwner(board.board_id, userId)) return;
+    throw new RepositoryError(
+      'Primary ownership is immutable; grant Manager access through the board permission policy'
+    );
+  }
+
+  async removeOwner(boardId: string, userId: UUID): Promise<void> {
+    const board = await this.findById(boardId);
+    if (!board) throw new EntityNotFoundError('Board', boardId);
+    throw new RepositoryError(
+      userId === board.primary_owner_user_id
+        ? 'Primary ownership is immutable'
+        : 'This user is not a board owner; remove their permission entry instead'
+    );
+  }
+
+  /**
+   * Update board by ID
+   */
+  async update(id: string, updates: Partial<Board>): Promise<Board> {
+    try {
+      this.rejectGenericPrimaryTeammateWrite(updates, 'set');
+      if (Object.hasOwn(updates, 'primary_owner_user_id')) {
+        throw new RepositoryError('Primary ownership is immutable');
+      }
+      if (
+        ['access_mode', 'default_others_can', 'default_others_fs_access'].some((field) =>
+          Object.hasOwn(updates, field)
+        )
+      ) {
+        throw new RepositoryError(
+          'Board permissions must be changed through the board permission policy service'
+        );
+      }
+      const fullId = await this.resolveId(id);
+
+      // Get current board to merge updates
+      const current = await this.findById(fullId);
+      if (!current) {
+        throw new EntityNotFoundError('Board', id);
+      }
+
+      const slugUpdateProvided = Object.hasOwn(updates, 'slug');
+      let nextSlug: string | undefined = current.slug;
+
+      if (slugUpdateProvided) {
+        const slugValue = updates.slug;
+        if (!slugValue) {
+          nextSlug = undefined;
+        } else {
+          const uniqueSlug = await this.generateUniqueSlug(slugValue, fullId);
+          nextSlug = uniqueSlug || undefined;
+        }
+      }
+
+      const merged = {
+        ...current,
+        ...updates,
+        ...(slugUpdateProvided ? { slug: nextSlug } : {}),
+      };
+      const insertData = this.boardToInsert(merged);
+
+      const setData: Record<string, unknown> = {
+        name: insertData.name,
+        slug: insertData.slug,
+        updated_at: new Date(),
+        data: insertData.data,
+      };
+
+      // Include archive fields if provided
+      if (updates.archived !== undefined) setData.archived = updates.archived;
+      if (Object.hasOwn(updates, 'archived_at')) {
+        setData.archived_at = updates.archived_at ? new Date(updates.archived_at) : null;
+      }
+      if (Object.hasOwn(updates, 'archived_by')) {
+        setData.archived_by = updates.archived_by ?? null;
+      }
+
+      await update(this.db, boards).set(setData).where(eq(boards.board_id, fullId)).run();
+
+      const updated = await this.findById(fullId);
+      if (!updated) {
+        throw new RepositoryError('Failed to retrieve updated board');
+      }
+
+      return updated;
+    } catch (error) {
+      if (error instanceof RepositoryError) throw error;
+      if (error instanceof EntityNotFoundError) throw error;
+      throw new RepositoryError(
+        `Failed to update board: ${error instanceof Error ? error.message : String(error)}`,
+        error
+      );
+    }
+  }
+
+  /**
+   * Delete board by ID
+   */
+  async delete(id: string): Promise<void> {
+    try {
+      const fullId = await this.resolveId(id);
+      await runDatabaseTransaction(
+        this.db,
+        async (tx) => {
+          await new CapabilityPolicyRepository(
+            tx
+          ).materializeInheritedBranchesBeforeBoardDeleteInTransaction(tx, fullId as BoardID);
+          const result = await deleteFrom(tx, boards).where(eq(boards.board_id, fullId)).run();
+          if (result.rowsAffected === 0) throw new EntityNotFoundError('Board', id);
+        },
+        { sqliteImmediate: true }
+      );
+    } catch (error) {
+      if (error instanceof EntityNotFoundError) throw error;
+      throw new RepositoryError(
+        `Failed to delete board: ${error instanceof Error ? error.message : String(error)}`,
+        error
+      );
+    }
+  }
+
+  /**
+   * Get the branch designated as this board's primary teammate.
+   */
+  async getPrimaryTeammate(boardId: string): Promise<Branch | null> {
+    try {
+      const board = await this.findById(boardId);
+      if (!board?.primary_teammate_id) return null;
+
+      const branchRepo = new BranchRepository(this.db);
+      return branchRepo.findById(board.primary_teammate_id);
+    } catch (error) {
+      if (error instanceof EntityNotFoundError) return null;
+      if (error instanceof AmbiguousIdError) throw error;
+      throw new RepositoryError(
+        `Failed to get primary teammate: ${error instanceof Error ? error.message : String(error)}`,
+        error
+      );
+    }
+  }
+
+  /**
+   * Set a board's primary teammate after validating that the branch is an
+   * teammate branch already attached to the board.
+   */
+  async setPrimaryTeammate(boardId: string, branchId: string): Promise<Board> {
+    const branch = await new BranchRepository(this.db).findById(branchId);
+    if (!branch) throw new EntityNotFoundError('Branch', branchId);
+    return runDatabaseTransaction(
+      this.db,
+      async (tx) => {
+        await lockBranchReferenceMutation(tx);
+        await lockBranchForAdmission(tx, branch.branch_id, { primaryDesignationOnly: true });
+        return new BoardRepository(tx).setPrimaryTeammateLocked(boardId, branch.branch_id);
+      },
+      { sqliteImmediate: true }
+    );
+  }
+
+  private async setPrimaryTeammateLocked(boardId: string, branchId: string): Promise<Board> {
+    try {
+      const fullBoardId = await this.resolveId(boardId);
+      const board = await this.findById(fullBoardId);
+      if (!board) throw new EntityNotFoundError('Board', boardId);
+
+      const branch = await this.getValidatedPrimaryTeammateBranch(fullBoardId, branchId);
+
+      await update(this.db, boards)
+        .set({
+          primary_teammate_id: branch.branch_id,
+          updated_at: new Date(),
+        })
+        .where(eq(boards.board_id, fullBoardId))
+        .run();
+
+      const updated = await this.findById(fullBoardId);
+      if (!updated) throw new RepositoryError('Failed to retrieve updated board');
+      return updated;
+    } catch (error) {
+      if (error instanceof RepositoryError) throw error;
+      if (error instanceof EntityNotFoundError) throw error;
+      if (error instanceof AmbiguousIdError) throw error;
+      throw new RepositoryError(
+        `Failed to set primary teammate: ${error instanceof Error ? error.message : String(error)}`,
+        error
+      );
+    }
+  }
+
+  /**
+   * Set a board's primary teammate only when it is currently unset.
+   *
+   * Returns the updated board when this call wins the race, or null when the
+   * board already had a primary teammate by the time the conditional update
+   * ran. The same branch/board/teammate invariants as setPrimaryTeammate()
+   * are validated before attempting the conditional write.
+   */
+  async setPrimaryTeammateIfUnset(boardId: string, branchId: string): Promise<Board | null> {
+    const branch = await new BranchRepository(this.db).findById(branchId);
+    if (!branch) throw new EntityNotFoundError('Branch', branchId);
+    return runDatabaseTransaction(
+      this.db,
+      async (tx) => {
+        await lockBranchReferenceMutation(tx);
+        await lockBranchForAdmission(tx, branch.branch_id, { primaryDesignationOnly: true });
+        return new BoardRepository(tx).setPrimaryTeammateIfUnsetLocked(boardId, branch.branch_id);
+      },
+      { sqliteImmediate: true }
+    );
+  }
+
+  private async setPrimaryTeammateIfUnsetLocked(
+    boardId: string,
+    branchId: string
+  ): Promise<Board | null> {
+    try {
+      const fullBoardId = await this.resolveId(boardId);
+      const branch = await this.getValidatedPrimaryTeammateBranch(fullBoardId, branchId);
+
+      const result = await update(this.db, boards)
+        .set({
+          primary_teammate_id: branch.branch_id,
+          updated_at: new Date(),
+        })
+        .where(and(eq(boards.board_id, fullBoardId), isNull(boards.primary_teammate_id)))
+        .run();
+
+      if (result.rowsAffected === 0) return null;
+
+      const updated = await this.findById(fullBoardId);
+      if (!updated) throw new RepositoryError('Failed to retrieve updated board');
+      return updated;
+    } catch (error) {
+      if (error instanceof RepositoryError) throw error;
+      if (error instanceof EntityNotFoundError) throw error;
+      if (error instanceof AmbiguousIdError) throw error;
+      throw new RepositoryError(
+        `Failed to set primary teammate if unset: ${error instanceof Error ? error.message : String(error)}`,
+        error
+      );
+    }
+  }
+
+  /**
+   * Clear a board's primary teammate only if it still points at branchId.
+   *
+   * This keeps board metadata consistent when a teammate branch is moved off
+   * a board without clearing a newer primary teammate assignment by mistake.
+   */
+  async clearPrimaryTeammateIfMatches(boardId: string, branchId: string): Promise<Board | null> {
+    try {
+      const fullBoardId = await this.resolveId(boardId);
+      const branch = await new BranchRepository(this.db).findById(branchId);
+      if (!branch) throw new EntityNotFoundError('Branch', branchId);
+
+      const result = await update(this.db, boards)
+        .set({ primary_teammate_id: null, updated_at: new Date() })
+        .where(
+          and(eq(boards.board_id, fullBoardId), eq(boards.primary_teammate_id, branch.branch_id))
+        )
+        .run();
+
+      if (result.rowsAffected === 0) return null;
+
+      const updated = await this.findById(fullBoardId);
+      if (!updated) throw new EntityNotFoundError('Board', boardId);
+      return updated;
+    } catch (error) {
+      if (error instanceof RepositoryError) throw error;
+      if (error instanceof EntityNotFoundError) throw error;
+      if (error instanceof AmbiguousIdError) throw error;
+      throw new RepositoryError(
+        `Failed to clear primary teammate if matched: ${error instanceof Error ? error.message : String(error)}`,
+        error
+      );
+    }
+  }
+
+  /**
+   * Clear a board's primary teammate pointer without deleting either entity.
+   */
+  async clearPrimaryTeammate(boardId: string): Promise<Board> {
+    try {
+      const fullBoardId = await this.resolveId(boardId);
+      await update(this.db, boards)
+        .set({ primary_teammate_id: null, updated_at: new Date() })
+        .where(eq(boards.board_id, fullBoardId))
+        .run();
+
+      const updated = await this.findById(fullBoardId);
+      if (!updated) throw new EntityNotFoundError('Board', boardId);
+      return updated;
+    } catch (error) {
+      if (error instanceof RepositoryError) throw error;
+      if (error instanceof EntityNotFoundError) throw error;
+      if (error instanceof AmbiguousIdError) throw error;
+      throw new RepositoryError(
+        `Failed to clear primary teammate: ${error instanceof Error ? error.message : String(error)}`,
+        error
+      );
+    }
+  }
+
+  private async getValidatedPrimaryTeammateBranch(
+    fullBoardId: string,
+    branchId: string
+  ): Promise<Branch> {
+    const branchRepo = new BranchRepository(this.db);
+    const branch = await branchRepo.findById(branchId);
+    if (!branch) throw new EntityNotFoundError('Branch', branchId);
+
+    if (branch.board_id !== fullBoardId) {
+      throw new RepositoryError('Primary teammate branch must belong to the board');
+    }
+    if (!isTeammate(branch)) {
+      throw new RepositoryError('Primary teammate branch must be a teammate branch');
+    }
+    if (branch.archived) {
+      throw new RepositoryError('Primary teammate branch must be active');
+    }
+
+    return branch;
+  }
+
+  /**
+   * DEPRECATED: Add session to board
+   * Use board-objects service instead
+   */
+  // async addSession(boardId: string, sessionId: string): Promise<Board> {
+  //   throw new RepositoryError('addSession is deprecated - use board-objects service');
+  // }
+
+  /**
+   * DEPRECATED: Remove session from board
+   * Use board-objects service instead
+   */
+  // async removeSession(boardId: string, sessionId: string): Promise<Board> {
+  //   throw new RepositoryError('removeSession is deprecated - use board-objects service');
+  // }
+
+  /**
+   * Get default board (or create if doesn't exist)
+   */
+  async getDefault(createdBy?: UserID | string): Promise<Board> {
+    try {
+      const defaultBoard = await this.findBySlug('default');
+
+      if (defaultBoard) {
+        return defaultBoard;
+      }
+
+      if (!createdBy) {
+        throw new RepositoryError('Cannot create the default Board without a real primary owner');
+      }
+      return this.create({
+        name: 'Main Board',
+        slug: 'default',
+        description: 'Main board for all sessions',
+        color: '#1677ff',
+        icon: '⭐',
+        created_by: createdBy as UserID,
+      });
+    } catch (error) {
+      throw new RepositoryError(
+        `Failed to get default board: ${error instanceof Error ? error.message : String(error)}`,
+        error
+      );
+    }
+  }
+
+  /**
+   * Atomically add or update a board object (text label or zone)
+   *
+   * Uses read-modify-write approach with proper serialization via update() method.
+   */
+  async upsertBoardObject(
+    boardId: string,
+    objectId: string,
+    objectData: BoardObject
+  ): Promise<Board> {
+    try {
+      const fullId = await this.resolveId(boardId);
+
+      const current = await this.findById(fullId);
+      if (!current) {
+        throw new EntityNotFoundError('Board', boardId);
+      }
+
+      // Add or update the object
+      const updatedObjects = { ...(current.objects || {}), [objectId]: objectData };
+
+      // Use the standard update method to ensure proper serialization
+      return this.update(fullId, { objects: updatedObjects });
+    } catch (error) {
+      if (error instanceof RepositoryError) throw error;
+      if (error instanceof EntityNotFoundError) throw error;
+      throw new RepositoryError(
+        `Failed to upsert board object: ${error instanceof Error ? error.message : String(error)}`,
+        error
+      );
+    }
+  }
+
+  /**
+   * Atomically remove a board object
+   */
+  async removeBoardObject(boardId: string, objectId: string): Promise<Board> {
+    try {
+      const fullId = await this.resolveId(boardId);
+
+      const current = await this.findById(fullId);
+      if (!current) {
+        throw new EntityNotFoundError('Board', boardId);
+      }
+
+      // Remove the object
+      const updatedObjects = { ...(current.objects || {}) };
+      delete updatedObjects[objectId];
+
+      // Use the standard update method to ensure proper serialization
+      return this.update(fullId, { objects: updatedObjects });
+    } catch (error) {
+      if (error instanceof RepositoryError) throw error;
+      if (error instanceof EntityNotFoundError) throw error;
+      throw new RepositoryError(
+        `Failed to remove board object: ${error instanceof Error ? error.message : String(error)}`,
+        error
+      );
+    }
+  }
+
+  /**
+   * Batch upsert multiple objects (sequential atomic updates)
+   *
+   * Note: Not a single transaction - each object is updated atomically.
+   * This is safe for independent objects but may have partial failures.
+   */
+  async batchUpsertBoardObjects(
+    boardId: string,
+    objects: Record<string, BoardObject>
+  ): Promise<Board> {
+    try {
+      const fullId = await this.resolveId(boardId);
+      const current = await this.findById(fullId);
+      for (const [objectId, objectData] of Object.entries(objects)) {
+        await this.upsertBoardObject(
+          boardId,
+          objectId,
+          keepZoneArrangement(current?.objects?.[objectId], objectData)
+        );
+      }
+
+      const updated = await this.findById(fullId);
+      if (!updated) {
+        throw new RepositoryError('Failed to retrieve updated board');
+      }
+
+      return updated;
+    } catch (error) {
+      if (error instanceof RepositoryError) throw error;
+      if (error instanceof EntityNotFoundError) throw error;
+      throw new RepositoryError(
+        `Failed to batch upsert board objects: ${error instanceof Error ? error.message : String(error)}`,
+        error
+      );
+    }
+  }
+
+  /**
+   * Shallow-merge field patches into existing board objects in a single
+   * read-modify-write.
+   *
+   * Unlike upsertBoardObject (which fully replaces the object value, dropping
+   * omitted fields), this overwrites ONLY the provided keys and leaves the rest
+   * of each object intact — so a narrow change (e.g. a zIndex reorder) has a
+   * smaller blast radius and won't clobber a field edited via a different patch
+   * call. Multiple objects in one call are merged before a single write, so a
+   * forward/backward swap touches both neighbors in one update.
+   *
+   * Objects that no longer exist are SKIPPED, never re-created — so a swap can't
+   * resurrect a neighbor deleted between the client's read and this write.
+   *
+   * Only an explicit allowlist of fields can be merged: `zIndex`, clamped into
+   * the board-object band [1, 499] so it can never be pushed onto the card
+   * (500) / comment (1000) layers, and a zone's `layout` (a known layout) and
+   * `order` (a list of ids). Any other key in a
+   * patch is ignored, so this narrow action cannot reshape an object (e.g. flip
+   * its `type`) the way a full upsert could.
+   *
+   * NOTE: this is NOT atomic against concurrent writers. Like every other board
+   * writer, the findById → update sequence has a lost-update window: a write
+   * that lands between the read and the update can be overwritten (last-write-
+   * wins). Merging only the patched keys narrows that window's blast radius
+   * versus a full-object upsert, but does not close it.
+   */
+  async mergeBoardObjectFields(
+    boardId: string,
+    patches: Record<string, Partial<BoardObject>>
+  ): Promise<Board> {
+    // Board objects stay strictly below the card (500) / comment (1000) layers.
+    const Z_MIN = 1;
+    const Z_MAX = 499;
+    try {
+      const fullId = await this.resolveId(boardId);
+
+      const current = await this.findById(fullId);
+      if (!current) {
+        throw new EntityNotFoundError('Board', boardId);
+      }
+
+      const updatedObjects = { ...(current.objects || {}) };
+      for (const [objectId, fields] of Object.entries(patches)) {
+        const existing = updatedObjects[objectId];
+        if (!existing) continue; // never resurrect a concurrently-deleted object
+
+        // Allowlist: everything else in the patch is ignored so this action
+        // can't reshape an object's persisted fields.
+        const { zIndex, layout, order, width } = fields as {
+          zIndex?: unknown;
+          layout?: unknown;
+          order?: unknown;
+          width?: unknown;
+        };
+        const merged: Partial<BoardObject> & { layout?: ZoneLayout; order?: string[] } = {};
+        if (typeof zIndex === 'number' && Number.isFinite(zIndex)) {
+          merged.zIndex = Math.min(Z_MAX, Math.max(Z_MIN, zIndex));
+        }
+        if (existing.type === 'zone' && ZONE_LAYOUTS.includes(layout as ZoneLayout)) {
+          merged.layout = layout as ZoneLayout;
+        }
+        const zoneOrder = existing.type === 'zone' ? sanitizeZoneOrder(order) : undefined;
+        if (zoneOrder) merged.order = zoneOrder;
+        if (existing.type === 'zone' && typeof width === 'number' && Number.isFinite(width)) {
+          (merged as { width?: number }).width = Math.max(1, width);
+        }
+        if (Object.keys(merged).length === 0) continue;
+        updatedObjects[objectId] = { ...existing, ...merged } as BoardObject;
+      }
+
+      return this.update(fullId, { objects: updatedObjects });
+    } catch (error) {
+      if (error instanceof RepositoryError) throw error;
+      if (error instanceof EntityNotFoundError) throw error;
+      throw new RepositoryError(
+        `Failed to merge board object fields: ${error instanceof Error ? error.message : String(error)}`,
+        error
+      );
+    }
+  }
+
+  /**
+   * DEPRECATED: Delete a zone and handle associated sessions
+   * TODO: Reimplement using board-objects table
+   */
+  async deleteZone(
+    boardId: string,
+    objectId: string,
+    _deleteAssociatedSessions: boolean
+  ): Promise<{ board: Board; affectedSessions: string[] }> {
+    // For now, just delete the zone object from annotations
+    // Session pinning will be handled by board-objects table in the future
+    const updatedBoard = await this.removeBoardObject(boardId, objectId);
+    return {
+      board: updatedBoard,
+      affectedSessions: [], // No sessions to track yet
+    };
+  }
+
+  /**
+   * Export board to blob (JSON)
+   *
+   * Strips runtime-specific fields (IDs, timestamps, user attribution).
+   * Returns a portable board template.
+   */
+  async toBlob(boardId: string): Promise<BoardExportBlob> {
+    const board = await this.findById(boardId);
+    if (!board) {
+      throw new EntityNotFoundError('Board', boardId);
+    }
+
+    const permissions = await new CapabilityPolicyRepository(this.db).getBoardPolicies(
+      board.board_id as BoardID
+    );
+    const templateOthers = permissions.branch_template.access.others;
+    const defaultOthersCan: BranchPermissionLevel =
+      templateOthers.preset === 'manager'
+        ? 'all'
+        : templateOthers.preset === 'collaborator'
+          ? 'session'
+          : templateOthers.preset === 'viewer'
+            ? 'view'
+            : 'none';
+
+    return {
+      name: board.name,
+      slug: board.slug,
+      description: board.description,
+      icon: board.icon,
+      color: board.color,
+      background_color: board.background_color,
+      custom_css: board.custom_css,
+      // Portable exports preserve only fallback/template behavior. Named
+      // users, groups, and primary ownership are
+      // intentionally tenant-local security state and never leave with a
+      // board template.
+      access_mode: permissions.board_access.sharing_mode,
+      default_others_can: defaultOthersCan,
+      default_others_fs_access: templateOthers.fs_access,
+      objects: board.objects,
+      custom_context: board.custom_context,
+    };
+  }
+
+  /**
+   * Import board from blob (JSON)
+   *
+   * Creates a new board with fresh IDs and timestamps. Objects that cannot be
+   * imported are skipped and reported in `import_skipped`.
+   */
+  async fromBlob(blob: BoardExportBlob, userId: string): Promise<BoardImportResult> {
+    const { blob: importable, skipped } = await this.prepareBoardImport(blob, userId);
+    const board: BoardImportResult = await this.create(
+      mapBoardExportBlobToCreateData(importable, userId)
+    );
+    if (skipped.length) board.import_skipped = skipped;
+    return board;
+  }
+
+  /**
+   * Validate an untrusted export blob and drop the objects import cannot use.
+   * Structural problems (not an object, no name) still throw.
+   */
+  private async prepareBoardImport(
+    blob: unknown,
+    userId: string
+  ): Promise<{ blob: BoardExportBlob; skipped: BoardImportSkippedObject[] }> {
+    this.validateBoardBlob(blob);
+    if (!blob.objects) return { blob, skipped: [] };
+    const sanitized = sanitizeImportedBoardObjects(blob.objects);
+    const { objects, skipped } = await this.resolveImportedArtifactReferences(
+      sanitized.objects,
+      userId
+    );
+    return { blob: { ...blob, objects }, skipped: [...sanitized.skipped, ...skipped] };
+  }
+
+  /**
+   * Best-effort artifact references: keep one only if the artifact exists in
+   * the importing tenant and the importing user can see it (the same
+   * public-or-creator rule the board read filter applies). Same-workspace
+   * imports keep their artifacts; cross-workspace, deleted, or another user's
+   * private artifacts are dropped. The warning does not distinguish "missing"
+   * from "not yours", so it never confirms a private artifact exists.
+   */
+  private async resolveImportedArtifactReferences(
+    objects: Record<string, BoardObject>,
+    userId: string
+  ): Promise<{ objects: Record<string, BoardObject>; skipped: BoardImportSkippedObject[] }> {
+    const artifactIds = Object.values(objects).flatMap((object) =>
+      object.type === 'artifact' ? [object.artifact_id] : []
+    );
+    if (!artifactIds.length) return { objects, skipped: [] };
+
+    let visible = new Set<string>();
+    try {
+      visible = await new ArtifactRepository(this.db).findBoardReferenceVisibleIds(
+        artifactIds,
+        userId
+      );
+    } catch {
+      // Fail closed: an unverifiable reference is dropped, the board still imports.
+    }
+
+    const kept: Record<string, BoardObject> = {};
+    const skipped: BoardImportSkippedObject[] = [];
+    for (const [id, object] of Object.entries(objects)) {
+      if (object.type === 'artifact' && !visible.has(object.artifact_id)) {
+        skipped.push({
+          object_id: id,
+          type: 'artifact',
+          reason: 'unresolved_reference',
+          detail: `artifact ${object.artifact_id} is not available to you in this workspace`,
+        });
+        continue;
+      }
+      kept[id] = object;
+    }
+    return { objects: kept, skipped };
+  }
+
+  /**
+   * Export board to YAML string
+   */
+  async toYaml(boardId: string): Promise<string> {
+    const blob = await this.toBlob(boardId);
+
+    // Add header comment with metadata
+    const header = [
+      '# Agor Board Export',
+      `# Generated: ${new Date().toISOString()}`,
+      '# Version: 1.0',
+      '',
+    ].join('\n');
+
+    return header + yaml.dump(blob, { indent: 2, lineWidth: -1 });
+  }
+
+  /**
+   * Import board from YAML string
+   */
+  async fromYaml(yamlContent: string, userId: string): Promise<BoardImportResult> {
+    const blob = this.parseYamlToBlob(yamlContent);
+    return this.fromBlob(blob, userId);
+  }
+
+  /**
+   * Parse YAML string into a structurally validated BoardExportBlob without
+   * creating a board (per-object filtering happens in prepareBoardImport)
+   * Uses JSON_SCHEMA to prevent code execution via malicious YAML tags
+   * while still correctly parsing numbers, booleans, and null
+   */
+  parseYamlToBlob(yamlContent: string): BoardExportBlob {
+    try {
+      // Use JSON_SCHEMA to prevent RCE via !!js/function or other code-executing tags
+      // while still parsing numbers, booleans, and null correctly
+      // (FAILSAFE_SCHEMA parses everything as strings, breaking numeric validations)
+      const blob = yaml.load(yamlContent, { schema: yaml.JSON_SCHEMA }) as BoardExportBlob;
+      this.validateBoardBlob(blob);
+      return blob;
+    } catch (error) {
+      throw new RepositoryError(
+        `Failed to parse YAML: ${error instanceof Error ? error.message : String(error)}`,
+        error
+      );
+    }
+  }
+
+  /**
+   * Clone board (create copy with new ID)
+   *
+   * Convenience method that combines toBlob + fromBlob.
+   */
+  async clone(boardId: string, newName: string, userId: string): Promise<Board> {
+    const blob = await this.toBlob(boardId);
+    return this.create(mapBoardExportBlobToCreateData(blob, userId, newName));
+  }
+
+  /**
+   * Validate board export blob structure
+   */
+  public validateBoardBlob(blob: unknown): asserts blob is BoardExportBlob {
+    if (!blob || typeof blob !== 'object') {
+      throw new RepositoryError('Invalid board export: must be an object');
+    }
+
+    const b = blob as Partial<BoardExportBlob>;
+
+    if (!b.name || typeof b.name !== 'string') {
+      throw new RepositoryError('Invalid board export: name is required');
+    }
+
+    // Individual objects are filtered (not rejected) by prepareBoardImport;
+    // only the container shape is structural.
+    if (
+      b.objects !== undefined &&
+      b.objects !== null &&
+      (typeof b.objects !== 'object' || Array.isArray(b.objects))
+    ) {
+      throw new RepositoryError('Invalid board export: objects must be a map of objects');
+    }
+
+    // Validate custom_context if present
+    if (b.custom_context) {
+      try {
+        JSON.parse(JSON.stringify(b.custom_context));
+      } catch (_error) {
+        throw new RepositoryError('Invalid custom_context: must be valid JSON');
+      }
+    }
+  }
+}

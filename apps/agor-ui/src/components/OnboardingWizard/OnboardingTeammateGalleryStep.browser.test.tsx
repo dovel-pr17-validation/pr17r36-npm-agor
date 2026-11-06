@@ -1,0 +1,147 @@
+import { type Repo, TEAMMATE_FRAMEWORK_REPO_URL } from '@agor-live/client';
+import { act, cleanup, render, screen } from '@testing-library/react';
+import { ConfigProvider, theme } from 'antd';
+import { afterEach, expect, it, vi } from 'vitest';
+import { page, userEvent } from 'vitest/browser';
+import { EMPTY_MAPS } from '../../store/agorMaps';
+import { agorStore } from '../../store/agorStore';
+import { OnboardingWizard } from './OnboardingWizard';
+
+function seedFrameworkRepo(slug: string, remote_url: string) {
+  const repo = { repo_id: 'repo-framework', slug, remote_url, clone_status: 'ready' } as Repo;
+  agorStore.setState({ ...EMPTY_MAPS, repoById: new Map([[repo.repo_id, repo]]) });
+}
+
+function renderTeammateStep() {
+  // Real components, null client: layout evidence only, not provisioning/executor evidence.
+  render(
+    <ConfigProvider theme={{ algorithm: theme.darkAlgorithm, token: { motion: false } }}>
+      <OnboardingWizard
+        open
+        initialStep="workspace"
+        client={null}
+        onComplete={vi.fn()}
+        onUpdateUser={vi.fn(async () => undefined)}
+      />
+    </ConfigProvider>
+  );
+}
+
+const originalViewport = { width: window.innerWidth, height: window.innerHeight };
+afterEach(async () => {
+  cleanup();
+  agorStore.setState({ ...EMPTY_MAPS });
+  await page.viewport(originalViewport.width, originalViewport.height);
+});
+
+// Intersect every clipping ancestor, not just the scroller's nominal box.
+function visibleBox(element: Element) {
+  const rect = element.getBoundingClientRect();
+  let top = Math.max(0, rect.top);
+  let bottom = Math.min(window.innerHeight, rect.bottom);
+  for (
+    let parent = element.parentElement;
+    parent && parent !== document.body;
+    parent = parent.parentElement
+  ) {
+    if (/auto|scroll|hidden|clip/.test(getComputedStyle(parent).overflowY)) {
+      const clip = parent.getBoundingClientRect();
+      top = Math.max(top, clip.top);
+      bottom = Math.min(bottom, clip.bottom);
+    }
+  }
+  return { top, bottom, height: Math.max(0, bottom - top) };
+}
+
+it.each([
+  [320, 568],
+  [844, 480],
+  [844, 430],
+])('keeps baseline gallery space and scrollable disclosure at %dx%d', async (width, height) => {
+  await page.viewport(width, height);
+  seedFrameworkRepo('preset-io/agor-teammate', TEAMMATE_FRAMEWORK_REPO_URL);
+  renderTeammateStep();
+  await screen.findByLabelText('Teammate name');
+  await act(async () => {
+    await document.fonts.ready;
+    await Promise.all(
+      document
+        .getAnimations()
+        .filter((animation) => animation.effect?.getComputedTiming().iterations !== Infinity)
+        .map((animation) => animation.finished)
+    );
+  });
+  const grid = screen.getByRole('group', { name: 'Teammate template' });
+  const scroller = grid.parentElement!;
+  const disclosure = screen.getByText(/With the public starter, home files stay/);
+  const actual = visibleBox(scroller);
+
+  // The pre-disclosure baseline is this same layout with only the new copy hidden.
+  disclosure.style.display = 'none';
+  const baseline = visibleBox(scroller);
+  disclosure.style.removeProperty('display');
+  expect(actual.height).toBeGreaterThan(0);
+  expect(actual.height).toBeCloseTo(baseline.height, 1);
+  expect(actual.top).toBeCloseTo(baseline.top, 1);
+  expect(disclosure.parentElement).toBe(scroller);
+  expect(grid.compareDocumentPosition(disclosure) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+
+  // All lines must be reachable inside the true clip, even where the pre-existing
+  // short layout shows less than a full line at once. No 844x390 layout repair here.
+  const range = document.createRange();
+  range.selectNodeContents(disclosure);
+  const lineCount = range.getClientRects().length;
+  expect(lineCount).toBeGreaterThan(0);
+  for (let index = 0; index < lineCount; index++) {
+    const line = range.getClientRects()[index];
+    const clip = visibleBox(scroller);
+    await act(async () => {
+      scroller.scrollTop += (line.top + line.bottom - clip.top - clip.bottom) / 2;
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    });
+    const reached = range.getClientRects()[index];
+    const visible = visibleBox(scroller);
+    expect(
+      Math.min(reached.bottom, visible.bottom) - Math.max(reached.top, visible.top)
+    ).toBeGreaterThan(0);
+    const hit = document.elementFromPoint(
+      (reached.left + reached.right) / 2,
+      (Math.max(reached.top, visible.top) + Math.min(reached.bottom, visible.bottom)) / 2
+    );
+    expect(hit === disclosure || disclosure.contains(hit)).toBe(true);
+  }
+  console.info('local-home disclosure geometry', { width, height, actual, baseline, lineCount });
+});
+
+it('hides the public-starter disclosure when onboarding uses a private framework fork', async () => {
+  seedFrameworkRepo(
+    'acme/agor-teammate-private',
+    'https://github.com/acme/agor-teammate-private.git'
+  );
+  renderTeammateStep();
+  await screen.findByLabelText('Teammate name');
+  expect(screen.getByRole('group', { name: 'Teammate template' })).toBeInTheDocument();
+  expect(screen.queryByText(/With the public starter, home files stay/)).not.toBeInTheDocument();
+});
+
+it('settles at the bottom when collapsing the title would make the cards fit', async () => {
+  // Without the disclosure, collapsing the title at 1280x800 leaves no overflow.
+  await page.viewport(1280, 800);
+  seedFrameworkRepo(
+    'acme/agor-teammate-private',
+    'https://github.com/acme/agor-teammate-private.git'
+  );
+  renderTeammateStep();
+  await screen.findByLabelText('Teammate name');
+  const scroller = screen.getByRole('group', { name: 'Teammate template' }).parentElement!;
+  expect(scroller.scrollHeight).toBeGreaterThan(scroller.clientHeight);
+
+  await userEvent.wheel(scroller, { delta: { y: 120 }, times: 10 });
+  const samples: number[] = [];
+  for (let index = 0; index < 10; index++) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    samples.push(scroller.scrollTop);
+  }
+  expect(new Set(samples).size, samples.join(',')).toBe(1);
+  expect(samples[0]).toBeCloseTo(scroller.scrollHeight - scroller.clientHeight, 0);
+});

@@ -1,0 +1,156 @@
+/**
+ * SDK Response Types - Raw responses from each agentic tool SDK
+ *
+ * These types represent the SDK response shapes used for token accounting.
+ * Before tasks.raw_sdk_response persistence, executor adapters project away
+ * provider error bodies and unknown extension metadata.
+ *
+ * IMPORTANT: These are the ACTUAL SDK types, imported directly from each SDK.
+ * The provider SDK types remain the source of truth for the allowlisted shape;
+ * the runtime values are deliberately not persisted verbatim.
+ */
+
+import type { MessageID } from '@agor/core/types';
+import type { SDKResultMessage } from '@anthropic-ai/claude-agent-sdk';
+import type { ServerGeminiFinishedEvent } from '@google/gemini-cli-core';
+import type { TurnCompletedEvent } from '@openai/codex-sdk';
+
+// ============================================================================
+// Claude Code SDK Response (from Anthropic Claude Agent SDK)
+// ============================================================================
+
+/**
+ * Claude Code SDK Response - Direct import from Claude Agent SDK
+ * This is the actual SDKResultMessage type with no modifications
+ */
+export type ClaudeCodeSdkResponse = SDKResultMessage;
+
+/**
+ * Per-model usage from the Claude Agent SDK. Derive it from the provider type
+ * so newly-added accounting metadata (for example thinkingTokens and
+ * costBasis) is retained without maintaining a second partial interface.
+ */
+export type ClaudeModelUsage = SDKResultMessage['modelUsage'][string];
+
+/**
+ * Internal structure of top-level usage from Claude Agent SDK (legacy/fallback)
+ */
+export interface ClaudeTopLevelUsage {
+  input_tokens?: number;
+  output_tokens?: number;
+  cache_read_input_tokens?: number;
+  cache_creation_input_tokens?: number;
+}
+
+/**
+ * Type-safe representation of ClaudeCodeSdkResponse with known fields
+ * Intersects the SDK type with explicit structure for our usage
+ */
+export type ClaudeCodeSdkResponseTyped = SDKResultMessage & {
+  modelUsage?: Record<string, ClaudeModelUsage>;
+  usage?: ClaudeTopLevelUsage;
+  duration_ms?: number;
+  total_cost_usd?: number;
+};
+
+// ============================================================================
+// Codex SDK Response (from OpenAI Codex SDK)
+// ============================================================================
+
+/**
+ * Codex SDK Response - closed accounting projection of TurnCompletedEvent.
+ */
+export type CodexSdkResponse = TurnCompletedEvent;
+
+// ============================================================================
+// Gemini SDK Response (from Google Gemini CLI SDK)
+// ============================================================================
+
+/**
+ * Gemini SDK Response - Direct import from Gemini SDK
+ * This is the actual ServerGeminiFinishedEvent type with no modifications
+ */
+export type GeminiSdkResponse = ServerGeminiFinishedEvent & {
+  agor?: {
+    usage: import('./token-usage.js').TokenUsage;
+    requestedModel: string;
+    reportedModel?: string;
+    costEstimated: true;
+  };
+};
+
+// ============================================================================
+// Copilot SDK Response (from GitHub Copilot SDK)
+// ============================================================================
+
+/**
+ * Copilot SDK Response - Accumulated data from Copilot session events
+ *
+ * Unlike other SDKs that return a single response object, Copilot streams
+ * events and we accumulate the relevant data (usage, model, sessionId)
+ * into this structure for normalization and storage.
+ */
+export type CopilotSdkResponse = import('../sdk-handlers/copilot/normalizer.js').CopilotSdkResponse;
+
+// ============================================================================
+// OpenCode SDK Response
+// ============================================================================
+
+/**
+ * OpenCode SDK Response - Currently unknown structure
+ * TODO: Import actual OpenCode SDK type when available
+ */
+export type OpenCodeSdkResponse = unknown;
+
+// ============================================================================
+// Union Type - All Raw SDK Responses
+// ============================================================================
+
+/**
+ * Union of all raw SDK response types
+ * This is what gets stored in tasks.raw_sdk_response
+ */
+export type RawSdkResponse =
+  | ClaudeCodeSdkResponse
+  | CodexSdkResponse
+  | GeminiSdkResponse
+  | CopilotSdkResponse
+  | OpenCodeSdkResponse;
+
+// ============================================================================
+// Legacy/Deprecated Types (for backward compatibility)
+// ============================================================================
+
+/**
+ * @deprecated Use normalizeRawSdkResponse() from utils/sdk-normalizer instead
+ * This interface represents normalized/computed data, not raw SDK responses
+ */
+export interface NormalizedSdkResponse {
+  userMessageId: MessageID;
+  assistantMessageIds: MessageID[];
+  tokenUsage?: {
+    inputTokens: number;
+    outputTokens: number;
+    totalTokens: number;
+    cacheReadTokens?: number;
+    cacheCreationTokens?: number;
+  };
+  durationMs?: number;
+  contextWindow?: number;
+  contextWindowLimit?: number;
+  model?: string;
+  /**
+   * Per-model usage breakdown (for multi-model sessions like Claude Code)
+   * Maps model ID to usage stats including context window per model
+   */
+  modelUsage?: Record<
+    string,
+    {
+      inputTokens: number;
+      outputTokens: number;
+      cacheReadInputTokens?: number;
+      cacheCreationInputTokens?: number;
+      contextWindow: number;
+    }
+  >;
+}

@@ -1,0 +1,235 @@
+import type { AgorClient, Board, Branch, SpawnConfig, User } from '@agor-live/client';
+import { Spin, Typography, theme } from 'antd';
+import { lazy, Suspense, useEffect, useMemo } from 'react';
+import { useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom';
+import { resolveBoardFromUrlPure } from '@/utils/urlResolution';
+import { useTrackBoardVisit } from '../../hooks/useRecentBoards';
+import { useStableCallback } from '../../hooks/useStableCallback';
+import { agorStore, shallow, useAgorStore, useStoreWithEqualityFn } from '../../store/agorStore';
+import { makeBranchesForBoardSelector } from '../../store/selectors';
+import { OPEN_BOARD_SWITCHER_EVENT, requestShellPicker } from '../../utils/shellEvents';
+import { BoardSwitcher } from '../BoardSwitcher';
+import { BoardTeammatePanel, type BoardTeammatePanelTab } from '../BoardTeammatePanel';
+import { useBoardTeammatePanelData } from '../BoardTeammatePanel/useBoardTeammatePanelData';
+import type { BranchModalTab } from '../BranchModal';
+import { CompactNotice } from '../CompactNotice';
+import { mobilePageStyle } from './constants';
+
+// React Flow stays out of the shell bundle until a board is opened.
+const SessionCanvas = lazy(() => import('../SessionCanvas/SessionCanvas'));
+
+export const BOARD_UNAVAILABLE =
+  "This board isn't available. It may have been deleted, or you may not have access.";
+
+// Teammate leads (and is the default), like the desktop panel; the view-only canvas is second.
+const BOARD_TABS: BoardTeammatePanelTab[] = ['teammate', 'board', 'all-sessions', 'comments'];
+const DEFAULT_BOARD_TAB: BoardTeammatePanelTab = 'teammate';
+
+/** Route state that opens the board switcher on arrival (Home's "All boards"). */
+export interface MobileBoardLocationState {
+  openBoardSwitcher?: boolean;
+}
+
+interface MobileBoardPageProps {
+  client: AgorClient | null;
+  currentUser?: User | null;
+  boardById: Map<string, Board>;
+  branchById: Map<string, Branch>;
+  onOpenBranch: (branchId: string, tab: BranchModalTab) => void;
+  /** Start a new session on a branch (opens the agent picker). */
+  onNewSession: (branchId: string) => void;
+  onForkSession: (sessionId: string, prompt: string) => Promise<void>;
+  onSpawnSession: (sessionId: string, config: string | Partial<SpawnConfig>) => Promise<void>;
+  onUpdateBoard?: (boardId: string, updates: Partial<Board>) => void;
+  onSendComment: (boardId: string, content: string) => void;
+  onReplyComment?: (parentId: string, content: string) => void;
+  onResolveComment?: (commentId: string) => void;
+  onToggleReaction?: (commentId: string, emoji: string) => void;
+  onDeleteComment?: (commentId: string) => void;
+  /**
+   * The board's partition is complete (`useBoardPartition`). Until then rows
+   * may be missing, so the panel never infers "empty" or "no access".
+   */
+  boardReady?: boolean;
+  /** Current workspace tool availability is known; resets on workspace switches. */
+  settingsHydrated: boolean;
+}
+
+/** Board screen: board switcher, then the desktop board panel tabs with a view-only canvas second. */
+export const MobileBoardPage: React.FC<MobileBoardPageProps> = ({
+  client,
+  currentUser,
+  boardById,
+  branchById,
+  onOpenBranch,
+  onNewSession,
+  onForkSession,
+  onSpawnSession,
+  onUpdateBoard,
+  onSendComment,
+  onReplyComment,
+  onResolveComment,
+  onToggleReaction,
+  onDeleteComment,
+  boardReady = true,
+  settingsHydrated,
+}) => {
+  const { boardId = '' } = useParams<{ boardId: string }>();
+  const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const { token } = theme.useToken();
+  // Boards load with the first workspace read; until then a missing board may still arrive.
+  const loading = useAgorStore((state) => state.loading);
+  const userId = currentUser?.user_id;
+  const resolvedBoardId = boardById.has(boardId)
+    ? boardId
+    : resolveBoardFromUrlPure(boardId, boardById);
+  const board = resolvedBoardId ? boardById.get(resolvedBoardId) : undefined;
+  const visitedBoardId = board?.board_id;
+  const trackBoardVisit = useTrackBoardVisit(userId);
+  useEffect(() => {
+    if (visitedBoardId) trackBoardVisit(visitedBoardId);
+  }, [visitedBoardId, trackBoardVisit]);
+
+  const { state, pathname, search } = useLocation();
+  const openBoardSwitcher = (state as MobileBoardLocationState | null)?.openBoardSwitcher;
+  useEffect(() => {
+    if (!openBoardSwitcher) return;
+    requestShellPicker(OPEN_BOARD_SWITCHER_EVENT);
+    // One-shot: clear it so Back/Forward onto this entry doesn't reopen the switcher.
+    navigate({ pathname, search }, { replace: true, state: null });
+  }, [openBoardSwitcher, navigate, pathname, search]);
+
+  const tabParam = searchParams.get('tab') as BoardTeammatePanelTab | null;
+  const activeTab = tabParam && BOARD_TABS.includes(tabParam) ? tabParam : DEFAULT_BOARD_TAB;
+  const setActiveTab = useStableCallback((tab: BoardTeammatePanelTab) =>
+    setSearchParams(tab === DEFAULT_BOARD_TAB ? {} : { tab }, { replace: true })
+  );
+
+  const boards = useMemo(() => Array.from(boardById.values()), [boardById]);
+  // Shallow-equal like desktop: unrelated socket churn keeps the array, so the canvas stays put.
+  const boardBranches = useStoreWithEqualityFn(
+    agorStore,
+    useMemo(() => makeBranchesForBoardSelector(visitedBoardId), [visitedBoardId]),
+    shallow
+  );
+  const {
+    primaryTeammateId,
+    primaryTeammateBranch,
+    primaryTeammateRepo,
+    primaryTeammateInaccessible,
+    unreadCommentsCount,
+    hasUserMentions,
+  } = useBoardTeammatePanelData(board, currentUser, boardReady);
+
+  const openSession = useStableCallback((sessionId: string) => navigate(`/m/session/${sessionId}`));
+  const openBranch = useStableCallback((branchId: string, tab?: BranchModalTab) =>
+    onOpenBranch(branchId, tab ?? 'general')
+  );
+  // Stable, like desktop's, so the memoized panel skips the shell's re-render on every session patch.
+  const sendComment = useStableCallback((content: string) => {
+    if (visitedBoardId) onSendComment(visitedBoardId, content);
+  });
+  const createSession = useStableCallback(onNewSession);
+  const forkSession = useStableCallback(onForkSession);
+  const spawnSession = useStableCallback(onSpawnSession);
+  const replyComment = useStableCallback(onReplyComment);
+  const resolveComment = useStableCallback(onResolveComment);
+  const toggleReaction = useStableCallback(onToggleReaction);
+  const deleteComment = useStableCallback(onDeleteComment);
+  // Same element across shell re-renders (every session patch), so React skips the canvas subtree.
+  const canvas = useMemo(
+    () =>
+      board ? (
+        <Suspense fallback={<Spin style={{ display: 'block', margin: token.marginLG }} />}>
+          <SessionCanvas
+            readOnly
+            height="100%"
+            board={board}
+            client={client}
+            branches={boardBranches}
+            primaryTeammateId={primaryTeammateId}
+            currentUserId={userId}
+            onSessionClick={openSession}
+            onOpenBranch={openBranch}
+          />
+        </Suspense>
+      ) : null,
+    [board, client, boardBranches, primaryTeammateId, userId, openSession, openBranch, token]
+  );
+
+  return (
+    <div style={mobilePageStyle}>
+      <div
+        style={{
+          flexShrink: 0,
+          paddingInline: token.paddingXXS,
+          background: token.colorBgContainer,
+          borderBottom: `${token.lineWidth}px solid ${token.colorBorderSecondary}`,
+        }}
+      >
+        <BoardSwitcher
+          boards={boards}
+          currentBoardId={resolvedBoardId}
+          onBoardChange={(id) => navigate(`/m/board/${id}`)}
+          onHomeClick={() => navigate('/m')}
+          branchById={branchById}
+          client={client}
+          currentUser={currentUser}
+          onUpdateBoard={onUpdateBoard}
+        />
+      </div>
+      {!settingsHydrated && (
+        <Typography.Text
+          role="status"
+          type="secondary"
+          style={{ padding: token.paddingSM, flexShrink: 0 }}
+        >
+          Loading agentic tool availability
+        </Typography.Text>
+      )}
+      {board ? (
+        <div style={{ flex: 1, minHeight: 0 }}>
+          <BoardTeammatePanel
+            client={client}
+            board={board}
+            boardTab={canvas}
+            showBranchesTab={false}
+            touch
+            activeTab={activeTab}
+            onTabChange={setActiveTab}
+            primaryTeammateBranch={primaryTeammateBranch}
+            primaryTeammateRepo={primaryTeammateRepo}
+            primaryTeammateInaccessible={primaryTeammateInaccessible}
+            boardReady={boardReady}
+            currentUserId={userId}
+            unreadCommentsCount={unreadCommentsCount}
+            hasUserMentions={hasUserMentions}
+            onSessionClick={openSession}
+            onCreateSession={createSession}
+            onForkSession={forkSession}
+            onSpawnSession={spawnSession}
+            onOpenSettings={openBranch}
+            onSendComment={sendComment}
+            onReplyComment={replyComment}
+            onResolveComment={resolveComment}
+            onToggleReaction={toggleReaction}
+            onDeleteComment={deleteComment}
+          />
+        </div>
+      ) : (
+        <div style={{ padding: token.padding }}>
+          {loading ? (
+            <Typography.Text type="secondary">Loading board…</Typography.Text>
+          ) : (
+            <CompactNotice
+              type="neutral"
+              message={BOARD_UNAVAILABLE}
+              actions={[{ label: 'Back to home', onClick: () => navigate('/m') }]}
+            />
+          )}
+        </div>
+      )}
+    </div>
+  );
+};

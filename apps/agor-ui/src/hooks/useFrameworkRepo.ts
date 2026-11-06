@@ -1,0 +1,87 @@
+import {
+  isPrivateTeammateFrameworkFork,
+  type Repo,
+  TEAMMATE_FRAMEWORK_REPO_SLUG,
+  TEAMMATE_FRAMEWORK_REPO_URL,
+} from '@agor-live/client';
+import { useMemo } from 'react';
+
+/** Back-compatible UI aliases for the domain-owned framework identifiers. */
+export const FRAMEWORK_REPO_SLUG = TEAMMATE_FRAMEWORK_REPO_SLUG;
+export const FRAMEWORK_REPO_URL = TEAMMATE_FRAMEWORK_REPO_URL;
+
+/**
+ * Match predicate with priority ordering:
+ * 1. agor-teammate-private/agor-assistant-private (any org) — private fork takes precedence
+ * 2. preset-io/agor-teammate (exact slug)
+ * 3. Legacy preset-io/agor-assistant (exact slug)
+ * 4. Any repo whose remote_url contains "agor-teammate", "agor-assistant", or "agor-openclaw"
+ */
+function findBestFrameworkRepo(repos: Repo[]): Repo | undefined {
+  let publicMatch: Repo | undefined;
+  let urlMatch: Repo | undefined;
+
+  for (const r of repos) {
+    // Highest priority: private fork
+    if (isPrivateTeammateFrameworkFork(r)) {
+      return r;
+    }
+    // Exact public slug
+    if (!publicMatch && (r.slug === FRAMEWORK_REPO_SLUG || r.slug === 'preset-io/agor-assistant')) {
+      publicMatch = r;
+    }
+    // URL-based fallback
+    if (
+      !urlMatch &&
+      (r.remote_url?.includes('agor-teammate') ||
+        r.remote_url?.includes('agor-assistant') ||
+        r.remote_url?.includes('agor-openclaw'))
+    ) {
+      urlMatch = r;
+    }
+  }
+
+  return publicMatch || urlMatch;
+}
+
+/**
+ * Detects the framework repository from a list of repos.
+ * Prefers private forks over the public repo.
+ * Used by the teammate create flow and OnboardingWizard.
+ */
+export function useFrameworkRepo(repos: Repo[]): Repo | undefined {
+  return useMemo(() => findBestFrameworkRepo(repos), [repos]);
+}
+
+/**
+ * Non-hook version for use in loops / imperative code (e.g., OnboardingWizard effects).
+ *
+ * When `readyOnly` is true, non-ready repos (`clone_status: 'cloning' | 'failed'`) are
+ * excluded **before** priority selection, so a stale/failed higher-priority match (e.g.
+ * an abandoned `agor-assistant-private` clone) never hides a ready lower-priority repo.
+ */
+export function findFrameworkRepo(
+  repos: Iterable<[string, Repo]>,
+  options?: { readyOnly?: boolean; excludeFailed?: boolean }
+): [string, Repo] | undefined {
+  const repoArray: Repo[] = [];
+  const entryMap = new Map<string, [string, Repo]>();
+
+  for (const entry of repos) {
+    const repo = entry[1];
+    if (options?.readyOnly && repo.clone_status !== 'ready' && repo.clone_status !== undefined) {
+      continue;
+    }
+    if (options?.excludeFailed && repo.clone_status === 'failed') {
+      continue;
+    }
+    repoArray.push(repo);
+    entryMap.set(repo.repo_id, entry);
+  }
+
+  const best = findBestFrameworkRepo(repoArray);
+  if (best) {
+    return entryMap.get(best.repo_id);
+  }
+  return undefined;
+}

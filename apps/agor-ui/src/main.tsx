@@ -1,0 +1,50 @@
+import type { AgorClient } from '@agor-live/client';
+import { createRoot } from 'react-dom/client';
+import App from './App.tsx';
+import './index.css';
+import { installClipboardPolyfill } from './utils/clipboard-polyfill';
+import { preventIosInputZoom } from './utils/deviceDetection';
+import { captureMcpConnectIntent } from './utils/mcpConnectIntent';
+import { captureMcpOAuthReturn } from './utils/mcpOAuthReturn';
+
+declare global {
+  interface Window {
+    __agorClient?: AgorClient;
+  }
+}
+
+// Install clipboard polyfill for non-HTTPS environments
+// This ensures Streamdown's copy buttons work on HTTP and local network IPs
+installClipboardPolyfill();
+
+// Lets phone inputs use body-size text without iOS zooming in on focus.
+preventIosInputZoom();
+
+// Before any router can canonicalize the query away.
+captureMcpConnectIntent();
+// Before the auth gate: a signed-out login screen copies the address into its
+// launch `return_to`, which must never carry the provider response.
+captureMcpOAuthReturn();
+
+// Cleanup WebSocket connections on Vite HMR
+if (import.meta.hot) {
+  import.meta.hot.dispose(() => {
+    // Close all open socket.io connections
+    if (typeof window !== 'undefined' && window.__agorClient) {
+      const client = window.__agorClient;
+      if (client?.io) {
+        client.io.removeAllListeners();
+        client.io.close();
+      }
+      delete window.__agorClient;
+    }
+  });
+}
+
+createRoot(document.getElementById('root')!).render(
+  // Temporarily disable StrictMode to avoid double socket connections in dev
+  // TODO: Make useAgorClient StrictMode-compatible by handling double-mount properly
+  // <StrictMode>
+  <App />
+  // </StrictMode>
+);

@@ -1,0 +1,404 @@
+/**
+ * About Tab - Display version, connection info, and system details
+ */
+
+import type { AgorClient, UnixUserMode } from '@agor-live/client';
+import { Button, Card, Descriptions, Space, Tag, Tooltip, Typography, theme } from 'antd';
+import { useEffect, useState } from 'react';
+import { getDaemonUrl } from '../../config/daemon';
+import { resolveUiRuntime } from '../../config/urlRuntime';
+import { useConnectionState } from '../../contexts/ConnectionContext';
+import { isOutOfSync } from '../../hooks/useServerVersion';
+import { GradientBackdrop } from '../GradientBackdrop/GradientBackdrop';
+
+export interface AboutTabProps {
+  client: AgorClient | null;
+  connected: boolean;
+  connectionError?: string;
+  isAdmin?: boolean;
+}
+
+interface WindowWithAgorConfig extends Window {
+  AGOR_DAEMON_URL?: string;
+}
+
+// Renders nothing — just throws on mount. Used by the admin Crash Test
+// button to verify the global ErrorBoundary catches render-phase crashes
+// and renders the friendly crash screen. React error boundaries do NOT
+// catch errors thrown from event handlers, which is why we flip a state
+// flag and let this component throw during the next render instead of
+// throwing from the button's onClick directly.
+function CrashTestBomb(): never {
+  throw new Error(
+    'Crash test: this is a synthetic render-phase error from About → Crash Test. ' +
+      "If you're seeing the friendly crash screen, the global ErrorBoundary works."
+  );
+}
+
+interface HealthInfo {
+  version?: string;
+  /** Build SHA from /health (canonical version signal — see setup/build-info.ts). */
+  buildSha?: string;
+  /** ISO timestamp from /health, may be null when SHA came from env or git. */
+  builtAt?: string | null;
+  database?:
+    | string
+    | {
+        dialect: 'sqlite' | 'postgresql';
+        url?: string;
+        path?: string;
+      };
+  auth?: {
+    requireAuth: boolean;
+  };
+  encryption?: {
+    enabled: boolean;
+    method: string | null;
+  };
+  execution?: {
+    unixUserMode: UnixUserMode;
+  };
+  security?: {
+    csp: {
+      enabled: boolean;
+      reportOnly: boolean;
+      reportUri?: string;
+      header: string;
+    };
+    cors: {
+      mode: 'list' | 'wildcard' | 'reflect' | 'null-origin';
+      credentials: boolean;
+      originCount: number;
+      allowSandpack: boolean;
+    };
+  };
+}
+
+export const AboutTab: React.FC<AboutTabProps> = ({
+  client,
+  connected,
+  connectionError,
+  isAdmin = false,
+}) => {
+  const { token } = theme.useToken();
+  const daemonUrl = getDaemonUrl();
+  const uiRuntime = resolveUiRuntime({
+    baseUrl: import.meta.env.BASE_URL,
+    pathname: typeof window === 'undefined' ? '/' : window.location.pathname,
+  });
+  const [detectionMethod, setDetectionMethod] = useState<string>('');
+  const [healthInfo, setHealthInfo] = useState<HealthInfo | null>(null);
+  // Admin-only crash-test toggle: flipping this true makes <CrashTestBomb />
+  // mount and throw on the next render, which trips the global ErrorBoundary.
+  const [crashTest, setCrashTest] = useState(false);
+  // SHA captured at tab-load time (resets on hard reload). Provider-owned in
+  // App.tsx via useServerVersion so this and the banner stay in lockstep.
+  const { capturedSha } = useConnectionState();
+  const cardStyle: React.CSSProperties = {
+    width: '100%',
+    maxWidth: 800,
+    margin: '0 auto',
+    borderColor: token.colorBorderSecondary,
+    background: `color-mix(in srgb, ${token.colorBgContainer} 94%, transparent)`,
+    boxShadow: token.boxShadowTertiary,
+  };
+
+  useEffect(() => {
+    // Determine which detection method was used
+    if ((window as WindowWithAgorConfig).AGOR_DAEMON_URL) {
+      setDetectionMethod('Runtime injection (window.AGOR_DAEMON_URL)');
+    } else if (import.meta.env.VITE_DAEMON_URL) {
+      setDetectionMethod('Build-time env var (VITE_DAEMON_URL)');
+    } else if (uiRuntime.mode === 'bundled-daemon-ui') {
+      setDetectionMethod('Bundled UI (same-origin daemon)');
+    } else if (uiRuntime.mode === 'canonical-dev-deeplink') {
+      setDetectionMethod('Dev canonical /ui deep link (daemon port)');
+    } else {
+      setDetectionMethod('Dev mode (explicit port)');
+    }
+
+    // Fetch health info using FeathersJS client
+    if (client) {
+      client
+        .service('health')
+        .find()
+        .then((data) => {
+          // Health endpoint returns a single object, not paginated
+          const healthData = data as HealthInfo;
+          setHealthInfo(healthData);
+        })
+        .catch((err) => console.error('Failed to fetch health info:', err));
+    }
+  }, [client, uiRuntime.mode]);
+
+  return (
+    <div
+      style={{
+        position: 'relative',
+        minHeight: 500,
+        padding: 'clamp(12px, 3vw, 24px) 0',
+        overflow: 'hidden',
+        borderRadius: token.borderRadiusLG,
+      }}
+    >
+      <GradientBackdrop variant="panel" />
+
+      {/* Content */}
+      <div style={{ position: 'relative', zIndex: 1 }}>
+        <Space orientation="vertical" size="large" style={{ width: '100%' }}>
+          {/* Connection Info */}
+          <Card title="Connection Info" style={cardStyle}>
+            <Descriptions column={1} bordered size="small">
+              <Descriptions.Item label="Status">
+                {connected ? (
+                  <Typography.Text type="success">✓ Connected</Typography.Text>
+                ) : (
+                  <Typography.Text type="danger">✗ Disconnected</Typography.Text>
+                )}
+              </Descriptions.Item>
+              {connectionError && (
+                <Descriptions.Item label="Error">
+                  <Typography.Text type="danger">{connectionError}</Typography.Text>
+                </Descriptions.Item>
+              )}
+              {healthInfo?.version && (
+                <Descriptions.Item label="Version">{healthInfo.version}</Descriptions.Item>
+              )}
+              {healthInfo?.buildSha && (
+                <Descriptions.Item label="Daemon Build">
+                  <code>{healthInfo.buildSha}</code>
+                  {healthInfo.builtAt && (
+                    <Typography.Text type="secondary" style={{ marginLeft: 8 }}>
+                      built {healthInfo.builtAt}
+                    </Typography.Text>
+                  )}
+                </Descriptions.Item>
+              )}
+              {capturedSha && (
+                <Descriptions.Item label="Tab Captured">
+                  <code>{capturedSha}</code>
+                  {isOutOfSync(capturedSha, healthInfo?.buildSha) && (
+                    <Typography.Text type="warning" style={{ marginLeft: 8 }}>
+                      ⚠️ out of sync — refresh to load the latest UI
+                    </Typography.Text>
+                  )}
+                </Descriptions.Item>
+              )}
+              {healthInfo?.encryption && (
+                <Descriptions.Item label="Encryption">
+                  {healthInfo.encryption.enabled ? (
+                    <Typography.Text type="success">
+                      🔐 Enabled ({healthInfo.encryption.method})
+                    </Typography.Text>
+                  ) : (
+                    <Typography.Text type="warning">🔓 Disabled</Typography.Text>
+                  )}
+                </Descriptions.Item>
+              )}
+            </Descriptions>
+          </Card>
+
+          {/* Admin-only detailed info */}
+          {isAdmin && (
+            <>
+              {/* Daemon Config */}
+              <Card title="Daemon Config (Admin Only)" style={cardStyle}>
+                <Descriptions column={1} bordered size="small">
+                  <Descriptions.Item label="Daemon URL">
+                    <code>{daemonUrl}</code>
+                  </Descriptions.Item>
+                  <Descriptions.Item label="Detection Method">{detectionMethod}</Descriptions.Item>
+                  {healthInfo?.database &&
+                    (typeof healthInfo.database === 'string' ? (
+                      <Descriptions.Item label="Database">
+                        <code>{healthInfo.database}</code>
+                      </Descriptions.Item>
+                    ) : (
+                      <>
+                        <Descriptions.Item label="Database Type">
+                          {healthInfo.database.dialect === 'postgresql' ? (
+                            <span>🐘 PostgreSQL</span>
+                          ) : (
+                            <span>💾 SQLite</span>
+                          )}
+                        </Descriptions.Item>
+                        {healthInfo.database.dialect === 'postgresql' &&
+                          healthInfo.database.url && (
+                            <Descriptions.Item label="Database URL">
+                              <code>{healthInfo.database.url}</code>
+                            </Descriptions.Item>
+                          )}
+                        {healthInfo.database.dialect === 'sqlite' && healthInfo.database.path && (
+                          <Descriptions.Item label="Database Path">
+                            <code>{healthInfo.database.path}</code>
+                          </Descriptions.Item>
+                        )}
+                      </>
+                    ))}
+                  {healthInfo?.auth && (
+                    <Descriptions.Item label="Authentication">🔐 Required</Descriptions.Item>
+                  )}
+                  {healthInfo?.execution && (
+                    <>
+                      <Descriptions.Item label="Branch RBAC">
+                        <Typography.Text type="success">🛡️ Always enabled</Typography.Text>
+                      </Descriptions.Item>
+                      <Descriptions.Item label="Execution Mode">
+                        <code>{healthInfo.execution.unixUserMode}</code>
+                        {healthInfo.execution.unixUserMode === 'simple' && (
+                          <Typography.Text type="secondary" style={{ marginLeft: 8 }}>
+                            (trusted daemon-user execution)
+                          </Typography.Text>
+                        )}
+                        {healthInfo.execution.unixUserMode === 'delegated' && (
+                          <Typography.Text type="secondary" style={{ marginLeft: 8 }}>
+                            (per-user identity, enforced by substrate)
+                          </Typography.Text>
+                        )}
+                        {healthInfo.execution.unixUserMode === 'sandbox' && (
+                          <Typography.Text type="secondary" style={{ marginLeft: 8 }}>
+                            (local filesystem sandbox)
+                          </Typography.Text>
+                        )}
+                      </Descriptions.Item>
+                    </>
+                  )}
+                </Descriptions>
+              </Card>
+
+              {/* Security Headers (CSP + CORS posture) */}
+              {healthInfo?.security && (
+                <Card title="Security Headers (Admin Only)" style={cardStyle}>
+                  <Descriptions column={1} bordered size="small">
+                    <Descriptions.Item label="CSP">
+                      {healthInfo.security.csp.enabled ? (
+                        healthInfo.security.csp.reportOnly ? (
+                          <Tag color="warning">Report-Only</Tag>
+                        ) : (
+                          <Tag color="success">Enforced</Tag>
+                        )
+                      ) : (
+                        <Tag color="error">Disabled</Tag>
+                      )}
+                      {healthInfo.security.csp.reportUri && (
+                        <Typography.Text type="secondary" style={{ marginLeft: 8 }}>
+                          Reports → <code>{healthInfo.security.csp.reportUri}</code>
+                        </Typography.Text>
+                      )}
+                    </Descriptions.Item>
+                    <Descriptions.Item label="CSP Header">
+                      <Tooltip title="Full Content-Security-Policy header the daemon is emitting. If a resource is blocked, check which directive matches.">
+                        <Typography.Paragraph
+                          copyable={{ text: healthInfo.security.csp.header }}
+                          style={{
+                            margin: 0,
+                            fontFamily: 'monospace',
+                            fontSize: 12,
+                            whiteSpace: 'pre-wrap',
+                            wordBreak: 'break-all',
+                          }}
+                        >
+                          {healthInfo.security.csp.header}
+                        </Typography.Paragraph>
+                      </Tooltip>
+                    </Descriptions.Item>
+                    <Descriptions.Item label="CORS Mode">
+                      <code>{healthInfo.security.cors.mode}</code>
+                      {healthInfo.security.cors.mode === 'wildcard' && (
+                        <Typography.Text type="danger" style={{ marginLeft: 8 }}>
+                          ⚠️ Any origin accepted
+                        </Typography.Text>
+                      )}
+                      {healthInfo.security.cors.mode === 'reflect' && (
+                        <Typography.Text type="warning" style={{ marginLeft: 8 }}>
+                          ⚠️ Origin header echoed
+                        </Typography.Text>
+                      )}
+                    </Descriptions.Item>
+                    <Descriptions.Item label="CORS Credentials">
+                      {healthInfo.security.cors.credentials ? (
+                        <Tag color="success">Enabled</Tag>
+                      ) : (
+                        <Tag color="default">Disabled</Tag>
+                      )}
+                    </Descriptions.Item>
+                    <Descriptions.Item label="Allowed Origins">
+                      {healthInfo.security.cors.originCount} configured{' '}
+                      <Typography.Text type="secondary">
+                        (+ localhost dev ports
+                        {healthInfo.security.cors.allowSandpack && ', + Sandpack'})
+                      </Typography.Text>
+                    </Descriptions.Item>
+                  </Descriptions>
+                  <Typography.Paragraph
+                    type="secondary"
+                    style={{ marginTop: 12, marginBottom: 0, fontSize: 12 }}
+                  >
+                    Configure via <code>security.csp</code> and <code>security.cors</code> in{' '}
+                    <code>~/.agor/config.yaml</code>. See{' '}
+                    <a
+                      href="https://github.com/preset-io/agor/blob/main/context/concepts/security.md"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                    >
+                      context/concepts/security.md
+                    </a>
+                    .
+                  </Typography.Paragraph>
+                </Card>
+              )}
+
+              {/* System Debug Info */}
+              <Card title="System Debug Info (Admin Only)" style={cardStyle}>
+                <Descriptions column={1} bordered size="small">
+                  <Descriptions.Item label="Mode">
+                    {uiRuntime.mode === 'bundled-daemon-ui' ? (
+                      <span>npm package (agor-live)</span>
+                    ) : (
+                      <span>Source code (dev)</span>
+                    )}
+                  </Descriptions.Item>
+                  <Descriptions.Item label="URL Runtime">
+                    <code>{uiRuntime.mode}</code>
+                  </Descriptions.Item>
+                  <Descriptions.Item label="UI Location">
+                    <code>{window.location.href}</code>
+                  </Descriptions.Item>
+                  <Descriptions.Item label="Origin">
+                    <code>{window.location.origin}</code>
+                  </Descriptions.Item>
+                  <Descriptions.Item label="Path">
+                    <code>{window.location.pathname}</code>
+                  </Descriptions.Item>
+                  <Descriptions.Item label="Crash Test">
+                    <Space>
+                      <Button danger size="small" onClick={() => setCrashTest(true)}>
+                        Trigger render crash
+                      </Button>
+                      <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                        Throws during render to verify the global error boundary. Reload to recover.
+                      </Typography.Text>
+                    </Space>
+                    {crashTest && <CrashTestBomb />}
+                  </Descriptions.Item>
+                </Descriptions>
+              </Card>
+            </>
+          )}
+
+          {/* Links */}
+          <Card style={{ ...cardStyle, textAlign: 'center' }}>
+            <Space size="large">
+              <a href="https://github.com/preset-io/agor" target="_blank" rel="noopener noreferrer">
+                GitHub
+              </a>
+              <a href="https://agor.live" target="_blank" rel="noopener noreferrer">
+                Documentation
+              </a>
+            </Space>
+          </Card>
+        </Space>
+      </div>
+    </div>
+  );
+};

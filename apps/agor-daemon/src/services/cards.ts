@@ -1,0 +1,320 @@
+/**
+ * Cards Service
+ *
+ * Provides REST + WebSocket API for card management.
+ * Cards are visual work items on boards, managed by agents via MCP tools.
+ *
+ * Key behavior: Card creation also creates a board_objects record for placement.
+ */
+
+import { PAGINATION } from '@agor/core/config';
+import {
+  BoardObjectRepository,
+  BoardRepository,
+  CardRepository,
+  type TenantScopeAwareDatabase,
+} from '@agor/core/db';
+import { NotFound } from '@agor/core/feathers';
+import {
+  type AuthenticatedParams,
+  type BoardEntityObject,
+  type BoardID,
+  type Card,
+  type CardID,
+  type CardTypeID,
+  type CardWithType,
+  hasMinimumRole,
+  type QueryParams,
+  ROLES,
+  type UUID,
+  type ZoneBoardObject,
+} from '@agor/core/types';
+import { DrizzleService, type Query } from '../adapters/drizzle';
+import {
+  authorizeCallerBoard,
+  type BoardRouteAccessMode,
+} from '../utils/board-route-authorization';
+
+export type CardParams = QueryParams<{
+  board_id?: BoardID;
+  card_type_id?: CardTypeID;
+  archived?: boolean;
+  search?: string;
+  zone_id?: string;
+}> &
+  AuthenticatedParams & {
+    /** Internal RBAC SQL pushdown marker set by register-hooks. */
+    _agorSqlBoardAccessUserId?: UUID;
+  };
+
+export class CardsService extends DrizzleService<Card, Partial<Card>, CardParams> {
+  private cardRepo: CardRepository;
+  private boardObjectRepo: BoardObjectRepository;
+  private boardRepo: BoardRepository;
+
+  constructor(db: TenantScopeAwareDatabase) {
+    const cardRepo = new CardRepository(db);
+    super(cardRepo, {
+      id: 'card_id',
+      resourceType: 'Card',
+      paginate: {
+        default: PAGINATION.DEFAULT_LIMIT,
+        max: PAGINATION.MAX_LIMIT,
+      },
+    });
+    this.cardRepo = cardRepo;
+    this.boardObjectRepo = new BoardObjectRepository(db);
+    this.boardRepo = new BoardRepository(db);
+  }
+
+  /** Load a card and authorize the caller on its board; these custom methods never run Feathers hooks. */
+  private async authorizedCard(
+    id: string,
+    mode: BoardRouteAccessMode,
+    action: string,
+    params?: CardParams
+  ): Promise<Card> {
+    const user = params?.user;
+    // Like the cards hook, resolve RBAC callers' short IDs only among cards they can see.
+    const card =
+      params?.provider && user && !user._isServiceAccount && !hasMinimumRole(user.role, ROLES.ADMIN)
+        ? await this.cardRepo.findVisibleById(user.user_id as UUID, id)
+        : await this.cardRepo.findById(id);
+    await authorizeCallerBoard(this.boardRepo, params, card?.board_id, mode, action);
+    if (!card) throw new NotFound(`Card ${id} not found`);
+    return card;
+  }
+
+  /**
+   * Push the list read's high-selectivity predicates into SQL.
+   *
+   * The generic adapter would read the entire cards table and filter in memory.
+   * The board bootstrap fetches cards both board-scoped and as a global
+   * fallback, so narrowing the read to a board (and archived state) before rows
+   * leave the database is the win. `find` still re-applies every query filter in
+   * memory, so this only ever returns a superset of the matching rows.
+   *
+   * Cards are not query-validated, so values arrive uncoerced: only push when
+   * the value already has the column's type (string `board_id`, boolean
+   * `archived`). Anything else falls through to the unchanged in-memory filter,
+   * preserving current behavior exactly.
+   */
+  protected async fetchData(query: Query, _params?: CardParams): Promise<Card[]> {
+    const filter: {
+      board_id?: BoardID;
+      boardIds?: BoardID[];
+      archived?: boolean;
+      visibleToUserId?: UUID;
+    } = {};
+
+    if (_params?._agorSqlBoardAccessUserId) {
+      filter.visibleToUserId = _params._agorSqlBoardAccessUserId;
+    }
+
+    if (typeof query.board_id === 'string') filter.board_id = query.board_id as BoardID;
+    else if (
+      query.board_id &&
+      typeof query.board_id === 'object' &&
+      Array.isArray(query.board_id.$in) &&
+      query.board_id.$in.every((value: unknown) => typeof value === 'string')
+    ) {
+      filter.boardIds = query.board_id.$in as BoardID[];
+    }
+    if (typeof query.archived === 'boolean') filter.archived = query.archived;
+
+    const search = typeof query.search === 'string' ? query.search.toLowerCase() : undefined;
+    delete query.search;
+
+    const zoneId = typeof query.zone_id === 'string' ? query.zone_id : undefined;
+    delete query.zone_id;
+
+    if (zoneId && filter.board_id) {
+      return this.cardRepo.findByZoneId(filter.board_id, zoneId, {
+        archived: filter.archived,
+        visibleToUserId: filter.visibleToUserId,
+      });
+    }
+
+    const rows = await this.cardRepo.findAll(filter);
+    if (!search) return rows;
+    return rows.filter(
+      (card) =>
+        card.title.toLowerCase().includes(search) ||
+        (card.description?.toLowerCase().includes(search) ?? false)
+    );
+  }
+
+  /**
+   * Override default REST create to prevent orphan cards without board placement.
+   * Use createWithPlacement() instead.
+   */
+  // biome-ignore lint/suspicious/noExplicitAny: Override base class signature
+  override async create(_data: any, _params?: any): Promise<any> {
+    throw new Error('Use createWithPlacement() to create cards with board placement');
+  }
+
+  /**
+   * Create a card AND its board_objects placement in one operation.
+   *
+   * If zoneId is provided, the card is placed in that zone with jitter positioning.
+   * Otherwise, the card gets default position (0, 0).
+   */
+  async createWithPlacement(
+    data: Partial<Card> & {
+      zoneId?: string;
+      zoneData?: ZoneBoardObject;
+    },
+    params?: CardParams
+  ): Promise<{ card: Card; boardObject: BoardEntityObject }> {
+    await authorizeCallerBoard(this.boardRepo, params, data.board_id, 'mutate', 'create cards');
+    // Create the card
+    const card = await this.cardRepo.create({
+      ...data,
+      created_by:
+        (params as Partial<{ user: { user_id: string } }>)?.user?.user_id ?? data.created_by,
+    });
+
+    // Calculate position
+    let position = { x: 0, y: 0 };
+    const zoneId = data.zoneId;
+
+    if (zoneId && data.zoneData) {
+      const { computeZoneRelativePosition, CARD_WIDTH, CARD_HEIGHT } = await import(
+        '@agor/core/utils/board-placement'
+      );
+      position = computeZoneRelativePosition(data.zoneData, {
+        entityWidth: CARD_WIDTH,
+        entityHeight: CARD_HEIGHT,
+        desiredPadding: 60,
+      });
+    }
+
+    // Create board object placement — compensate on failure to avoid orphan cards
+    let boardObject: BoardEntityObject;
+    try {
+      boardObject = await this.boardObjectRepo.create({
+        board_id: card.board_id as BoardID,
+        card_id: card.card_id as CardID,
+        position,
+        zone_id: zoneId,
+      });
+    } catch (error) {
+      // Clean up the card to prevent orphan
+      await this.cardRepo.delete(card.card_id).catch(() => {});
+      throw error;
+    }
+
+    return { card, boardObject };
+  }
+
+  /**
+   * Get card with resolved CardType info
+   */
+  async getWithType(id: string, params?: CardParams): Promise<CardWithType | null> {
+    const card = await this.authorizedCard(id, 'view', 'view this card', params).catch(
+      (error: unknown) => {
+        if (error instanceof NotFound) return null;
+        throw error;
+      }
+    );
+    return card ? this.cardRepo.findByIdWithType(card.card_id) : null;
+  }
+
+  /**
+   * Find cards by board ID
+   */
+  async findByBoardId(
+    boardId: BoardID,
+    options?: { archived?: boolean; limit?: number; offset?: number }
+  ): Promise<Card[]> {
+    return this.cardRepo.findByBoardId(boardId, options);
+  }
+
+  /**
+   * Find cards by card type ID
+   */
+  async findByCardTypeId(
+    cardTypeId: CardTypeID,
+    options?: { limit?: number; offset?: number }
+  ): Promise<Card[]> {
+    return this.cardRepo.findByCardTypeId(cardTypeId, options);
+  }
+
+  /**
+   * Find cards by zone ID
+   */
+  async findByZoneId(boardId: BoardID, zoneId: string): Promise<Card[]> {
+    return this.cardRepo.findByZoneId(boardId, zoneId);
+  }
+
+  /**
+   * Search cards by title
+   */
+  async searchCards(
+    query: string,
+    options?: { boardId?: BoardID; archived?: boolean; limit?: number; offset?: number }
+  ): Promise<Card[]> {
+    return this.cardRepo.search(query, options);
+  }
+
+  /**
+   * Archive a card
+   */
+  async archive(id: string, params?: CardParams): Promise<Card> {
+    const card = await this.authorizedCard(id, 'mutate', 'archive this card', params);
+    return this.cardRepo.archive(card.card_id);
+  }
+
+  /**
+   * Unarchive a card
+   */
+  async unarchive(id: string, params?: CardParams): Promise<Card> {
+    const card = await this.authorizedCard(id, 'mutate', 'unarchive this card', params);
+    return this.cardRepo.unarchive(card.card_id);
+  }
+
+  /**
+   * Move a card to a zone (update board_objects placement)
+   */
+  async moveToZone(
+    cardId: CardID,
+    zoneId: string | null,
+    zoneData?: ZoneBoardObject,
+    params?: CardParams
+  ): Promise<BoardEntityObject> {
+    const boardObj = await this.boardObjectRepo.findByCardId(cardId);
+    await authorizeCallerBoard(
+      this.boardRepo,
+      params,
+      boardObj?.board_id,
+      'mutate',
+      'move this card'
+    );
+    if (!boardObj) {
+      throw new Error(`Card ${cardId} has no board placement`);
+    }
+
+    // If moving to a zone with zone data, calculate position
+    if (zoneId && zoneData) {
+      const { computeZoneRelativePosition, CARD_WIDTH, CARD_HEIGHT } = await import(
+        '@agor/core/utils/board-placement'
+      );
+      const position = computeZoneRelativePosition(zoneData, {
+        entityWidth: CARD_WIDTH,
+        entityHeight: CARD_HEIGHT,
+        desiredPadding: 60,
+      });
+
+      await this.boardObjectRepo.updatePosition(boardObj.object_id, position);
+    }
+
+    return this.boardObjectRepo.updateZone(
+      boardObj.object_id,
+      zoneId === null ? undefined : zoneId
+    );
+  }
+}
+
+export function createCardsService(db: TenantScopeAwareDatabase): CardsService {
+  return new CardsService(db);
+}

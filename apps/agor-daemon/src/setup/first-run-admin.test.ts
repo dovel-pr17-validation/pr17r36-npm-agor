@@ -1,0 +1,404 @@
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import type { AgorConfig } from '@agor/core/config';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  logFirstRunAdminBootstrap,
+  runFirstRunAdminBootstrap,
+  warnDeprecatedConfig,
+} from './first-run-admin.js';
+
+// Mock the pure-DB layer so we can exercise the daemon-side factory
+// without spinning up a real database. The factory is the only piece
+// these tests care about.
+vi.mock('@agor/core/db', async (importOriginal) => {
+  const actual = (await importOriginal()) as Record<string, unknown>;
+  return {
+    ...actual,
+    assertUsableBootstrapAdminPassword:
+      actual.assertUsableBootstrapAdminPassword ??
+      ((password: string, label: string = 'Bootstrap admin password') => {
+        if (password === 'admin') {
+          throw new Error(`${label} must not be the legacy fixed default password.`);
+        }
+        if (password.length < 15) {
+          throw new Error(`${label} must be at least 15 characters.`);
+        }
+      }),
+    bootstrapFirstRunAdmin: vi.fn(),
+    createDevelopmentDefaultAdminUser: vi.fn(),
+    createUser: vi.fn(),
+  };
+});
+
+describe('warnDeprecatedConfig', () => {
+  let stderrSpy: ReturnType<typeof vi.spyOn>;
+  let written: string;
+
+  beforeEach(() => {
+    written = '';
+    stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
+      written += String(chunk);
+      return true;
+    });
+  });
+
+  afterEach(() => {
+    stderrSpy.mockRestore();
+  });
+
+  it('is silent when no daemon block exists', () => {
+    warnDeprecatedConfig({} as AgorConfig);
+    expect(written).toBe('');
+  });
+
+  it('is silent when daemon block has no deprecated keys', () => {
+    warnDeprecatedConfig({ daemon: { port: 3030 } } as AgorConfig);
+    expect(written).toBe('');
+  });
+
+  it('warns when allowAnonymous is present', () => {
+    warnDeprecatedConfig({
+      daemon: { allowAnonymous: true },
+    } as unknown as AgorConfig);
+    expect(written).toContain('DEPRECATED CONFIG KEYS DETECTED');
+    expect(written).toContain('daemon.allowAnonymous: true');
+    expect(written).toContain('admin-credentials');
+  });
+
+  it('warns when requireAuth is present', () => {
+    warnDeprecatedConfig({
+      daemon: { requireAuth: false },
+    } as unknown as AgorConfig);
+    expect(written).toContain('DEPRECATED CONFIG KEYS DETECTED');
+    expect(written).toContain('daemon.requireAuth: false');
+  });
+
+  it('lists both keys when both are present', () => {
+    warnDeprecatedConfig({
+      daemon: { allowAnonymous: true, requireAuth: false },
+    } as unknown as AgorConfig);
+    expect(written).toContain('daemon.allowAnonymous: true');
+    expect(written).toContain('daemon.requireAuth: false');
+  });
+
+  it('fires even when the deprecated value is falsy (key presence is what matters)', () => {
+    // Operators who explicitly wrote `allowAnonymous: false` still get the
+    // nudge — the key is dead, regardless of its value.
+    warnDeprecatedConfig({
+      daemon: { allowAnonymous: false },
+    } as unknown as AgorConfig);
+    expect(written).toContain('daemon.allowAnonymous: false');
+  });
+
+  it('warns about the retired display.shortIdLength key', () => {
+    warnDeprecatedConfig({
+      display: { shortIdLength: 12 },
+    } as unknown as AgorConfig);
+    expect(written).toContain('display.shortIdLength: 12');
+  });
+
+  it('warns about retired CLI display settings while accepting old config files', () => {
+    warnDeprecatedConfig({
+      display: { tableStyle: 'ascii', colorOutput: false },
+    } as unknown as AgorConfig);
+    expect(written).toContain('display.tableStyle: ascii');
+    expect(written).toContain('display.colorOutput: false');
+    expect(written).toContain('no longer have any effect');
+  });
+
+  it('warns about retired global defaults and onboarding YAML state', () => {
+    warnDeprecatedConfig({
+      defaults: { board: 'main', agent: 'claude-code' },
+      onboarding: { teammatePending: true, frameworkRepoUrl: 'https://example.test/repo.git' },
+    } as unknown as AgorConfig);
+    expect(written).toContain('defaults.board: main');
+    expect(written).toContain('defaults.agent: claude-code');
+    expect(written).toContain('onboarding.teammatePending: true');
+    expect(written).toContain('onboarding.frameworkRepoUrl: https://example.test/repo.git');
+    expect(written).toContain('teammates.framework_repo_url');
+    expect(written).toContain('onboarding progress is stored');
+  });
+
+  it('warns about retired branch defaults and managed-environment role config', () => {
+    warnDeprecatedConfig({
+      execution: { managed_envs_minimum_role: 'admin' },
+      branches: { others_can_default: 'view', others_fs_access_default: 'none' },
+    } as unknown as AgorConfig);
+    expect(written).toContain('execution.managed_envs_minimum_role: admin');
+    expect(written).toContain('branches.others_can_default: view');
+    expect(written).toContain('branches.others_fs_access_default: none');
+    expect(written).toContain('typed board defaults');
+    expect(written).toContain('effective branch permissions');
+  });
+});
+
+describe('logFirstRunAdminBootstrap', () => {
+  let stderrSpy: ReturnType<typeof vi.spyOn>;
+  let written: string;
+
+  beforeEach(() => {
+    written = '';
+    stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
+      written += String(chunk);
+      return true;
+    });
+  });
+
+  afterEach(() => {
+    stderrSpy.mockRestore();
+  });
+
+  it('prints the credentials file path when one was written', () => {
+    logFirstRunAdminBootstrap({
+      createdAdmin: true,
+      admin: { user_id: 'u1', email: 'admin@example.com' } as unknown as never,
+      reattributedCount: 0,
+      credentialsPath: '/etc/agor/admin-credentials',
+    });
+    expect(written).toContain('First-run admin user created');
+    expect(written).toContain('generated because AGOR_ADMIN_PASSWORD was not set');
+    expect(written).toContain('see /etc/agor/admin-credentials (mode 0600)');
+    expect(written).toContain('set AGOR_ADMIN_PASSWORD before first startup');
+    expect(written).toContain('will not reset passwords');
+  });
+
+  it('does not announce a required change for an opted-out admin', () => {
+    logFirstRunAdminBootstrap({
+      createdAdmin: true,
+      admin: { email: 'admin@example.com', must_change_password: false } as never,
+      reattributedCount: 0,
+    });
+    expect(written).not.toContain('prompted to change');
+  });
+
+  it('points operators at AGOR_ADMIN_PASSWORD when no file was written', () => {
+    logFirstRunAdminBootstrap({
+      createdAdmin: true,
+      admin: { user_id: 'u1', email: 'admin@example.com' } as unknown as never,
+      reattributedCount: 0,
+      credentialsPath: undefined,
+    });
+    expect(written).toContain('First-run admin user created');
+    expect(written).toContain('set via the AGOR_ADMIN_PASSWORD env var');
+    // SECURITY: never echo the password back to stderr.
+    expect(written).not.toMatch(/Password:\s+\S{8,}/i);
+  });
+});
+
+describe('runFirstRunAdminBootstrap — capability-driven password resolution', () => {
+  let tempDir: string;
+  let originalEnv: string | undefined;
+  let originalAllowDevelopmentDefault: string | undefined;
+  let originalRequireChange: string | undefined;
+  let originalNodeEnv: string | undefined;
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agor-bootstrap-'));
+    originalRequireChange = process.env.AGOR_ADMIN_REQUIRE_PASSWORD_CHANGE;
+    delete process.env.AGOR_ADMIN_REQUIRE_PASSWORD_CHANGE;
+    originalEnv = process.env.AGOR_ADMIN_PASSWORD;
+    originalAllowDevelopmentDefault = process.env.AGOR_ALLOW_DEVELOPMENT_DEFAULT_ADMIN;
+    originalNodeEnv = process.env.NODE_ENV;
+    delete process.env.AGOR_ADMIN_PASSWORD;
+    delete process.env.AGOR_ALLOW_DEVELOPMENT_DEFAULT_ADMIN;
+  });
+
+  afterEach(async () => {
+    await fs.rm(tempDir, { recursive: true, force: true });
+    if (originalEnv === undefined) {
+      delete process.env.AGOR_ADMIN_PASSWORD;
+    } else {
+      process.env.AGOR_ADMIN_PASSWORD = originalEnv;
+    }
+    if (originalAllowDevelopmentDefault === undefined) {
+      delete process.env.AGOR_ALLOW_DEVELOPMENT_DEFAULT_ADMIN;
+    } else {
+      process.env.AGOR_ALLOW_DEVELOPMENT_DEFAULT_ADMIN = originalAllowDevelopmentDefault;
+    }
+    if (originalNodeEnv === undefined) {
+      delete process.env.NODE_ENV;
+    } else {
+      process.env.NODE_ENV = originalNodeEnv;
+    }
+    if (originalRequireChange === undefined) delete process.env.AGOR_ADMIN_REQUIRE_PASSWORD_CHANGE;
+    else process.env.AGOR_ADMIN_REQUIRE_PASSWORD_CHANGE = originalRequireChange;
+    vi.clearAllMocks();
+  });
+
+  async function loadMocks() {
+    const dbModule = (await import('@agor/core/db')) as unknown as {
+      bootstrapFirstRunAdmin: ReturnType<typeof vi.fn>;
+      createDevelopmentDefaultAdminUser: ReturnType<typeof vi.fn>;
+      createUser: ReturnType<typeof vi.fn>;
+    };
+    return dbModule;
+  }
+
+  it('uses AGOR_ADMIN_PASSWORD verbatim and does NOT write a credentials file', async () => {
+    process.env.AGOR_ADMIN_PASSWORD = 'super-secret-from-secret-store';
+
+    const { bootstrapFirstRunAdmin, createUser } = await loadMocks();
+    // Invoke the factory so we can assert what it did.
+    bootstrapFirstRunAdmin.mockImplementation(
+      async (_db: unknown, factory: () => Promise<unknown>) => {
+        const admin = await factory();
+        return { createdAdmin: true, admin, reattributedCount: 0 };
+      }
+    );
+    createUser.mockResolvedValue({ user_id: 'u1', email: 'admin@example.com' });
+
+    const result = await runFirstRunAdminBootstrap({} as unknown as never, {
+      credentialsBaseDir: tempDir,
+    });
+
+    // createUser was called with the env-var password verbatim.
+    expect(createUser).toHaveBeenCalledTimes(1);
+    expect(createUser).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        password: 'super-secret-from-secret-store',
+        must_change_password: true,
+        role: 'superadmin',
+        unix_username: 'admin',
+      })
+    );
+    // No credentials file was written.
+    expect(result.credentialsPath).toBeUndefined();
+    const credentialsPath = path.join(tempDir, 'admin-credentials');
+    await expect(fs.access(credentialsPath)).rejects.toThrow();
+  });
+
+  it('allows explicitly keeping a validated operator password on first login', async () => {
+    process.env.AGOR_ADMIN_PASSWORD = 'operator-selected-preview-secret';
+    process.env.AGOR_ADMIN_REQUIRE_PASSWORD_CHANGE = 'false';
+    const { bootstrapFirstRunAdmin, createUser } = await loadMocks();
+    bootstrapFirstRunAdmin.mockImplementation(
+      async (_db: unknown, factory: () => Promise<unknown>) => ({
+        createdAdmin: true,
+        admin: await factory(),
+        reattributedCount: 0,
+      })
+    );
+    createUser.mockResolvedValue({ user_id: 'u1' });
+    await runFirstRunAdminBootstrap({} as never, { credentialsBaseDir: tempDir });
+    expect(createUser).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        password: 'operator-selected-preview-secret',
+        must_change_password: false,
+      })
+    );
+  });
+
+  it('does not update an existing admin when the opt-out is set', async () => {
+    process.env.AGOR_ADMIN_PASSWORD = 'operator-selected-preview-secret';
+    process.env.AGOR_ADMIN_REQUIRE_PASSWORD_CHANGE = 'false';
+    const { bootstrapFirstRunAdmin, createUser } = await loadMocks();
+    bootstrapFirstRunAdmin.mockResolvedValue({ createdAdmin: false, reattributedCount: 0 });
+    await runFirstRunAdminBootstrap({} as never, { credentialsBaseDir: tempDir });
+    expect(createUser).not.toHaveBeenCalled();
+  });
+
+  it('rejects the legacy fixed default password from AGOR_ADMIN_PASSWORD', async () => {
+    process.env.AGOR_ADMIN_PASSWORD = 'admin';
+    process.env.AGOR_ADMIN_REQUIRE_PASSWORD_CHANGE = 'false';
+
+    const { bootstrapFirstRunAdmin } = await loadMocks();
+    bootstrapFirstRunAdmin.mockImplementation(
+      async (_db: unknown, factory: () => Promise<unknown>) => factory()
+    );
+
+    await expect(
+      runFirstRunAdminBootstrap({} as unknown as never, { credentialsBaseDir: tempDir })
+    ).rejects.toThrow(/legacy fixed default password/);
+  });
+
+  it('allows the fixed default only behind the explicit development gate', async () => {
+    process.env.NODE_ENV = 'development';
+    process.env.AGOR_ADMIN_PASSWORD = 'admin';
+    process.env.AGOR_ALLOW_DEVELOPMENT_DEFAULT_ADMIN = 'true';
+
+    const { bootstrapFirstRunAdmin, createDevelopmentDefaultAdminUser, createUser } =
+      await loadMocks();
+    bootstrapFirstRunAdmin.mockImplementation(
+      async (_db: unknown, factory: () => Promise<unknown>) => ({
+        createdAdmin: true,
+        admin: await factory(),
+        reattributedCount: 0,
+      })
+    );
+    createDevelopmentDefaultAdminUser.mockResolvedValue({
+      user_id: 'u1',
+      email: 'admin@agor.live',
+    });
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    await runFirstRunAdminBootstrap({} as unknown as never, { credentialsBaseDir: tempDir });
+
+    expect(createDevelopmentDefaultAdminUser).toHaveBeenCalledWith(expect.anything());
+    expect(createUser).not.toHaveBeenCalled();
+    expect(warning).toHaveBeenCalledWith(expect.stringContaining('[SECURITY]'));
+    warning.mockRestore();
+  });
+
+  it('refuses the development-default gate outside an explicit development/test runtime', async () => {
+    process.env.NODE_ENV = 'production';
+    process.env.AGOR_ADMIN_PASSWORD = 'admin';
+    process.env.AGOR_ALLOW_DEVELOPMENT_DEFAULT_ADMIN = 'true';
+
+    await expect(
+      runFirstRunAdminBootstrap({} as unknown as never, { credentialsBaseDir: tempDir })
+    ).rejects.toThrow(/development-only.*NODE_ENV=development or NODE_ENV=test/);
+
+    delete process.env.NODE_ENV;
+    await expect(
+      runFirstRunAdminBootstrap({} as never, { credentialsBaseDir: '/unused' })
+    ).rejects.toThrow(/development-only.*NODE_ENV=development or NODE_ENV=test/);
+  });
+
+  it('generated passwords still require a change even with operator opt-out', async () => {
+    process.env.AGOR_ADMIN_REQUIRE_PASSWORD_CHANGE = 'false';
+    const { bootstrapFirstRunAdmin, createUser } = await loadMocks();
+    bootstrapFirstRunAdmin.mockImplementation(
+      async (_db: unknown, factory: () => Promise<unknown>) => {
+        const admin = await factory();
+        return { createdAdmin: true, admin, reattributedCount: 0 };
+      }
+    );
+    createUser.mockResolvedValue({ user_id: 'u1', email: 'admin@example.com' });
+
+    const result = await runFirstRunAdminBootstrap({} as unknown as never, {
+      credentialsBaseDir: tempDir,
+    });
+
+    expect(createUser).toHaveBeenCalledTimes(1);
+    expect(createUser).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        role: 'superadmin',
+        unix_username: 'admin',
+        must_change_password: true,
+      })
+    );
+    expect(result.credentialsPath).toBe(path.join(tempDir, 'admin-credentials'));
+    // File exists with mode 0600.
+    const stat = await fs.stat(result.credentialsPath as string);
+    expect(stat.mode & 0o777).toBe(0o600);
+  });
+
+  it('errors with AGOR_ADMIN_PASSWORD remediation when the directory is unwritable', async () => {
+    const { bootstrapFirstRunAdmin } = await loadMocks();
+    bootstrapFirstRunAdmin.mockImplementation(
+      async (_db: unknown, factory: () => Promise<unknown>) => factory()
+    );
+
+    // Point credentialsBaseDir at a path whose parent doesn't exist → ENOENT
+    // on file create. This mirrors a read-only or absent AGOR_HOME mount.
+    const unwritable = path.join(tempDir, 'does', 'not', 'exist');
+    await expect(
+      runFirstRunAdminBootstrap({} as unknown as never, { credentialsBaseDir: unwritable })
+    ).rejects.toThrow(/AGOR_ADMIN_PASSWORD/);
+  });
+});

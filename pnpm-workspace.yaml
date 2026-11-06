@@ -1,0 +1,162 @@
+packages:
+  - apps/*
+  - packages/*
+overrides:
+  '@codemirror/state': 6.7.0
+  '@codemirror/view': 6.43.0
+  '@esbuild-kit/core-utils>esbuild': 0.25.4
+  '@google/genai': ^1.52.0
+  # Gemini core still uses Zod 3 APIs; keep it out of the workspace-wide Zod 4 override.
+  '@google/gemini-cli-core>zod': ^3.25.76
+  # Gemini 0.61 pins vulnerable 3.28.0 (no fixed 3.x exists); mirror the managed
+  # npm install override. v4 only affects Gemini's checkpointing GitService,
+  # which Agor never enables.
+  '@google/gemini-cli-core>simple-git': 4.0.2
+  '@github/copilot': '>=1.0.43 <2'
+  '@grpc/grpc-js': '>=1.14.4 <2'
+  '@hono/node-server': '>=1.19.14 <2'
+  '@isaacs/brace-expansion': '>=5.0.1 <6'
+  '@modelcontextprotocol/sdk': '>=1.30.0 <2'
+  '@xmldom/xmldom': '>=0.9.10 <1'
+  ajv: '>=8.18.0 <9'
+  axios: '>=1.18.0 <2'
+  # ansi-to-react is still on vulnerable linkify-it 3.x; remove when it accepts >=5.0.2.
+  ansi-to-react>linkify-it: '>=5.0.2 <6'
+  body-parser@<2: '>=1.20.6 <2'
+  body-parser@>=2 <3: '>=2.3.0 <3'
+  brace-expansion@<2.1.3: '>=2.1.3 <3'
+  brace-expansion@>=4.0.0 <5.0.8: '>=5.0.8 <6'
+  diff: '>=8.0.3 <9'
+  dompurify: '>=3.4.12 <4'
+  esbuild: '>=0.25.0 <0.26'
+  express-rate-limit: '>=8.2.2 <9'
+  fast-uri: '>=3.1.4 <4'
+  fast-xml-parser: '>=5.5.7 <6'
+  follow-redirects: '>=1.16.0 <2'
+  glob: ^11.1.0
+  handlebars: '>=4.7.10 <5'
+  hono: '>=4.12.34 <5'
+  jws: '>=4.0.1 <5'
+  # Keep the v4 schema/options used by config and browser consumers; v5 changes
+  # empty-input and merge-key behavior. Include transitive YAML parsers in the fix.
+  js-yaml: '>=4.3.2 <5'
+  lodash: '>=4.18.1 <5'
+  lodash-es: '>=4.18.1 <5'
+  mdast-util-to-hast: '>=13.2.1 <14'
+  mermaid: '>=11.14.1 <12'
+  minimatch@<5.1.8: '>=5.1.8 <6'
+  minimatch@>=10.0.0 <10.2.3: '>=10.2.3 <11'
+  nanoid: '>=3.3.17 <4'
+  nextra-theme-docs>zod: 4.1.12
+  nextra>zod: 4.1.12
+  npm-run-path: ^5.3.0
+  path-to-regexp@<0.1.13: '>=0.1.13 <0.2'
+  path-to-regexp@>=8.0.0 <8.4.2: '>=8.4.2 <9'
+  postcss: '>=8.5.18 <9'
+  picomatch: '>=4.0.4 <5'
+  proxy-addr: '>=2.0.8 <3'
+  protobufjs@<7.6.5: '>=7.6.5 <8'
+  protobufjs@>=8.0.0 <8.0.1: '>=8.0.1 <9'
+  qs: '>=6.14.2 <7'
+  # Match the reviewed direct pin; retain the workspace-wide security override.
+  rollup: 4.63.4
+  # GHSA-pqg4-j6r4-53mv: reject line terminators after comment tokens.
+  shell-quote: '>=1.11.0 <2'
+  # Next 15.5.24 supports this fixed AVIF decoder release.
+  next>sharp: '>=0.35.4 <0.36'
+  shiki: 3.23.0
+  smol-toml: '>=1.6.1 <2'
+  engine.io: '>=6.6.7 <7'
+  socket.io-parser: '>=4.2.7 <5'
+  systeminformation: '>=5.31.7 <6'
+  tar@<7.5.21: '>=7.5.21 <8'
+  # Keep Vite's optional tsx peer aligned with the workspace's reviewed runner.
+  tsx: 4.23.15
+  undici: '>=7.28.0 <8'
+  vite: '>=8.3.0 <9'
+  ws: '>=8.21.0 <9'
+  yaml: '>=2.8.3 <3'
+  zod: ^4.6.5
+peerDependencyRules:
+  ignoreMissing:
+    - '@opentelemetry/core'
+    - '@opentelemetry/resources'
+    - '@opentelemetry/sdk-metrics'
+    - '@opentelemetry/sdk-trace-base'
+  allowedVersions:
+    zod: '*'
+allowBuilds:
+  # Prebuilt binaries ship with the package; the build script is only a fallback.
+  '@parcel/watcher': false
+  '@github/keytar@7.10.6': false
+  '@scarf/scarf@1.4.0': false
+  'es5-ext@0.10.64': false
+  'esbuild@0.25.4 || 0.25.12': true
+  'keytar@7.9.0': true
+  'node-pty@1.0.0': true
+  'opencode-ai@1.18.31': true
+  # Prebuilt JS ships in the tarball; postinstall only warns about version schemes.
+  'protobufjs@7.5.8 || 7.6.5 || 7.6.6': false
+  # Registry tarball is already built; preinstall is an echo-only no-op.
+  '@google/genai@1.52.0': false
+  'sharp@0.34.5': true
+  'sqlite3@5.1.7': true
+  'tree-sitter-bash@0.25.0': true
+  # Scalar's React wrapper uses its Vue core; vue-demi selects the installed Vue runtime.
+  'vue-demi@0.14.10': true
+  # hot-shots uses this optional native addon only for Unix-domain sockets;
+  # Agor's exporter deliberately uses UDP to the local Agent.
+  'unix-dgram@2.0.7': false
+patchedDependencies:
+  # Vitest 5.0.1 leaves CDP event listeners attached after tester RPC close.
+  # Remove once upstream disposes them; regression runs before test:browser.
+  '@vitest/browser@5.0.1': patches/@vitest__browser@5.0.1.patch
+  # AntD Form's delayed-state hook must cancel timers/frames on unmount.
+  # Remove once upstream useDelayState includes effect cleanup; regression:
+  # apps/agor-ui/src/test/antdDelayState.test.tsx.
+  '@rc-component/util@1.13.0': patches/@rc-component__util@1.13.0.patch
+  # Bound shared browser token retention; full-content/theme identity and async cleanup.
+  # Remove when upstream supplies equivalent limits and lifecycle correctness.
+  # Regression: apps/agor-ui/src/test/streamdownCodeCache.test.ts.
+  '@streamdown/code@1.1.1': patches/@streamdown__code@1.1.1.patch
+  streamdown@2.5.0: patches/streamdown@2.5.0.patch
+# These reviewed versions must remain installable when CI or an operator's
+# global pnpm config enforces minimumReleaseAge; this repo sets no age itself.
+minimumReleaseAgeExclude:
+  - '@anthropic-ai/claude-agent-sdk-darwin-arm64@0.3.293'
+  - '@anthropic-ai/claude-agent-sdk-darwin-x64@0.3.293'
+  - '@anthropic-ai/claude-agent-sdk-linux-arm64-musl@0.3.293'
+  - '@anthropic-ai/claude-agent-sdk-linux-arm64@0.3.293'
+  - '@anthropic-ai/claude-agent-sdk-linux-x64-musl@0.3.293'
+  - '@anthropic-ai/claude-agent-sdk-linux-x64@0.3.293'
+  - '@anthropic-ai/claude-agent-sdk-win32-arm64@0.3.293'
+  - '@anthropic-ai/claude-agent-sdk-win32-x64@0.3.293'
+  - '@anthropic-ai/claude-agent-sdk@0.3.293'
+  - '@openai/codex-sdk@0.160.0'
+  - '@openai/codex@0.160.0-darwin-arm64 || 0.160.0-darwin-x64 || 0.160.0-linux-arm64 || 0.160.0-linux-x64 || 0.160.0-win32-arm64 || 0.160.0-win32-x64 || 0.160.0'
+  - '@opencode-ai/sdk@1.18.31'
+  - opencode-ai@1.18.31
+  - opencode-darwin-arm64@1.18.31
+  - opencode-darwin-x64-baseline@1.18.31
+  - opencode-darwin-x64@1.18.31
+  - opencode-linux-arm64-musl@1.18.31
+  - opencode-linux-arm64@1.18.31
+  - opencode-linux-x64-baseline-musl@1.18.31
+  - opencode-linux-x64-baseline@1.18.31
+  - opencode-linux-x64-musl@1.18.31
+  - opencode-linux-x64@1.18.31
+  - opencode-windows-arm64@1.18.31
+  - opencode-windows-x64-baseline@1.18.31
+  - opencode-windows-x64@1.18.31
+  - '@vitest/browser-playwright@5.0.1'
+  - '@vitest/browser@5.0.1'
+  - '@vitest/coverage-v8@5.0.1'
+  - '@vitest/mocker@5.0.1'
+  - '@vitest/pretty-format@5.0.1'
+  - '@vitest/spy@5.0.1'
+  - '@vitest/ui@5.0.1'
+  - '@vitest/utils@5.0.1'
+  - vitest@5.0.1
+  - '@aws-sdk/client-s3@3.1132.0'
+  - '@aws-sdk/lib-storage@3.1132.0'
+  - open@11.0.4

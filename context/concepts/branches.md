@@ -1,0 +1,105 @@
+# Branches (cheat sheet for agents)
+
+> User-facing reference: [`apps/agor-docs/content/guide/branches.mdx`](../../apps/agor-docs/content/guide/branches.mdx).
+
+## The shape
+
+```
+Boards ←one-to-many→ Branches ←one-to-many→ Sessions
+```
+
+- **Boards display Branches as the primary card.** Sessions live _inside_ a branch's card as a genealogy tree. Do not treat Sessions as the unit on a board.
+- A **Session** has a _required_ `branch_id` FK; deletes cascade branch → sessions. Multiple sessions (across users) share one branch's filesystem and git branch.
+
+## Persistence
+
+The `branches` table:
+
+- Materialized columns for query/index include `name`, `ref`, `path`, `branch`, `issue_url`, `pull_request_url`, `board_id`, `unique_id` (port assignment), explicitly transferable `primary_owner_user_id`, and `permission_binding` (`inherit | override`).
+- Other state (notes, env config overrides, etc.) lives in JSON.
+- `branch_permission_configs` and `branch_permission_entries` are always authoritative. The complete config also stores the shared-session prompt switch. A branch either inherits its board's entire template or uses one complete override. Historical owner/grant fields are inert compatibility shells.
+
+Schemas: `packages/core/src/db/schema.{sqlite,postgres}.ts`.
+Repository: `packages/core/src/db/repositories/branches.ts`.
+Service: `apps/agor-daemon/src/services/branches.ts`.
+Type: `packages/core/src/types/branch.ts`.
+
+### Permanent-deletion persistence boundary
+
+Permanent deletion stores `deletion_status`, a bounded safe `deletion_error`, and
+`deletion_updated_at` on the branch. Both `deleting` and `deletion_failed` are
+sticky admission fences; failure never authorizes resuming ordinary work.
+
+`db/repositories/branch-maintenance.ts` holds the shared private operation and
+invocation identity on that same row. It does not authorize callers or supervise
+executors. Its short claimed transactions must not contain filesystem/network
+work. Invocation uncertainty retains ownership; elapsed time is not settlement.
+The deletion executor's `settled` acknowledgement is narrower than process
+containment: direct storage work has stopped and every upload RPC was acknowledged.
+The executor tracks entry into workspace/SDK-home removal and permits settlement
+only on successful return. Recursive `fs.rm` can reject before sibling removals
+drain; a rejected removal (including Git or validation inside that call) stays
+fenced. Separate pre-removal validation/quiesce failures can still settle.
+Only DB-only requests may still be unknown. `failSettled` drains/fences them under
+the same Branch lock before clearing ownership. It does not infer rollback.
+Pre-removal validation also checks that every non-empty directory is writable
+(restoring u+rwx on owned ones), so container-written root files settle as a
+reasoned, retryable `storage_not_writable` failure instead of failing mid-removal.
+
+An executor that dies without settling is the second release path, modeled on
+Task containment. A local deletion executor is a process-group leader; the daemon
+records `execution_process` (PID, kernel boot ID, PID namespace) on the claim
+**before** delivering its payload. Every filesystem/Git effect of the worker
+lives in that group, so its verified absence is storage containment.
+`releaseVerifiedExitedDeletion` then clears ownership under the Branch lock
+(same DB-request barrier as `failSettled`). Both the spawning daemon's exit
+callback and the periodic `BranchDeletionReconciler` (any replica) attempt it;
+a daemon in a different boot or PID namespace never treats a missing PGID as
+absence. Cross-tenant maintenance discovery includes `deletion_failed` rows
+only while they retain a deletion invocation with a recorded process identity.
+This lets the executor host reconcile an exit even if another replica marked
+the heartbeat stale first; settlement removes that discovery visibility.
+A late daemon-side upload RPC is harmless: upload deletes are keyed by
+immutable ref and idempotent. Templated/remote executors and legacy claims with
+no recorded identity stay fenced until an administrator calls
+`branches/:id/release-deletion` (MCP `agor_branches_release_deletion`), which only
+clears a `deletion_failed` claim and records the actor; it never releases a live
+`deleting` row. A recorded same-host/PID-namespace process must also be verified
+absent, even on a stale-fenced row. The probe runs outside the transaction; release
+compares both the invocation ID and the complete process identity under the Branch
+lock so a replacement invocation or newly recorded identity cannot bypass it.
+See the guide's **Deletion recovery** section. Failed,
+never-claimed dispatches can instead be replaced atomically, fencing any late old
+claim by generation.
+`db/branch-admission.ts` supplies the Branch-first lock for producer admission.
+Deletion's reference scrub (`db/branch-deletion-references.ts`) reads pages
+without row locks and locks only rows it rewrites. That relies on this fence: a
+new reference to a deleting branch's sessions, tasks or namespaces must be
+admitted under that branch's row lock, never written around it.
+Do not expose maintenance methods or internal claim JSON as generic CRUD.
+
+`db/branch-deletion-manifest.ts` declares ownership-review dispositions for inbound
+FKs plus known plain-ID, JSON and external relations. Its dual-schema test detects
+new inbound FKs; it is not an executable cascade plan or proof of exhaustive runtime
+inventory. In particular, Knowledge namespaces require ownership classification,
+and published artifacts belong to boards rather than their provenance branch.
+
+Keep original storage locator rows until required removal has been verified.
+Do not replace those rows with an unbounded manifest on the branch or treat an
+empty descendant query as proof of filesystem/process containment.
+
+## Things that bite
+
+- **Port allocation** uses `branch.unique_id` (monotonic per repo). Templates like `{{add 9000 branch.unique_id}}` resolve in environment configs.
+- **Permanent deletion is executor-owned**: `packages/executor/src/commands/branch-deletion.ts` drives authenticated `branch-deletion-steps` requests; `BranchDeletionRepository` (`db/repositories/branch-deletion.ts`) drains owned data before branch-row-last finalization. The shared maintenance claim fences managed producers. Known activity and best-effort terminal closure are not proof that detached processes stopped. Unknown invocations remain fenced; never retry on heartbeat age alone.
+- Delegated permanent deletion is opt-in through `execution.delegated_branch_deletion`; its executor verifies that tenant worktrees, repos, and branch homes share an external storage device before removal. A missing or inconsistent mount must leave the branch fenced.
+- **Moving a branch** requires branch Manager authority and Editor/Manager access on both boards. Inherited permissions follow the destination defaults; explicit overrides and primary ownership remain unchanged.
+- **Deleting a board** first materializes every inheriting branch as an override, including the shared-session prompt switch.
+- **RBAC is an invariant.** Every board/branch boundary must enforce the normalized policy; there is no open-access mode.
+
+## Where the UI lives
+
+- Card on board: `apps/agor-ui/src/components/BranchCard/`
+- Modal permissions tab: `apps/agor-ui/src/components/BranchModal/`
+- Shared board/branch editor primitives: `apps/agor-ui/src/components/permissions/CapabilityPolicyEditor/`
+- Permissions are always rendered and fail closed when policy loading fails.

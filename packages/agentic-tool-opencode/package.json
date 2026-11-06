@@ -1,0 +1,88 @@
+{
+  "name": "@agor/agentic-tool-opencode",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/shared/index.js",
+  "types": "./dist/shared/index.d.ts",
+  "exports": {
+    ".": {
+      "source": "./src/shared/index.ts",
+      "types": "./dist/shared/index.d.ts",
+      "import": "./dist/shared/index.js",
+      "default": "./dist/shared/index.js"
+    },
+    "./daemon": {
+      "source": "./src/daemon/index.ts",
+      "types": "./dist/daemon/index.d.ts",
+      "import": "./dist/daemon/index.js",
+      "default": "./dist/daemon/index.js"
+    },
+    "./runtime": {
+      "source": "./src/runtime/index.ts",
+      "types": "./dist/runtime/index.d.ts",
+      "import": "./dist/runtime/index.js",
+      "default": "./dist/runtime/index.js"
+    },
+    "./runtime/binary": {
+      "source": "./src/runtime/binary.ts",
+      "types": "./dist/runtime/binary.d.ts",
+      "import": "./dist/runtime/binary.js",
+      "default": "./dist/runtime/binary.js"
+    },
+    "./ui": {
+      "source": "./src/ui/index.ts",
+      "types": "./dist/ui/index.d.ts",
+      "import": "./dist/ui/index.js",
+      "default": "./dist/ui/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup && tsc --emitDeclarationOnly --declaration --declarationMap --noEmit false --incremental false",
+    "dev": "concurrently -k -n js,dts -c cyan,magenta \"TSUP_CLEAN=false tsup --watch\" \"tsc --emitDeclarationOnly --declaration --declarationMap --noEmit false --watch --preserveWatchOutput\"",
+    "typecheck": "tsc -p tsconfig.typecheck.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@agor/core": "workspace:*",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@ant-design/icons": "^6.3.4",
+    "@opencode-ai/sdk": "1.18.31",
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.3",
+    "@types/node": "^24.6.0",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "~19.3.0",
+    "@vitejs/plugin-react": "^6.1.1",
+    "antd": "^6.6.4",
+    "concurrently": "^9.2.1",
+    "jsdom": "^27.1.0",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "tsup": "^8.5.1",
+    "tsx": "^4.23.15",
+    "typescript": "^6.0.3",
+    "vitest": "^5.0.1"
+  },
+  "peerDependencies": {
+    "@ant-design/icons": "^6.3.4",
+    "antd": "^6.6.4",
+    "react": "^19.3.0"
+  },
+  "peerDependenciesMeta": {
+    "@ant-design/icons": {
+      "optional": true
+    },
+    "antd": {
+      "optional": true
+    },
+    "react": {
+      "optional": true
+    }
+  }
+}

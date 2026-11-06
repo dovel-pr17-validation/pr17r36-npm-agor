@@ -1,0 +1,354 @@
+import type { AgenticToolName, AgorClient, Branch, EffortLevel, User } from '@agor-live/client';
+import { DEFAULT_AGENTIC_TOOL_NAME } from '@agor-live/client';
+import { DownOutlined } from '@ant-design/icons';
+import { Button, Collapse, Flex, Form, Input, Modal, Tooltip, Typography, theme } from 'antd';
+import { useCallback, useEffect, useState } from 'react';
+import type { NewSessionConfig, SessionCreationResult } from '../../domain/sessionCreation';
+
+import { useAgorStore } from '../../store/agorStore';
+import { selectMcpServerById, selectUserById } from '../../store/selectors';
+import { useThemedMessage } from '../../utils/message';
+import { resolveSessionMcpServerIds } from '../../utils/resolveQuickStartMcpServerIds';
+import { AgenticConfigChipRow } from '../AgenticConfigChipRow';
+import type { AgenticFormValues } from '../AgenticToolConfigForm';
+import {
+  INLINE_AGENTIC_CONFIGURATION,
+  persistUserDefaultFromForm,
+} from '../AgenticToolConfigurationPicker';
+import {
+  buildNewSessionConfig,
+  getNewSessionDefaultValues,
+  getNewSessionToolSwitchValues,
+} from '../AgenticToolConfigurationPicker/newSessionConfig';
+import {
+  type AgenticToolOption,
+  AgentSelectionGrid,
+} from '../AgentSelectionGrid/AgentSelectionGrid';
+import { resolveAvailableUserAgenticTool } from '../AgentSelectionGrid/availableAgents';
+import { AutocompleteTextarea } from '../AutocompleteTextarea';
+import { CodexSettingsForm } from '../CodexSettingsForm';
+import { SessionEnvVarsSelector } from '../SessionEnvVarsSelector';
+import { SessionAttachmentTray } from '../SessionPanel/SessionAttachmentTray';
+import { useComposerAttachments } from '../SessionPanel/useComposerAttachments';
+
+const PASTE_SHORTCUT =
+  typeof navigator !== 'undefined' &&
+  /Mac|iPhone|iPad|iPod/.test(navigator.platform || navigator.userAgent || '')
+    ? '⌘V'
+    : 'Ctrl+V';
+
+export interface NewSessionModalProps {
+  open: boolean;
+  onClose: () => void;
+  onCreate: (config: NewSessionConfig) => Promise<SessionCreationResult | null>;
+  availableAgents: AgenticToolOption[];
+  branchId: string; // Required - the branch to create the session in
+  branch?: Branch; // Optional - branch details for display
+  currentUser?: User | null; // Optional - current user for default settings
+  client: AgorClient | null;
+  uploadPolicy?: import('@agor/core/types').UploadIngressPolicy;
+}
+
+export const NewSessionModal: React.FC<NewSessionModalProps> = ({
+  open,
+  onClose,
+  onCreate,
+  availableAgents,
+  branchId,
+  branch,
+  currentUser,
+  client,
+  uploadPolicy,
+}) => {
+  // Entity maps are read from the store rather than drilled through props so
+  // the App shell doesn't have to forward them into every modal.
+  const mcpServerById = useAgorStore(selectMcpServerById);
+  const userById = useAgorStore(selectUserById);
+  const agenticToolSettings = useAgorStore((state) => state.agenticToolSettingsByName);
+  const [form] = Form.useForm();
+  const { token } = theme.useToken();
+  const { showError } = useThemedMessage();
+  const [selectedAgent, setSelectedAgent] = useState<string>(DEFAULT_AGENTIC_TOOL_NAME);
+  const [isCreating, setIsCreating] = useState(false);
+  const [envVarNames, setEnvVarNames] = useState<string[]>([]);
+  const [configValidity, setConfigValidity] = useState<{ valid: boolean; reason?: string }>({
+    valid: true,
+  });
+  const { attachments, addAttachments, removeAttachment, clearAttachments } =
+    useComposerAttachments({
+      sessionId: null,
+      scopeKey: `new-session:${currentUser?.user_id ?? 'anonymous'}:${branchId ?? 'none'}`,
+      showError,
+      uploadPolicy,
+    });
+
+  // Stable callback so the chip row's reporting effect doesn't loop.
+  const handleConfigValidity = useCallback((valid: boolean, reason?: string) => {
+    setConfigValidity((prev) =>
+      prev.valid === valid && prev.reason === reason ? prev : { valid, reason }
+    );
+  }, []);
+
+  // The only genuinely-required input is an agent (always preselected); the
+  // configuration is the one thing that can become unresolvable (admin edge).
+  // Everything else defaults, so the happy path needs zero input.
+  const missingReason = !selectedAgent
+    ? 'Select an agent to continue'
+    : !configValidity.valid
+      ? configValidity.reason
+      : undefined;
+  const canCreate = !missingReason;
+
+  const watchedPresetId = Form.useWatch('agenticToolPresetId', form) as string | undefined;
+  const isInlineConfig = watchedPresetId === INLINE_AGENTIC_CONFIGURATION;
+
+  // Reset form when modal opens, using user defaults if available
+  // Only depends on `open` — branch/user refs may change while modal is open
+  // and we must not wipe user edits on live WebSocket refreshes.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: intentionally only reset on modal open
+  useEffect(() => {
+    if (!open) return;
+
+    const primaryTool = resolveAvailableUserAgenticTool(
+      currentUser,
+      agenticToolSettings,
+      availableAgents
+    );
+    setSelectedAgent(primaryTool);
+    setIsCreating(false); // Reset creating state when modal opens
+    setEnvVarNames([]);
+    clearAttachments();
+
+    form.resetFields();
+    form.setFieldsValue({
+      title: '',
+      initialPrompt: '',
+      // Never carry a checked save-as-default across opens — it could silently
+      // overwrite the user's default on a later create.
+      saveAsDefault: false,
+      // Saved agent config, and MCP inheritance: branch config > user defaults
+      ...getNewSessionDefaultValues(currentUser, primaryTool),
+    });
+  }, [open, form]);
+
+  // Update permission mode and other defaults when agent changes
+  useEffect(() => {
+    if (selectedAgent) {
+      // Re-seeds the saved config and clears Codex fields when switching away from Codex
+      form.setFieldsValue(
+        getNewSessionToolSwitchValues(currentUser, selectedAgent as AgenticToolName)
+      );
+    }
+  }, [selectedAgent, form, currentUser]);
+
+  const handleCreate = () => {
+    form.validateFields().then(() => {
+      // Use getFieldsValue(true) to include values from collapsed panels
+      const values = form.getFieldsValue(true);
+      // Prevent duplicate submissions
+      setIsCreating(true);
+
+      const isInline = values.agenticToolPresetId === INLINE_AGENTIC_CONFIGURATION;
+
+      // Promote the inline config to the user's default when requested. Fire and
+      // forget — session creation shouldn't block on the profile patch.
+      if (values.saveAsDefault && isInline && currentUser && client) {
+        const formValues: AgenticFormValues = {
+          modelConfig: values.modelConfig,
+          effort: values.effort as EffortLevel | undefined,
+          permissionMode: values.permissionMode,
+          codexSandboxMode: values.codexSandboxMode,
+          codexApprovalPolicy: values.codexApprovalPolicy,
+          codexNetworkAccess: values.codexNetworkAccess,
+          codexIncludePlugins: values.codexIncludePlugins,
+        };
+        void persistUserDefaultFromForm(
+          client,
+          currentUser,
+          selectedAgent as AgenticToolName,
+          formValues
+        ).catch(() => showError('Failed to save your default configuration'));
+      }
+
+      // Shared builder: unmounted fields fall back to saved defaults; MCP respects branch > user
+      const config: NewSessionConfig = {
+        ...buildNewSessionConfig({
+          user: currentUser,
+          tool: selectedAgent as AgenticToolName,
+          branch: { branch_id: branchId, mcp_server_ids: branch?.mcp_server_ids },
+          values,
+          initialPrompt: values.initialPrompt,
+          attachmentFiles: attachments.map((attachment) => attachment.file),
+        }),
+        title: values.title,
+        envVarNames: envVarNames.length > 0 ? envVarNames : undefined,
+      };
+
+      void onCreate(config).catch(() => setIsCreating(false));
+      // Note: isCreating will be reset when modal reopens via useEffect
+    });
+  };
+
+  const handleCancel = () => {
+    form.resetFields();
+    clearAttachments();
+    onClose();
+  };
+
+  const advancedBits: string[] = [];
+  if (envVarNames.length > 0) {
+    advancedBits.push(`${envVarNames.length} env var${envVarNames.length === 1 ? '' : 's'}`);
+  }
+  if (selectedAgent === 'codex' && isInlineConfig) advancedBits.push('Codex sandbox');
+  const advancedSummary = `Advanced${advancedBits.length > 0 ? ` · ${advancedBits.join(' · ')}` : ''}`;
+
+  return (
+    <Modal
+      title={branch ? `New Session · ${branch.name}` : 'Create New Session'}
+      open={open}
+      onCancel={handleCancel}
+      width={700}
+      maskClosable={false}
+      footer={
+        <Flex justify="flex-end" gap={token.marginXS}>
+          <Button onClick={handleCancel}>Cancel</Button>
+          {/* Disabled buttons don't emit hover events, so the wrapper span carries
+              the Tooltip that explains what's blocking creation. */}
+          <Tooltip title={missingReason}>
+            <span style={{ display: 'inline-block' }}>
+              <Button
+                type="primary"
+                onClick={handleCreate}
+                disabled={!canCreate || isCreating}
+                loading={isCreating}
+                style={canCreate ? undefined : { pointerEvents: 'none' }}
+              >
+                Create Session
+              </Button>
+            </span>
+          </Tooltip>
+        </Flex>
+      }
+    >
+      <Form
+        form={form}
+        layout="vertical"
+        preserve={false}
+        style={{ marginTop: 16 }}
+        // Render the required mark as a suffix ("Label *", before any info icon)
+        // rather than antd's default "* Label" prefix.
+        requiredMark={(label, { required }) => (
+          <>
+            {label}
+            {required && (
+              <span style={{ color: token.colorError, marginInlineStart: token.marginXXS }}>*</span>
+            )}
+          </>
+        )}
+      >
+        {/* Agent Selection — dense tiles (pick who you're talking to first) */}
+        <Form.Item label="Coding Agent" required>
+          <AgentSelectionGrid
+            agents={availableAgents}
+            selectedAgentId={selectedAgent}
+            onSelect={setSelectedAgent}
+            columns={4}
+            size="small"
+            showComparisonLink={false}
+            fallbackToFirstVisibleAgent
+          />
+        </Form.Item>
+
+        {/* Configuration — source Select + resolved chips */}
+        <AgenticConfigChipRow
+          tool={(selectedAgent as AgenticToolName) || DEFAULT_AGENTIC_TOOL_NAME}
+          mcpServerById={mcpServerById}
+          currentUser={currentUser}
+          client={client}
+          branchId={branchId}
+          inheritedMcpServerIds={resolveSessionMcpServerIds(
+            currentUser?.default_mcp_server_ids,
+            branch
+          )}
+          validateModelSelection
+          enableSaveAsDefault
+          onConfigValidityChange={handleConfigValidity}
+        />
+
+        {/* Session Title */}
+        <Form.Item
+          name="title"
+          label="Title"
+          tooltip="Auto-generated from your first prompt when left blank."
+        >
+          <Input placeholder="e.g., Add authentication system" />
+        </Form.Item>
+
+        {/* Initial Prompt */}
+        <Form.Item
+          name="initialPrompt"
+          label="Initial Prompt"
+          tooltip={`Optional — the first message sent when the session starts. Type @ to reference files or knowledge, or paste (${PASTE_SHORTCUT}) a screenshot. Sessions can also start idle and be prompted later.`}
+        >
+          <AutocompleteTextarea
+            value={form.getFieldValue('initialPrompt') || ''}
+            onChange={(value) => form.setFieldValue('initialPrompt', value)}
+            placeholder="e.g., Build a JWT authentication system"
+            autoSize={{ minRows: 4, maxRows: 8 }}
+            client={client}
+            sessionId={null}
+            userById={userById}
+            enableKnowledgeMentions
+            kbLinkTarget="absolute-route"
+            onFilesDrop={addAttachments}
+            filesDropDisabled={isCreating}
+          />
+        </Form.Item>
+        {attachments.length > 0 && (
+          <div style={{ paddingBlock: token.paddingXS }}>
+            <SessionAttachmentTray
+              attachments={attachments}
+              onRemove={removeAttachment}
+              disabled={isCreating}
+            />
+          </div>
+        )}
+
+        {/* Advanced Configuration (Collapsible) */}
+        <Collapse
+          ghost
+          destroyOnHidden={false}
+          expandIcon={({ isActive }) => <DownOutlined rotate={isActive ? 180 : 0} />}
+          items={[
+            {
+              key: 'advanced',
+              label: <Typography.Text type="secondary">{advancedSummary}</Typography.Text>,
+              children: (
+                <>
+                  {currentUser && client && (
+                    <Form.Item
+                      label="Environment Variables"
+                      tooltip="Exported into this session's executor process."
+                    >
+                      <SessionEnvVarsSelector
+                        ownerUserId={currentUser.user_id}
+                        client={client}
+                        value={envVarNames}
+                        onChange={setEnvVarNames}
+                      />
+                    </Form.Item>
+                  )}
+
+                  {selectedAgent === 'codex' && isInlineConfig && (
+                    <CodexSettingsForm showHelpText={false} />
+                  )}
+                </>
+              ),
+            },
+          ]}
+          style={{ marginTop: 16 }}
+        />
+      </Form>
+    </Modal>
+  );
+};

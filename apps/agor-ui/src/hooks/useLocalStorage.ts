@@ -1,0 +1,108 @@
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { readLocalStorageJson, writeLocalStorageJson } from './localStorageJson';
+
+const LOCAL_STORAGE_CHANGE_EVENT = 'agor-local-storage-change';
+
+interface LocalStorageChangeDetail {
+  key: string;
+  value: unknown;
+}
+
+/**
+ * Write a value to localStorage AND notify mounted `useLocalStorage` hooks on
+ * the same key in this tab. Use this for writes that happen outside React
+ * (e.g. store event handlers) so hook consumers don't go stale.
+ */
+export function writeSharedLocalStorageJson<T>(key: string, value: T): void {
+  writeLocalStorageJson(key, value);
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(
+      new CustomEvent<LocalStorageChangeDetail>(LOCAL_STORAGE_CHANGE_EVENT, {
+        detail: { key, value },
+      })
+    );
+  }
+}
+
+/**
+ * Hook for persisting state to localStorage with type safety.
+ * The setter is referentially stable (safe to use in dependency arrays).
+ */
+export function useLocalStorage<T>(
+  key: string,
+  initialValue: T
+): [T, (value: T | ((val: T) => T)) => void] {
+  const readValue = useCallback(() => readLocalStorageJson(key, initialValue), [initialValue, key]);
+
+  // Keep key in a ref so the callback doesn't depend on it
+  const keyRef = useRef(key);
+  keyRef.current = key;
+
+  // State to store our value
+  // Pass initial state function to useState so logic is only executed once
+  const [stored, setStored] = useState(() => ({ key, value: readValue() }));
+  // A new key (e.g. a per-user key after sign-in) reads its own value instead of keeping the old one.
+  if (stored.key !== key) setStored({ key, value: readValue() });
+  const storedValue = stored.key === key ? stored.value : readValue();
+  const setStoredValue = useCallback((value: T) => setStored({ key: keyRef.current, value }), []);
+
+  // Mirror the latest value into a ref so the functional form of `setValue` can
+  // resolve against it WITHOUT persisting + dispatching from inside the
+  // `setStoredValue` updater. React runs updaters during the render phase, so a
+  // change event dispatched there would make a sibling hook's listener call
+  // setState mid-render; keeping the side effects in the setter body (an
+  // event/effect context) keeps them out of render.
+  const storedValueRef = useRef(storedValue);
+  storedValueRef.current = storedValue;
+
+  // Stable setter that persists to localStorage
+  const setValue = useCallback(
+    (value: T | ((val: T) => T)) => {
+      try {
+        const valueToStore =
+          value instanceof Function ? (value as (val: T) => T)(storedValueRef.current) : value;
+        writeLocalStorageJson(keyRef.current, valueToStore);
+        setStoredValue(valueToStore);
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(
+            new CustomEvent<LocalStorageChangeDetail>(LOCAL_STORAGE_CHANGE_EVENT, {
+              detail: { key: keyRef.current, value: valueToStore },
+            })
+          );
+        }
+      } catch (error) {
+        console.error(`Error setting localStorage key "${keyRef.current}":`, error);
+      }
+    },
+    [setStoredValue]
+  );
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+
+    const handleStorage = (event: StorageEvent) => {
+      if (
+        (event.key === null || event.key === key) &&
+        (event.storageArea === null || event.storageArea === window.localStorage)
+      ) {
+        setStoredValue(readValue());
+      }
+    };
+
+    const handleLocalStorageChange = (event: Event) => {
+      const customEvent = event as CustomEvent<LocalStorageChangeDetail>;
+      if (customEvent.detail?.key === key) {
+        setStoredValue(customEvent.detail.value as T);
+      }
+    };
+
+    window.addEventListener('storage', handleStorage);
+    window.addEventListener(LOCAL_STORAGE_CHANGE_EVENT, handleLocalStorageChange);
+    return () => {
+      window.removeEventListener('storage', handleStorage);
+      window.removeEventListener(LOCAL_STORAGE_CHANGE_EVENT, handleLocalStorageChange);
+    };
+  }, [key, readValue, setStoredValue]);
+
+  return [storedValue, setValue];
+}

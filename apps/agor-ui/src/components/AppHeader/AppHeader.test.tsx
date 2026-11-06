@@ -1,0 +1,304 @@
+import { fireEvent, render, screen } from '@testing-library/react';
+import { MemoryRouter } from 'react-router-dom';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { MCPCatalogModalProvider, useMCPCatalogModal } from '../../contexts/MCPCatalogModalContext';
+import { AppHeader } from './AppHeader';
+
+const mockNavigate = vi.hoisted(() => vi.fn());
+const mockSetThemeMode = vi.hoisted(() => vi.fn());
+
+vi.mock('react-router-dom', async () => {
+  const actual = await vi.importActual<typeof import('react-router-dom')>('react-router-dom');
+  return {
+    ...actual,
+    useNavigate: () => mockNavigate,
+  };
+});
+
+vi.mock('../../contexts/ConnectionContext', () => ({
+  useMutationGate: () => ({ canMutate: true, reason: null, message: null }),
+}));
+
+vi.mock('../../contexts/ThemeContext', () => ({
+  useTheme: () => ({ themeMode: 'dark', setThemeMode: mockSetThemeMode }),
+}));
+
+vi.mock('../BoardSwitcher', () => ({
+  BoardSwitcher: () => <div data-testid="board-switcher" />,
+}));
+vi.mock('../BrandLogo', () => ({
+  BrandLogo: () => <div data-testid="brand-logo" />,
+}));
+vi.mock('../ConnectionStatus', () => ({
+  ConnectionStatus: () => null,
+}));
+vi.mock('../GlobalSearch', () => ({
+  GlobalSearch: () => <div data-testid="global-search" />,
+}));
+const globalUserMenuProps = vi.hoisted(() => [] as Array<{ externalAppLink?: string }>);
+vi.mock('../GlobalUserMenu', () => ({
+  GlobalUserMenu: (props: { externalAppLink?: string }) => {
+    globalUserMenuProps.push(props);
+    return <div data-testid="global-user-menu" />;
+  },
+}));
+vi.mock('../MarkdownRenderer', () => ({
+  MarkdownRenderer: () => <div data-testid="markdown-renderer" />,
+}));
+vi.mock('./GlobalPresenceFacepile', () => ({
+  GlobalPresenceFacepile: () => <div data-testid="presence-facepile" />,
+}));
+
+function CatalogState() {
+  const catalog = useMCPCatalogModal();
+  return <output data-testid="catalog-open">{String(catalog?.open)}</output>;
+}
+
+function renderHeader(props?: Partial<React.ComponentProps<typeof AppHeader>>) {
+  return render(
+    <MemoryRouter basename="/ui" initialEntries={['/ui/']}>
+      <MCPCatalogModalProvider>
+        <AppHeader {...props} />
+        <CatalogState />
+      </MCPCatalogModalProvider>
+    </MemoryRouter>
+  );
+}
+
+describe('AppHeader Knowledge Base button', () => {
+  beforeEach(() => {
+    mockNavigate.mockClear();
+  });
+
+  it('renders a standalone Knowledge Base button with correct href', () => {
+    renderHeader();
+
+    const button = screen.getByRole('link', { name: 'Knowledge Base' });
+    expect(button).toHaveAttribute('href', '/ui/knowledge');
+  });
+
+  it('navigates to /knowledge via SPA navigation on plain click', () => {
+    renderHeader();
+
+    const button = screen.getByRole('link', { name: 'Knowledge Base' });
+    fireEvent.click(button);
+
+    expect(mockNavigate).toHaveBeenCalledExactlyOnceWith('/knowledge');
+  });
+
+  it('lets modifier clicks fall through to the browser', () => {
+    renderHeader();
+
+    const button = screen.getByRole('link', { name: 'Knowledge Base' });
+    button.removeAttribute('href');
+
+    const eventWasNotCancelled = fireEvent.click(button, { metaKey: true });
+
+    expect(eventWasNotCancelled).toBe(true);
+    expect(mockNavigate).not.toHaveBeenCalled();
+  });
+});
+
+describe('AppHeader navigation entries', () => {
+  beforeEach(() => {
+    mockNavigate.mockClear();
+  });
+
+  it('advertises exactly these surfaces, in order', () => {
+    renderHeader();
+
+    // The whole set, so adding or removing an entry has to be a deliberate
+    // edit here rather than something that slips in. Order matters: Catalog
+    // is last of the two because it sits immediately left of the gear.
+    const linkNames = screen
+      .getAllByRole('link')
+      .map((link) => link.getAttribute('aria-label') ?? link.textContent?.trim());
+
+    expect(linkNames).toEqual(['Knowledge Base']);
+    expect(screen.getByRole('button', { name: 'Open MCP Catalog' })).toBeVisible();
+  });
+
+  it('opens Catalog without navigation', () => {
+    renderHeader();
+    fireEvent.click(screen.getByRole('button', { name: 'Open MCP Catalog' }));
+    expect(screen.getByTestId('catalog-open')).toHaveTextContent('true');
+    expect(mockNavigate).not.toHaveBeenCalled();
+  });
+
+  it('omits Catalog safely in provider-free marketing headers', () => {
+    render(
+      <MemoryRouter>
+        <AppHeader />
+      </MemoryRouter>
+    );
+    expect(screen.queryByRole('button', { name: 'Open MCP Catalog' })).not.toBeInTheDocument();
+  });
+
+  it('promotes Catalog to the header rather than the gear dropdown', async () => {
+    renderHeader();
+
+    // Option A from the spec: a marketplace is a surface people revisit, so
+    // burying it in the settings menu is the failure this guards against.
+    fireEvent.click(screen.getByRole('button', { name: 'Settings menu' }));
+    await screen.findByText('Settings');
+
+    // The header entry is an icon button carrying its name on aria-label, so a
+    // rendered "Catalog" text node could only be a dropdown menu item.
+    expect(screen.queryByText('Catalog')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Open MCP Catalog' })).toBeInTheDocument();
+  });
+
+  it('shows the Catalog entry to a viewer', () => {
+    // Browsing the catalog is authenticated-only on the daemon, so no role is
+    // filtered out of the entry. Connect is gated separately, in the surface.
+    renderHeader({ user: { user_id: 'u1', email: 'v@agor.live', role: 'viewer' } as never });
+
+    expect(screen.getByRole('button', { name: 'Open MCP Catalog' })).toBeInTheDocument();
+  });
+
+  it('bounds the always-visible board switcher slot', () => {
+    renderHeader();
+
+    const slot = screen.getByTestId('board-switcher').parentElement;
+    expect(slot).toHaveStyle({ width: '200px' });
+    expect(slot?.style.minWidth).toBe('');
+  });
+});
+
+describe('AppHeader settings dropdown', () => {
+  beforeEach(() => {
+    mockNavigate.mockClear();
+    mockSetThemeMode.mockClear();
+  });
+
+  it('does not include Knowledge Base in the dropdown', async () => {
+    renderHeader();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Settings menu' }));
+
+    await screen.findByText('Settings');
+    expect(screen.queryByText('Knowledge Base')).not.toBeInTheDocument();
+  });
+
+  it('invokes onEventStreamClick when Live Events is clicked', async () => {
+    const onEventStreamClick = vi.fn();
+    renderHeader({ eventStreamEnabled: true, onEventStreamClick });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Settings menu' }));
+
+    const liveEventsItem = await screen.findByText('Live Events');
+    fireEvent.click(liveEventsItem);
+
+    expect(onEventStreamClick).toHaveBeenCalledOnce();
+  });
+
+  it('invokes onSettingsClick when main Settings is clicked', async () => {
+    const onSettingsClick = vi.fn();
+    renderHeader({ onSettingsClick });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Settings menu' }));
+
+    const settingsItem = await screen.findByText('Settings');
+    fireEvent.click(settingsItem);
+
+    expect(onSettingsClick).toHaveBeenCalledOnce();
+  });
+
+  it('calls setThemeMode with the correct argument for each theme option', async () => {
+    renderHeader({ onThemeEditorClick: vi.fn() });
+
+    for (const [label, mode] of [
+      ['Dark', 'dark'],
+      ['Light', 'light'],
+      ['Custom', 'custom'],
+    ] as const) {
+      fireEvent.click(screen.getByRole('button', { name: 'Settings menu' }));
+      const themeText = await screen.findByText('Theme');
+      fireEvent.mouseOver(themeText);
+      const option = await screen.findByText(label);
+      fireEvent.click(option);
+      expect(mockSetThemeMode).toHaveBeenCalledWith(mode);
+      mockSetThemeMode.mockClear();
+    }
+  });
+
+  it('invokes onThemeEditorClick when Edit Custom Theme is clicked', async () => {
+    const onThemeEditorClick = vi.fn();
+    renderHeader({ onThemeEditorClick });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Settings menu' }));
+    const themeText = await screen.findByText('Theme');
+    fireEvent.mouseOver(themeText);
+    const editItem = await screen.findByText('Edit Custom Theme');
+    fireEvent.click(editItem);
+
+    expect(onThemeEditorClick).toHaveBeenCalledOnce();
+  });
+});
+
+describe('AppHeader instance label', () => {
+  it('bounds a long label with an ellipsis and keeps the full text in the title', () => {
+    const label = `Data team sandbox ${'x'.repeat(62)}`;
+    renderHeader({ instanceLabel: label });
+
+    const tag = screen.getByText(label);
+    expect(tag).toHaveAttribute('title', label);
+    // Inline style: jsdom cannot compute antd's CSS-variable border shorthands.
+    expect(tag.style).toMatchObject({
+      maxWidth: '200px',
+      overflow: 'hidden',
+      textOverflow: 'ellipsis',
+    });
+  });
+
+  it('renders no badge without a label', () => {
+    renderHeader({ instanceLabel: undefined });
+    expect(document.querySelector('.ant-tag-cyan')).toBeNull();
+  });
+});
+
+describe('AppHeader external app link', () => {
+  function openSettingsMenu(props?: Partial<React.ComponentProps<typeof AppHeader>>) {
+    renderHeader(props);
+    fireEvent.click(screen.getByRole('button', { name: 'Settings menu' }));
+  }
+
+  it('keeps the logo going Home when a link is configured', () => {
+    const onHomeClick = vi.fn();
+    renderHeader({ onHomeClick, externalAppLink: 'https://console.example.test' });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Go to Home' }));
+    expect(onHomeClick).toHaveBeenCalledOnce();
+  });
+
+  it('adds the labeled link to the settings menu, opening in a new tab', async () => {
+    openSettingsMenu({
+      externalAppLink: 'https://console.example.test',
+      externalAppLabel: 'Open Agor Cloud',
+    });
+
+    const link = await screen.findByRole('link', { name: 'Open Agor Cloud' });
+    expect(link).toHaveAttribute('href', 'https://console.example.test');
+    expect(link).toHaveAttribute('target', '_blank');
+  });
+
+  it('does not repeat the entry in the avatar menu', () => {
+    renderHeader({
+      externalAppLink: 'https://console.example.test',
+      externalAppLabel: 'Open Agor Cloud',
+    });
+
+    expect(screen.getByTestId('global-user-menu')).toBeInTheDocument();
+    expect(globalUserMenuProps.at(-1)?.externalAppLink).toBeUndefined();
+  });
+
+  it('omits the entry for a non-http(s) link', async () => {
+    openSettingsMenu({
+      externalAppLink: 'javascript:alert(1)',
+      externalAppLabel: 'Open Agor Cloud',
+    });
+
+    expect(await screen.findByText('Settings')).toBeInTheDocument();
+    expect(screen.queryByText('Open Agor Cloud')).not.toBeInTheDocument();
+  });
+});

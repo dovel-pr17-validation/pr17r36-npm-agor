@@ -1,0 +1,2623 @@
+import { describe, expect, it, vi } from 'vitest';
+
+const socketModeMocks = vi.hoisted(() => ({
+  instances: [] as Array<{
+    start: ReturnType<typeof vi.fn>;
+    disconnect: ReturnType<typeof vi.fn>;
+    on: ReturnType<typeof vi.fn>;
+  }>,
+  startImpl: () => Promise.resolve(),
+}));
+
+vi.mock('@slack/socket-mode', () => ({
+  LogLevel: { DEBUG: 'debug', INFO: 'info', WARN: 'warn', ERROR: 'error' },
+  SocketModeClient: class {
+    start = vi.fn(() => socketModeMocks.startImpl());
+    disconnect = vi.fn().mockResolvedValue(undefined);
+    on = vi.fn();
+
+    constructor() {
+      socketModeMocks.instances.push(this);
+    }
+  },
+}));
+
+import type { GatewayInboundCallback } from '../connector';
+import {
+  extractSlackInboundFiles,
+  isChannelAllowedByWhitelist,
+  isSlackDirectMessageId,
+  isSlackFileSourceAllowed,
+  isSlackInboundSurfaceAllowed,
+  isSlackWriteTargetAllowed,
+  markdownToMrkdwn,
+  markdownToSlackPayload,
+  normalizeSlackReactionName,
+  SLACK_AGOR_MESSAGE_METADATA_EVENT_TYPES,
+  SLACK_REQUEST_TIMEOUT_METADATA_KEY,
+  SlackConnector,
+  wrapTablesInCodeBlocks,
+} from './slack';
+
+describe('Slack listener lifecycle', () => {
+  it.each(['resolve', 'reject'] as const)(
+    'keeps stop-during-start bounded when Socket Mode later %ss',
+    async (outcome) => {
+      let resolveStart!: () => void;
+      let rejectStart!: (error: Error) => void;
+      socketModeMocks.instances.length = 0;
+      socketModeMocks.startImpl = () =>
+        new Promise<void>((resolve, reject) => {
+          resolveStart = resolve;
+          rejectStart = reject;
+        });
+      const connector = new SlackConnector({
+        bot_token: 'bot-redacted',
+        app_token: 'app-redacted',
+      });
+      (connector as unknown as { web: unknown }).web = {
+        auth: { test: vi.fn().mockResolvedValue({ user_id: 'bot-user' }) },
+      };
+
+      const starting = connector.startListening(vi.fn());
+      await vi.waitFor(() => expect(socketModeMocks.instances).toHaveLength(1));
+      await connector.stopListening();
+      expect(socketModeMocks.instances[0].disconnect).toHaveBeenCalledOnce();
+
+      if (outcome === 'resolve') {
+        resolveStart();
+        await expect(starting).resolves.toBeUndefined();
+      } else {
+        rejectStart(new Error('provider detail must stay hidden'));
+        await expect(starting).rejects.toMatchObject({
+          code: 'slack_socket_unavailable',
+          kind: 'transient',
+        });
+      }
+    }
+  );
+});
+
+describe('SlackConnector inbound reactions', () => {
+  type SlackEventHandler = (args: {
+    type: string;
+    body: Record<string, unknown>;
+    ack: () => Promise<void>;
+  }) => Promise<void>;
+
+  const reactedReply = {
+    ts: '200.000002',
+    thread_ts: '200.000000',
+    text: 'Ready to merge?',
+    user: 'UBOT',
+    bot_id: 'B1',
+  };
+
+  function reactionEvent(overrides: Record<string, unknown> = {}) {
+    return {
+      type: 'reaction_added',
+      user: 'UADA',
+      reaction: 'white_check_mark',
+      item_user: 'UBOT',
+      item: { type: 'message', channel: 'D123', ts: '200.000002' },
+      event_ts: '300.000001',
+      ...overrides,
+    };
+  }
+
+  async function startReactionListener(
+    args: {
+      config?: Record<string, unknown>;
+      channelInfo?: Record<string, unknown>;
+      replies?: ReturnType<typeof vi.fn>;
+      callback?: ReturnType<typeof vi.fn>;
+      durable?: boolean;
+      botUserId?: string | null;
+      isBot?: boolean | null;
+    } = {}
+  ) {
+    socketModeMocks.instances.length = 0;
+    socketModeMocks.startImpl = () => Promise.resolve();
+    const connector = new SlackConnector({
+      bot_token: 'bot-redacted',
+      app_token: 'app-redacted',
+      inbound_reactions: true,
+      ...args.config,
+    });
+    const replies = args.replies ?? vi.fn(async () => ({ messages: [reactedReply] }));
+    const web = {
+      auth: {
+        test: vi
+          .fn()
+          .mockResolvedValue({ user_id: args.botUserId === undefined ? 'UBOT' : args.botUserId }),
+      },
+      conversations: {
+        replies,
+        info: vi.fn(async () => ({ ok: true, channel: args.channelInfo ?? { is_im: true } })),
+      },
+      users: {
+        info: vi.fn(async () => ({
+          user: {
+            is_bot: args.isBot === undefined ? false : args.isBot,
+            profile: { email: 'ada@example.com', display_name: 'Ada' },
+          },
+        })),
+      },
+    };
+    (connector as unknown as { web: unknown }).web = web;
+    const callback = args.callback ?? vi.fn(async () => undefined);
+    await connector.startListening(callback as unknown as GatewayInboundCallback, {
+      durableEventIdempotency: args.durable ?? false,
+    });
+    const handler = socketModeMocks.instances[0].on.mock.calls.find(
+      ([name]) => name === 'slack_event'
+    )?.[1] as SlackEventHandler;
+    const emit = async (event: Record<string, unknown>, ack = vi.fn(async () => undefined)) => {
+      await handler({
+        type: 'events_api',
+        body: { team_id: 'T1', event_id: `Ev-${event.event_ts}`, event },
+        ack,
+      });
+      return ack;
+    };
+    return { connector, callback, emit, replies, web };
+  }
+
+  it.each(['!stop', '!skip', '!stop-clear', ' !HELP '])(
+    'rejects bare thread control %s even with broad message subscriptions',
+    async (text) => {
+      const { callback, emit } = await startReactionListener({
+        config: { enable_channels: true },
+        channelInfo: { is_channel: true },
+      });
+      await emit({
+        type: 'message',
+        channel: 'C123',
+        channel_type: 'channel',
+        user: 'UADA',
+        ts: '201.000001',
+        thread_ts: '200.000000',
+        text,
+      });
+      expect(callback).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each(['please !stop', '!stop <@OTHER>', 'great!help me', '`!stop`'])(
+    'does not treat %s as a bare command',
+    async (text) => {
+      const { callback, emit } = await startReactionListener({
+        config: { enable_channels: true },
+        channelInfo: { is_channel: true },
+      });
+      await emit({
+        type: 'message',
+        channel: 'C123',
+        channel_type: 'channel',
+        user: 'UADA',
+        ts: '201.000001',
+        thread_ts: '200.000000',
+        text,
+      });
+      expect(callback).not.toHaveBeenCalled();
+    }
+  );
+
+  describe.each([false, true])('channel chatter fast path (durable=%s)', (durable) => {
+    it.each([
+      { channel: 'C123', channel_type: 'channel' },
+      { channel: 'C123', channel_type: 'group' },
+      { channel: 'G123', channel_type: 'mpim' },
+      { channel: 'C123' },
+      { channel: 'G123' },
+    ])('acknowledges $channel/$channel_type without lookups or routing', async (surface) => {
+      const { callback, emit, web } = await startReactionListener({
+        durable,
+        config: { enable_channels: true, enable_groups: true, enable_mpim: true },
+      });
+      const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+      const debug = vi.spyOn(console, 'debug').mockImplementation(() => undefined);
+      const event = {
+        type: 'message',
+        ...surface,
+        user: 'UADA',
+        ts: '201.000001',
+        thread_ts: '200.000000',
+      };
+      for (const text of [
+        'ordinary chatter',
+        'please !stop',
+        '!stop <@UBOT>',
+        '!help',
+        '!stop-clear',
+      ]) {
+        expect(await emit({ ...event, text })).toHaveBeenCalledOnce();
+      }
+      expect(await emit({ ...event, text: '!help', thread_ts: undefined })).toHaveBeenCalledOnce();
+      // A parent summary must not fetch the latest reply or reinterpret the
+      // parent's text as a new command occurrence.
+      expect(
+        await emit({
+          ...event,
+          subtype: 'message_replied',
+          text: '!help',
+          message: { ts: '200.000000', latest_reply: '201.000001' },
+        })
+      ).toHaveBeenCalledOnce();
+      expect(web.conversations.info).not.toHaveBeenCalled();
+      expect(web.conversations.replies).not.toHaveBeenCalled();
+      expect(web.users.info).not.toHaveBeenCalled();
+      expect(callback).not.toHaveBeenCalled();
+      expect(log).not.toHaveBeenCalled();
+      expect(debug).not.toHaveBeenCalled();
+      log.mockRestore();
+      debug.mockRestore();
+    });
+  });
+
+  it('still delivers ordinary DM text without a channel-type hint', async () => {
+    const { callback, emit } = await startReactionListener();
+    await emit({
+      type: 'message',
+      channel: 'D123',
+      user: 'UADA',
+      ts: '201.000001',
+      text: 'ordinary DM prompt',
+    });
+    expect(callback).toHaveBeenCalledOnce();
+    expect(callback.mock.calls[0][0]).toMatchObject({ text: 'ordinary DM prompt' });
+  });
+
+  it('resolves C-prefixed private mentions before enforcing source configuration', async () => {
+    const { callback, emit, web } = await startReactionListener({
+      config: { enable_channels: true, enable_groups: false },
+      channelInfo: { is_private: true },
+    });
+    expect(
+      await emit({
+        type: 'app_mention',
+        channel: 'C123',
+        user: 'UADA',
+        ts: '201.000001',
+        thread_ts: '200.000000',
+        text: '<@UBOT> !stop',
+      })
+    ).toHaveBeenCalledOnce();
+    expect(web.conversations.info).toHaveBeenCalledOnce();
+    expect(web.users.info).not.toHaveBeenCalled();
+    expect(callback).not.toHaveBeenCalled();
+  });
+
+  it('ignores bare top-level controls and still accepts mentions on either side exactly once', async () => {
+    const { callback, emit } = await startReactionListener({
+      config: { enable_channels: true },
+      channelInfo: { is_channel: true },
+    });
+    const event = {
+      type: 'message',
+      channel: 'C123',
+      channel_type: 'channel',
+      user: 'UADA',
+      ts: '201.000001',
+      text: '!stop',
+    };
+    await emit(event);
+    expect(callback).not.toHaveBeenCalled();
+    for (const [i, text] of ['<@UBOT> !stop', '!stop <@UBOT>'].entries()) {
+      const mentioned = { ...event, ts: `202.00000${i}`, thread_ts: '200.000000', text };
+      await emit(mentioned);
+      await emit({ ...mentioned, type: 'app_mention' });
+    }
+    expect(callback).toHaveBeenCalledTimes(2);
+    for (const call of callback.mock.calls)
+      expect(call[0]).toMatchObject({ text: '!stop', metadata: { slack_has_mention: true } });
+  });
+
+  it('routes a reaction on a bot reply to its thread root with reaction metadata', async () => {
+    const { callback, emit, replies } = await startReactionListener();
+
+    const ack = await emit(reactionEvent());
+
+    expect(ack).toHaveBeenCalledOnce();
+    expect(replies).toHaveBeenCalledWith({
+      channel: 'D123',
+      ts: '200.000002',
+      oldest: '200.000002',
+      inclusive: true,
+      limit: 2,
+    });
+    expect(callback).toHaveBeenCalledOnce();
+    expect(callback.mock.calls[0][0]).toMatchObject({
+      providerEventId: 'slack:reaction:T1:D123:200.000002:UADA:white_check_mark:added:300.000001',
+      threadId: 'D123-200.000000',
+      text: ':white_check_mark:',
+      userId: 'UADA',
+      metadata: {
+        channel: 'D123',
+        channel_type: 'im',
+        slack_user_id: 'UADA',
+        slack_team_id: 'T1',
+        slack_bot_user_id: 'UBOT',
+        slack_thread_ts: '200.000000',
+        slack_is_thread_reply: true,
+        slack_has_mention: false,
+        slack_event_type: 'reaction_added',
+        slack_reaction: 'white_check_mark',
+        slack_reaction_item_ts: '200.000002',
+        slack_reaction_item_user_id: 'UBOT',
+        slack_reaction_item_text: 'Ready to merge?',
+        slack_user_email: 'ada@example.com',
+        slack_user_name: 'Ada',
+      },
+    });
+    // A reaction has no message of its own, so it must not look like one.
+    expect(callback.mock.calls[0][0].metadata).not.toHaveProperty('slack_message_ts');
+  });
+
+  it('routes reaction_removed with a distinct provider event identity', async () => {
+    const { callback, emit } = await startReactionListener();
+
+    await emit(reactionEvent({ type: 'reaction_removed' }));
+
+    expect(callback.mock.calls[0][0]).toMatchObject({
+      providerEventId: 'slack:reaction:T1:D123:200.000002:UADA:white_check_mark:removed:300.000001',
+      metadata: { slack_event_type: 'reaction_removed' },
+    });
+  });
+
+  it('ignores reactions entirely when inbound_reactions is off', async () => {
+    const { callback, emit, replies } = await startReactionListener({
+      config: { inbound_reactions: false },
+    });
+
+    const ack = await emit(reactionEvent());
+
+    expect(ack).toHaveBeenCalledOnce();
+    expect(replies).not.toHaveBeenCalled();
+    expect(callback).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['the bot itself', { user: 'UBOT' }],
+    ['a non-message item', { item: { type: 'file', file: 'F1' } }],
+    ['a malformed emoji name', { reaction: 'x:<@U1>' }],
+    ['a missing reactor', { user: undefined }],
+  ])('ignores a reaction from %s', async (_label, overrides) => {
+    const { callback, emit } = await startReactionListener();
+
+    const ack = await emit(reactionEvent(overrides));
+
+    expect(ack).toHaveBeenCalledOnce();
+    expect(callback).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['public channels disabled', {}, 0],
+    [
+      'a channel outside the whitelist',
+      { enable_channels: true, allowed_channel_ids: ['C999'] },
+      0,
+    ],
+    [
+      'an enabled, whitelisted public channel',
+      { enable_channels: true, allowed_channel_ids: ['C123'] },
+      1,
+    ],
+  ])('applies surface filters: %s', async (_label, config, expectedCalls) => {
+    const { callback, emit } = await startReactionListener({
+      config,
+      channelInfo: { name: 'eng' },
+    });
+
+    await emit(reactionEvent({ item: { type: 'message', channel: 'C123', ts: '200.000002' } }));
+
+    expect(callback).toHaveBeenCalledTimes(expectedCalls);
+  });
+
+  it.each([false, true])('never admits an unresolved reply root (durable=%s)', async (durable) => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const replies = vi.fn().mockRejectedValue(new Error('network unavailable'));
+    const { callback, emit } = await startReactionListener({ replies, durable });
+    const ack = vi.fn(async () => undefined);
+
+    for (const ts of ['200.000002', '200.000003', '200.000004', '200.000005']) {
+      const delivery = emit(reactionEvent({ item: { type: 'message', channel: 'D123', ts } }), ack);
+      if (durable) await expect(delivery).rejects.toThrow('thread could not be resolved');
+      else await delivery;
+    }
+    expect(callback).not.toHaveBeenCalled();
+    expect(ack).toHaveBeenCalledTimes(durable ? 0 : 4);
+
+    replies.mockResolvedValue({ messages: [reactedReply] });
+    await emit(reactionEvent());
+    expect(callback).toHaveBeenCalledOnce();
+    warn.mockRestore();
+  });
+
+  it('drops reactions until the listening bot identity is resolved', async () => {
+    const { callback, emit, replies, web } = await startReactionListener({ botUserId: null });
+    const ack = await emit(reactionEvent());
+    expect(ack).toHaveBeenCalledOnce();
+    expect(callback).not.toHaveBeenCalled();
+    expect(replies).not.toHaveBeenCalled();
+    expect(web.users.info).not.toHaveBeenCalled();
+  });
+
+  it.each([true, null])('drops non-human or unresolved reactors (isBot=%s)', async (isBot) => {
+    const { callback, emit, web } = await startReactionListener({ isBot });
+    await emit(reactionEvent());
+    await emit(reactionEvent({ reaction: 'two', event_ts: '300.000002' }));
+    expect(callback).not.toHaveBeenCalled();
+    // Cached identity must filter other bots on subsequent events too.
+    expect(web.users.info).toHaveBeenCalledOnce();
+  });
+
+  it('drops reactions when the user profile lookup fails', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const { callback, emit, web } = await startReactionListener();
+    web.users.info.mockRejectedValueOnce(new Error('unavailable'));
+    await emit(reactionEvent());
+    expect(callback).not.toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it.each([
+    { data: { error: 'missing_scope' } },
+    { data: { error: 'user_not_found' } },
+    { statusCode: 403 },
+  ])('acks and drops a permanent durable user lookup failure: %j', async (error) => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const { callback, emit, web, replies } = await startReactionListener({ durable: true });
+    web.users.info.mockRejectedValue(error);
+
+    const ack = await emit(reactionEvent());
+    expect(ack).toHaveBeenCalledOnce();
+    expect(callback).not.toHaveBeenCalled();
+    expect(replies).not.toHaveBeenCalled();
+    expect(web.users.info).toHaveBeenCalledOnce();
+
+    // Even an unexpected redelivery or a new reaction must remain terminal
+    // without retrying the permanent lookup refusal inside the cache TTL.
+    const redeliveryAck = await emit(reactionEvent());
+    const nextAck = await emit(reactionEvent({ reaction: 'two', event_ts: '300.000002' }));
+    expect(redeliveryAck).toHaveBeenCalledOnce();
+    expect(nextAck).toHaveBeenCalledOnce();
+    expect(callback).not.toHaveBeenCalled();
+    expect(replies).not.toHaveBeenCalled();
+    expect(web.users.info).toHaveBeenCalledOnce();
+    warn.mockRestore();
+  });
+
+  it.each(['org_login_required', 'team_added_to_org'])(
+    'retries temporary organization migration user lookup failures: %s',
+    async (code) => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      const { callback, emit, web } = await startReactionListener({ durable: true });
+      web.users.info.mockRejectedValueOnce({ data: { error: code } });
+      const ack = vi.fn(async () => undefined);
+      await expect(emit(reactionEvent(), ack)).rejects.toThrow(
+        'user profile could not be resolved'
+      );
+      expect(ack).not.toHaveBeenCalled();
+      expect(callback).not.toHaveBeenCalled();
+      await emit(reactionEvent(), ack);
+      expect(web.users.info).toHaveBeenCalledTimes(2);
+      expect(ack).toHaveBeenCalledOnce();
+      expect(callback).toHaveBeenCalledOnce();
+      warn.mockRestore();
+    }
+  );
+
+  it('retries a failed durable human lookup immediately and acks only after routing succeeds', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const { callback, emit, web, replies } = await startReactionListener({ durable: true });
+    const ack = vi.fn(async () => undefined);
+    web.users.info.mockRejectedValueOnce(new Error('network unavailable'));
+
+    await expect(emit(reactionEvent(), ack)).rejects.toThrow('user profile could not be resolved');
+    expect(ack).not.toHaveBeenCalled();
+    expect(callback).not.toHaveBeenCalled();
+    expect(replies).not.toHaveBeenCalled();
+
+    callback.mockImplementation(async () => {
+      expect(ack).not.toHaveBeenCalled();
+    });
+    await emit(reactionEvent(), ack);
+    await emit(reactionEvent(), ack);
+    expect(web.users.info).toHaveBeenCalledTimes(2);
+    expect(callback).toHaveBeenCalledOnce();
+    expect(ack).toHaveBeenCalledTimes(2);
+    warn.mockRestore();
+  });
+
+  it('does not reuse an optional metadata lookup failure for a durable reaction', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const { connector, callback, emit, web } = await startReactionListener({ durable: true });
+    web.users.info.mockRejectedValueOnce(new Error('network unavailable'));
+    await connector.lookupUserProfile('UADA');
+    const ack = await emit(reactionEvent());
+    expect(web.users.info).toHaveBeenCalledTimes(2);
+    expect(callback).toHaveBeenCalledOnce();
+    expect(ack).toHaveBeenCalledOnce();
+    warn.mockRestore();
+  });
+
+  it('keeps failed identity caches isolated between gateway channel connectors', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const first = await startReactionListener({ durable: true });
+    const other = await startReactionListener({ durable: true, isBot: true });
+    first.web.users.info.mockRejectedValueOnce(new Error('network unavailable'));
+    await expect(first.emit(reactionEvent())).rejects.toThrow('user profile could not be resolved');
+    await other.emit(reactionEvent());
+    await first.emit(reactionEvent());
+    // The same Slack ID in another channel/tenant must use its own credentials
+    // and bot identity, never the recovered human profile from the first connector.
+    await other.emit(reactionEvent({ reaction: 'two', event_ts: '300.000002' }));
+    expect(first.callback).toHaveBeenCalledOnce();
+    expect(other.callback).not.toHaveBeenCalled();
+    expect(other.replies).not.toHaveBeenCalled();
+    expect(other.web.users.info).toHaveBeenCalledOnce();
+    warn.mockRestore();
+  });
+
+  it.each([
+    { data: { error: 'missing_scope' } },
+    { data: { error: 'message_not_found' } },
+    { data: { error: 'channel_not_found' } },
+    { statusCode: 403 },
+    null,
+  ])('acks and drops a permanent thread lookup failure: %j', async (error) => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const replies = error
+      ? vi.fn().mockRejectedValue(error)
+      : vi.fn().mockResolvedValue({ messages: [] });
+    const { callback, emit } = await startReactionListener({ replies, durable: true });
+    const ack = await emit(reactionEvent());
+    expect(ack).toHaveBeenCalledOnce();
+    expect(callback).not.toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it.each([
+    new Error('network unavailable'),
+    { code: 'slack_webapi_rate_limited_error', retryAfter: 1 },
+    { data: { error: 'ratelimited' } },
+    { data: { error: 'internal_error' } },
+    { data: { error: 'org_login_required' } },
+    { data: { error: 'team_added_to_org' } },
+    { statusCode: 503 },
+    { statusCode: 429 },
+  ])('retries transient thread lookup failures without acking: %j', async (error) => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const replies = vi
+      .fn()
+      .mockRejectedValueOnce(error)
+      .mockResolvedValue({ messages: [reactedReply] });
+    const { callback, emit } = await startReactionListener({ replies, durable: true });
+    const ack = vi.fn(async () => undefined);
+    await expect(emit(reactionEvent(), ack)).rejects.toThrow('thread could not be resolved');
+    expect(ack).not.toHaveBeenCalled();
+    expect(callback).not.toHaveBeenCalled();
+    await emit(reactionEvent(), ack);
+    expect(ack).toHaveBeenCalledOnce();
+    expect(callback).toHaveBeenCalledOnce();
+    warn.mockRestore();
+  });
+
+  it('uses the thread parent when Slack returns only the parent of a reacted reply', async () => {
+    const replies = vi.fn(async () => ({
+      messages: [{ ts: '200.000000', thread_ts: '200.000000', text: 'root' }],
+    }));
+    const { callback, emit } = await startReactionListener({ replies });
+
+    await emit(reactionEvent());
+
+    expect(callback.mock.calls[0][0].threadId).toBe('D123-200.000000');
+    expect(callback.mock.calls[0][0].metadata).not.toHaveProperty('slack_reaction_item_text');
+  });
+
+  it('delivers a repeated identical reaction once per cooldown', async () => {
+    const { callback, emit } = await startReactionListener();
+
+    await emit(reactionEvent());
+    await emit(reactionEvent({ event_ts: '300.000002' }));
+    await emit(reactionEvent({ type: 'reaction_removed', event_ts: '300.000003' }));
+
+    // The add is delivered once; its removal is a distinct signal.
+    expect(callback).toHaveBeenCalledTimes(2);
+  });
+
+  it('caps reaction prompts per thread so emoji spam cannot queue a burst', async () => {
+    const { callback, emit } = await startReactionListener();
+
+    for (const [index, reaction] of ['one', 'two', 'three', 'four', 'five'].entries()) {
+      await emit(reactionEvent({ reaction, event_ts: `300.00000${index}` }));
+    }
+
+    expect(callback).toHaveBeenCalledTimes(3);
+  });
+
+  it.each(['success', 'failure'])(
+    'does not acknowledge an in-flight durable redelivery before routing %s',
+    async (outcome) => {
+      let finish!: () => void;
+      let fail!: (error: Error) => void;
+      const callback = vi.fn(
+        () =>
+          new Promise<void>((resolve, reject) => {
+            finish = resolve;
+            fail = reject;
+          })
+      );
+      const { emit } = await startReactionListener({ callback, durable: true });
+      const ackOriginal = vi.fn(async () => undefined);
+      const ackRetry = vi.fn(async () => undefined);
+      const original = emit(reactionEvent(), ackOriginal);
+      await vi.waitFor(() => expect(callback).toHaveBeenCalledOnce());
+      const retry = emit(reactionEvent(), ackRetry);
+      const settled = Promise.allSettled([original, retry]);
+      await Promise.resolve();
+      expect(ackOriginal).not.toHaveBeenCalled();
+      expect(ackRetry).not.toHaveBeenCalled();
+      expect(callback).toHaveBeenCalledOnce();
+      if (outcome === 'failure') fail(new Error('routing failed'));
+      else finish();
+      expect((await settled).map((result) => result.status)).toEqual(
+        outcome === 'failure' ? ['rejected', 'rejected'] : ['fulfilled', 'fulfilled']
+      );
+      expect(ackOriginal).toHaveBeenCalledTimes(outcome === 'failure' ? 0 : 1);
+      expect(ackRetry).toHaveBeenCalledTimes(outcome === 'failure' ? 0 : 1);
+      if (outcome === 'failure') {
+        callback.mockImplementation(async () => undefined);
+        await emit(reactionEvent(), ackRetry);
+        expect(callback).toHaveBeenCalledTimes(2);
+        expect(ackRetry).toHaveBeenCalledOnce();
+      }
+    }
+  );
+
+  it.each([false, true])(
+    'releases rejected reactions without consuming the thread budget (durable=%s)',
+    async (durable) => {
+      const callback = vi.fn().mockResolvedValue({ accepted: false });
+      const { emit } = await startReactionListener({ callback, durable });
+      for (const [index, reaction] of ['one', 'two', 'three'].entries()) {
+        await emit(reactionEvent({ reaction, event_ts: `300.00000${index}` }));
+      }
+      callback.mockResolvedValue({ accepted: true });
+      // A previously rejected occurrence does not retain its own cooldown either.
+      await emit(reactionEvent({ reaction: 'one', event_ts: '300.000004' }));
+      await emit(reactionEvent({ reaction: 'four', event_ts: '300.000005' }));
+      await emit(reactionEvent({ reaction: 'five', event_ts: '300.000006' }));
+      await emit(reactionEvent({ reaction: 'six', event_ts: '300.000007' }));
+      expect(callback).toHaveBeenCalledTimes(6);
+    }
+  );
+
+  it('releases the rate limit when durable routing fails so the redelivery is accepted', async () => {
+    const callback = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('routing failed'))
+      .mockResolvedValueOnce(undefined);
+    const { emit } = await startReactionListener({ callback, durable: true });
+
+    await expect(emit(reactionEvent())).rejects.toThrow('routing failed');
+    const ack = await emit(reactionEvent());
+
+    expect(callback).toHaveBeenCalledTimes(2);
+    expect(ack).toHaveBeenCalledOnce();
+  });
+});
+
+describe('normalizeSlackReactionName', () => {
+  it.each([
+    'white_check_mark',
+    '+1',
+    '-1',
+    'thumbsup::skin-tone-2',
+    'man-woman-girl-boy',
+    'e-mail',
+  ])('accepts %s', (name) => {
+    expect(normalizeSlackReactionName(name)).toBe(name);
+  });
+
+  it.each(['', 'has space', 'x:<@U1>', 'a'.repeat(101), 42, undefined, 'x::skin-tone-9'])(
+    'rejects %s',
+    (name) => {
+      expect(normalizeSlackReactionName(name)).toBeNull();
+    }
+  );
+});
+
+describe('isSlackInboundSurfaceAllowed', () => {
+  const surfaces = {
+    enableChannels: true,
+    enableGroups: false,
+    enableMpim: false,
+    allowedChannelIds: ['C1'],
+  };
+
+  it('always allows DMs, even outside the whitelist', () => {
+    expect(isSlackInboundSurfaceAllowed('im', 'D9', surfaces)).toBe(true);
+  });
+
+  it('follows the surface toggle and whitelist for channel-like surfaces', () => {
+    expect(isSlackInboundSurfaceAllowed('channel', 'C1', surfaces)).toBe(true);
+    expect(isSlackInboundSurfaceAllowed('channel', 'C2', surfaces)).toBe(false);
+    expect(isSlackInboundSurfaceAllowed('group', 'C1', surfaces)).toBe(false);
+    expect(isSlackInboundSurfaceAllowed('mpim', 'C1', surfaces)).toBe(false);
+  });
+
+  it('fails closed on an unresolved or unknown conversation type', () => {
+    expect(isSlackInboundSurfaceAllowed(undefined, 'C1', surfaces)).toBe(false);
+    expect(isSlackInboundSurfaceAllowed('app_home', 'C1', surfaces)).toBe(false);
+  });
+});
+
+/**
+ * slackify-markdown uses zero-width spaces (\u200B) around inline formatting
+ * to prevent Slack from misinterpreting mid-word emphasis markers.
+ * Tests use toContain for inline formatting to stay resilient to this.
+ */
+describe('markdownToMrkdwn', () => {
+  it('converts bold', () => {
+    expect(markdownToMrkdwn('**bold**')).toContain('*bold*');
+    expect(markdownToMrkdwn('__bold__')).toContain('*bold*');
+  });
+
+  it('converts italic', () => {
+    expect(markdownToMrkdwn('_italic_')).toContain('_italic_');
+    expect(markdownToMrkdwn('*italic*')).toContain('_italic_');
+  });
+
+  it('converts strikethrough', () => {
+    expect(markdownToMrkdwn('~~strike~~')).toContain('~strike~');
+  });
+
+  it('converts links', () => {
+    expect(markdownToMrkdwn('[click here](https://example.com)')).toBe(
+      '<https://example.com|click here>'
+    );
+  });
+
+  it('converts bare URLs to Slack link format', () => {
+    expect(markdownToMrkdwn('https://example.com')).toContain('https://example.com');
+  });
+
+  it('converts images to links (Slack cannot render inline images)', () => {
+    expect(markdownToMrkdwn('![alt text](https://img.png)')).toBe('<https://img.png|alt text>');
+    expect(markdownToMrkdwn('![](https://img.png)')).toBe('<https://img.png>');
+  });
+
+  it('converts headings to bold text', () => {
+    expect(markdownToMrkdwn('# Heading 1')).toBe('*Heading 1*');
+    expect(markdownToMrkdwn('## Heading 2')).toBe('*Heading 2*');
+    expect(markdownToMrkdwn('### Heading 3')).toBe('*Heading 3*');
+  });
+
+  it('converts horizontal rules', () => {
+    expect(markdownToMrkdwn('---')).toBe('***');
+    expect(markdownToMrkdwn('***')).toBe('***');
+  });
+
+  it('preserves code blocks and strips language identifier', () => {
+    const input = '```js\nconst x = 1;\n```';
+    expect(markdownToMrkdwn(input)).toBe('```\nconst x = 1;\n```');
+  });
+
+  it('preserves inline code', () => {
+    expect(markdownToMrkdwn('use `**not bold**` here')).toBe('use `**not bold**` here');
+  });
+
+  it('converts unordered lists', () => {
+    const input = '- item 1\n- item 2\n- item 3';
+    const output = markdownToMrkdwn(input);
+    expect(output).toContain('item 1');
+    expect(output).toContain('item 2');
+    expect(output).toContain('item 3');
+  });
+
+  it('converts ordered lists', () => {
+    const input = '1. first\n2. second\n3. third';
+    const output = markdownToMrkdwn(input);
+    expect(output).toContain('1.');
+    expect(output).toContain('first');
+    expect(output).toContain('2.');
+    expect(output).toContain('second');
+  });
+
+  it('preserves blockquotes', () => {
+    expect(markdownToMrkdwn('> quoted text')).toBe('> quoted text');
+  });
+
+  it('renders tables as monospace code blocks', () => {
+    const input = '| Col1 | Col2 |\n|------|------|\n| A    | B    |';
+    const output = markdownToMrkdwn(input);
+    // Table content is preserved inside a code block
+    expect(output).toContain('```');
+    expect(output).toContain('Col1');
+    expect(output).toContain('Col2');
+    expect(output).toContain('A');
+    expect(output).toContain('B');
+  });
+
+  it('handles a realistic agent response', () => {
+    const input = [
+      '## Summary',
+      '',
+      'I made the following changes:',
+      '',
+      '- **Fixed** the login bug in `auth.ts`',
+      '- Updated the [documentation](https://docs.example.com)',
+      '- ~~Removed~~ deprecated API calls',
+      '',
+      '### Code change',
+      '',
+      '```typescript',
+      'const user = await authenticate(token);',
+      '```',
+      '',
+      '> Note: This requires a restart.',
+    ].join('\n');
+
+    const output = markdownToMrkdwn(input);
+
+    // Bold headings
+    expect(output).toContain('*Summary*');
+    expect(output).toContain('*Code change*');
+    // Bold text
+    expect(output).toContain('*Fixed*');
+    // Links
+    expect(output).toContain('<https://docs.example.com|documentation>');
+    // Strikethrough
+    expect(output).toContain('~Removed~');
+    // Code block preserved (lang stripped)
+    expect(output).toContain('```\nconst user = await authenticate(token);\n```');
+    // Inline code preserved
+    expect(output).toContain('`auth.ts`');
+    // Blockquote
+    expect(output).toContain('> Note: This requires a restart.');
+    // No raw markdown artifacts
+    expect(output).not.toContain('##');
+    expect(output).not.toContain('**');
+    expect(output).not.toContain('~~');
+    expect(output).not.toContain('](');
+  });
+
+  it('escapes Slack special characters in text', () => {
+    expect(markdownToMrkdwn('a & b')).toBe('a &amp; b');
+    expect(markdownToMrkdwn('a < b')).toBe('a &lt; b');
+    expect(markdownToMrkdwn('a > b')).toContain('&gt;');
+  });
+
+  it('treats single asterisk as italic (markdown spec)', () => {
+    // In markdown, *text* is italic — slackify-markdown converts to _text_
+    expect(markdownToMrkdwn('*already bold*')).toContain('_already bold_');
+  });
+
+  it('separates multiple paragraphs', () => {
+    const output = markdownToMrkdwn('First paragraph.\n\nSecond paragraph.');
+    expect(output).toContain('First paragraph.');
+    expect(output).toContain('Second paragraph.');
+    expect(output).not.toBe('First paragraph.Second paragraph.');
+  });
+
+  it('handles inline formatting inside headings', () => {
+    const output = markdownToMrkdwn('## Fix for **critical** bug');
+    expect(output).toContain('Fix for');
+    expect(output).toContain('critical');
+    expect(output).toContain('bug');
+  });
+
+  it('handles empty input', () => {
+    expect(markdownToMrkdwn('')).toBe('');
+  });
+
+  it('does not escape special chars inside code blocks', () => {
+    const input = '```\nif (a < b && c > d) {}\n```';
+    const output = markdownToMrkdwn(input);
+    expect(output).toContain('a < b && c > d');
+    expect(output).not.toContain('&lt;');
+    expect(output).not.toContain('&amp;');
+  });
+
+  it('handles nested lists with proper indentation', () => {
+    const input = '- item 1\n  - subitem\n- item 2';
+    const output = markdownToMrkdwn(input);
+    expect(output).toContain('item 1');
+    expect(output).toContain('subitem');
+    expect(output).toContain('item 2');
+    // Nested items should be indented
+    expect(output).toMatch(/\n\s+.*subitem/);
+  });
+});
+
+describe('wrapTablesInCodeBlocks', () => {
+  it('wraps a GFM table in code fences', () => {
+    const input = '| Col1 | Col2 |\n|------|------|\n| A    | B    |';
+    const output = wrapTablesInCodeBlocks(input);
+    expect(output).toBe('```\n| Col1 | Col2 |\n|------|------|\n| A    | B    |\n```');
+  });
+
+  it('does not wrap tables already inside code blocks', () => {
+    const input = '```\n| Col1 | Col2 |\n|------|------|\n| A    | B    |\n```';
+    expect(wrapTablesInCodeBlocks(input)).toBe(input);
+  });
+
+  it('does not wrap pipe lines without a separator row', () => {
+    const input = '| not a table |\n| just pipes |';
+    expect(wrapTablesInCodeBlocks(input)).toBe(input);
+  });
+
+  it('handles multiple tables separated by text', () => {
+    const input = '| A | B |\n|---|---|\n| 1 | 2 |\n\nText\n\n| C | D |\n|---|---|\n| 3 | 4 |';
+    const output = wrapTablesInCodeBlocks(input);
+    expect(output).toContain('```\n| A | B |');
+    expect(output).toContain('```\n| C | D |');
+    // Should have 2 pairs of code fences (4 total)
+    expect(output.match(/```/g)?.length).toBe(4);
+  });
+
+  it('preserves surrounding text', () => {
+    const input = 'Before\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\nAfter';
+    const output = wrapTablesInCodeBlocks(input);
+    expect(output).toContain('Before');
+    expect(output).toContain('After');
+    expect(output).toContain('```\n| A | B |');
+  });
+
+  it('handles empty input', () => {
+    expect(wrapTablesInCodeBlocks('')).toBe('');
+  });
+
+  it('does not wrap tables inside tilde-fenced code blocks', () => {
+    const input = '~~~\n| Col1 | Col2 |\n|------|------|\n| A    | B    |\n~~~';
+    expect(wrapTablesInCodeBlocks(input)).toBe(input);
+  });
+
+  it('does not wrap tables inside 4+ backtick fences', () => {
+    const input = '````\n| Col1 | Col2 |\n|------|------|\n| A    | B    |\n````';
+    expect(wrapTablesInCodeBlocks(input)).toBe(input);
+  });
+});
+
+describe('markdownToSlackPayload', () => {
+  it('returns text-only payload when there is no table', () => {
+    const payload = markdownToSlackPayload('Hello **world**');
+    expect(payload.blocks).toBeUndefined();
+    expect(payload.text).toContain('Hello');
+    expect(payload.text).toContain('*world*');
+  });
+
+  it('preserves the mrkdwn fallback identical to markdownToMrkdwn for non-table content', () => {
+    const md = '## Heading\n\n- item 1\n- item 2\n\n```js\nconst x = 1;\n```';
+    expect(markdownToSlackPayload(md).text).toBe(markdownToMrkdwn(md));
+  });
+
+  it('emits a native Block Kit table block for a simple GFM table', () => {
+    const md = '| Col1 | Col2 |\n|------|------|\n| A    | B    |';
+    const payload = markdownToSlackPayload(md);
+    expect(payload.blocks).toBeDefined();
+    const blocks = payload.blocks!;
+    const table = blocks.find((b) => (b as { type: string }).type === 'table') as {
+      type: 'table';
+      rows: { type: string; text: string }[][];
+    };
+    expect(table).toBeDefined();
+    expect(table.rows).toHaveLength(2);
+    expect(table.rows[0]).toEqual([
+      { type: 'raw_text', text: 'Col1' },
+      { type: 'raw_text', text: 'Col2' },
+    ]);
+    expect(table.rows[1]).toEqual([
+      { type: 'raw_text', text: 'A' },
+      { type: 'raw_text', text: 'B' },
+    ]);
+  });
+
+  it('keeps an mrkdwn `text` field alongside structured blocks (notification fallback)', () => {
+    const md = 'Intro\n\n| A | B |\n|---|---|\n| 1 | 2 |';
+    const payload = markdownToSlackPayload(md);
+    expect(payload.text).toContain('Intro');
+    expect(payload.text).toContain('```'); // legacy monospace fallback in text
+    expect(payload.blocks).toBeDefined();
+  });
+
+  it('substitutes a single space for empty cells (Slack requires text length ≥ 1)', () => {
+    const md = '| A | B |\n|---|---|\n|   | x |';
+    const payload = markdownToSlackPayload(md);
+    const table = payload.blocks!.find((b) => (b as { type: string }).type === 'table') as {
+      rows: { text: string }[][];
+    };
+    expect(table.rows[1][0].text).toBe(' ');
+    expect(table.rows[1][1].text).toBe('x');
+  });
+
+  it('normalizes row widths to the header width', () => {
+    // Row 1 has 3 cells, row 2 has 2 (malformed); header has 3.
+    const md = '| A | B | C |\n|---|---|---|\n| 1 | 2 | 3 |\n| 4 | 5 |';
+    const payload = markdownToSlackPayload(md);
+    const table = payload.blocks!.find((b) => (b as { type: string }).type === 'table') as {
+      rows: { text: string }[][];
+    };
+    expect(table.rows[0]).toHaveLength(3);
+    expect(table.rows[1]).toHaveLength(3);
+    expect(table.rows[2]).toHaveLength(3);
+    expect(table.rows[2][2].text).toBe(' '); // padded
+  });
+
+  it('falls back to a monospace section block when the table exceeds 20 columns', () => {
+    const cols = Array.from({ length: 21 }, (_, i) => `c${i}`).join(' | ');
+    const sep = Array.from({ length: 21 }, () => '---').join(' | ');
+    const data = Array.from({ length: 21 }, (_, i) => `v${i}`).join(' | ');
+    const md = `| ${cols} |\n| ${sep} |\n| ${data} |`;
+    const payload = markdownToSlackPayload(md);
+    expect(payload.blocks).toBeDefined();
+    // No native table block — fell back to a section with a code block
+    expect(payload.blocks!.some((b) => (b as { type: string }).type === 'table')).toBe(false);
+    const section = payload.blocks!.find((b) => (b as { type: string }).type === 'section') as {
+      text: { text: string };
+    };
+    expect(section.text.text).toContain('```');
+    expect(section.text.text).toContain('c0');
+  });
+
+  it('falls back to a monospace section block when the table exceeds 100 rows', () => {
+    const header = '| a | b |';
+    const sep = '|---|---|';
+    const rows = Array.from({ length: 101 }, (_, i) => `| ${i} | x |`).join('\n');
+    const md = `${header}\n${sep}\n${rows}`;
+    const payload = markdownToSlackPayload(md);
+    expect(payload.blocks!.some((b) => (b as { type: string }).type === 'table')).toBe(false);
+    const section = payload.blocks!.find((b) => (b as { type: string }).type === 'section') as {
+      text: { text: string };
+    };
+    expect(section.text.text).toContain('```');
+  });
+
+  it('uses Slack native markdown block when a message contains multiple tables', () => {
+    const md = '| A | B |\n|---|---|\n| 1 | 2 |\n\nText\n\n| C | D |\n|---|---|\n| 3 | 4 |';
+    const payload = markdownToSlackPayload(md);
+    expect(payload.blocks).toEqual([{ type: 'markdown', text: md }]);
+  });
+
+  it('preserves intro/outro prose as section blocks around a table', () => {
+    const md = 'Before\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\nAfter';
+    const payload = markdownToSlackPayload(md);
+    const blockTypes = payload.blocks!.map((b) => (b as { type: string }).type);
+    expect(blockTypes).toContain('section');
+    expect(blockTypes).toContain('table');
+    // The first block should be the "Before" text and the last should be "After"
+    const firstSection = payload.blocks!.find((b) => (b as { type: string }).type === 'section') as
+      | { text: { text: string } }
+      | undefined;
+    expect(firstSection?.text.text).toContain('Before');
+  });
+
+  it('uses Slack native markdown block for a table with markdown inside cells', () => {
+    const md = '| Item | Notes |\n|---|---|\n| API cleanup | **Keep compatibility** |';
+    const payload = markdownToSlackPayload(md);
+    expect(payload.blocks).toEqual([{ type: 'markdown', text: md }]);
+    expect(payload.text).toContain('```');
+  });
+
+  it('handles empty input', () => {
+    const payload = markdownToSlackPayload('');
+    expect(payload.text).toBe('');
+    expect(payload.blocks).toBeUndefined();
+  });
+
+  it('does not emit a native table for pipe tables inside fenced code blocks', () => {
+    const md = '```\n| Col1 | Col2 |\n|------|------|\n| A    | B    |\n```';
+    const payload = markdownToSlackPayload(md);
+    // No table block — content stays inside a fenced code block, which
+    // slackify-markdown preserves verbatim in the text fallback path.
+    expect(payload.blocks).toBeUndefined();
+    expect(payload.text).toContain('```');
+    expect(payload.text).toContain('| Col1 | Col2 |');
+  });
+
+  it('uses Slack native markdown block for three tables', () => {
+    const md = [
+      '| A | B |\n|---|---|\n| 1 | 2 |',
+      '| C | D |\n|---|---|\n| 3 | 4 |',
+      '| E | F |\n|---|---|\n| 5 | 6 |',
+    ].join('\n\nText\n\n');
+    const payload = markdownToSlackPayload(md);
+    expect(payload.blocks).toEqual([{ type: 'markdown', text: md }]);
+  });
+
+  it('drops blocks entirely (text-only) when an oversize table would not fit even monospace', () => {
+    // 200 rows × 4 cols of fat cells → exceeds both the native cap and the
+    // monospace section text cap; we should fall back to text-only.
+    const header = '| a | b | c | d |';
+    const sep = '|---|---|---|---|';
+    const fat = 'x'.repeat(200);
+    const rows = Array.from({ length: 200 }, () => `| ${fat} | ${fat} | ${fat} | ${fat} |`).join(
+      '\n'
+    );
+    const md = `${header}\n${sep}\n${rows}`;
+    const payload = markdownToSlackPayload(md);
+    expect(payload.blocks).toBeUndefined();
+    // Content is not silently truncated — the legacy mrkdwn fallback still
+    // contains the table inside its code fence.
+    expect(payload.text).toContain('```');
+    expect(payload.text.length).toBeGreaterThan(SECTION_MAX_CHARS_TEST);
+  });
+
+  it('normalizes CRLF line endings', () => {
+    const md = '| A | B |\r\n|---|---|\r\n| 1 | 2 |';
+    const payload = markdownToSlackPayload(md);
+    const table = payload.blocks!.find((b) => (b as { type: string }).type === 'table') as {
+      rows: { text: string }[][];
+    };
+    expect(table.rows[0]).toEqual([
+      { type: 'raw_text', text: 'A' },
+      { type: 'raw_text', text: 'B' },
+    ]);
+    expect(table.rows[1]).toEqual([
+      { type: 'raw_text', text: '1' },
+      { type: 'raw_text', text: '2' },
+    ]);
+  });
+
+  it('treats escaped pipes (\\|) as literal pipe characters inside cells', () => {
+    const md = '| key | value |\n|---|---|\n| or | a \\| b |';
+    const payload = markdownToSlackPayload(md);
+    const table = payload.blocks!.find((b) => (b as { type: string }).type === 'table') as {
+      rows: { text: string }[][];
+    };
+    expect(table.rows[1][0].text).toBe('or');
+    expect(table.rows[1][1].text).toBe('a | b');
+  });
+
+  it('emits column_settings reflecting GFM alignment markers', () => {
+    const md = '| L | C | R |\n|:---|:---:|---:|\n| 1 | 2 | 3 |';
+    const payload = markdownToSlackPayload(md);
+    const table = payload.blocks!.find((b) => (b as { type: string }).type === 'table') as {
+      column_settings?: { align: string }[];
+    };
+    expect(table.column_settings).toEqual([
+      { align: 'left' },
+      { align: 'center' },
+      { align: 'right' },
+    ]);
+  });
+
+  it('omits column_settings when every column is default-aligned', () => {
+    const md = '| A | B |\n|---|---|\n| 1 | 2 |';
+    const payload = markdownToSlackPayload(md);
+    const table = payload.blocks!.find((b) => (b as { type: string }).type === 'table') as {
+      column_settings?: unknown;
+    };
+    expect(table.column_settings).toBeUndefined();
+  });
+});
+
+describe('SlackConnector card writes: one attempt, bounded by the caller', () => {
+  const posted = () => ({ ok: true, ts: '1700000000.000001' });
+  const refusingShared = {
+    chat: {
+      postMessage: async () => {
+        throw new Error('a card write must not use the shared retrying client');
+      },
+      update: async () => {
+        throw new Error('a card write must not use the shared retrying client');
+      },
+    },
+  };
+
+  it('sends a card write through a fresh single-attempt client, not the shared one', async () => {
+    const connector = new SlackConnector({ bot_token: 'xoxb-test' });
+    (connector as unknown as { web: unknown }).web = refusingShared;
+    const update = vi.fn(async () => posted());
+    const build = vi
+      .spyOn(
+        connector as unknown as { createSingleAttemptWebClient(ms: number): unknown },
+        'createSingleAttemptWebClient'
+      )
+      .mockReturnValue({ chat: { update } });
+
+    await connector.sendMessage({
+      threadId: 'C123-1700000000.000000',
+      text: 'card',
+      metadata: {
+        [SLACK_REQUEST_TIMEOUT_METADATA_KEY]: 4_200.4,
+        slack_update_ts: '1700000000.000001',
+      },
+    });
+
+    expect(build).toHaveBeenCalledWith(4_201);
+    expect(update).toHaveBeenCalledTimes(1);
+  });
+
+  it('builds that client with no retries and at most the connector deadline', () => {
+    const connector = new SlackConnector({ bot_token: 'xoxb-test' });
+    const create = (ms: number) =>
+      (
+        connector as unknown as {
+          createSingleAttemptWebClient(ms: number): {
+            retryConfig: { retries?: number };
+            axios: { defaults: { timeout?: number } };
+          };
+        }
+      ).createSingleAttemptWebClient(ms);
+
+    const short = create(4_200);
+    expect(short.retryConfig).toEqual({ retries: 0 });
+    expect(short.axios.defaults.timeout).toBe(4_200);
+    // Never longer than an ordinary request is allowed to take.
+    expect(create(60_000).axios.defaults.timeout).toBe(15_000);
+  });
+
+  it('keeps every other send on the shared client and its retry ladder', async () => {
+    const connector = new SlackConnector({ bot_token: 'xoxb-test' });
+    const postMessage = vi.fn(async () => posted());
+    (connector as unknown as { web: unknown }).web = { chat: { postMessage } };
+    const build = vi.spyOn(
+      connector as unknown as { createSingleAttemptWebClient(ms: number): unknown },
+      'createSingleAttemptWebClient'
+    );
+
+    await connector.sendMessage({ threadId: 'C123-1700000000.000000', text: 'relay' });
+
+    expect(postMessage).toHaveBeenCalledTimes(1);
+    expect(build).not.toHaveBeenCalled();
+  });
+});
+
+describe('SlackConnector outbound target resolution', () => {
+  it('bounds and sanitizes token-shaped provider failures at the connector boundary', async () => {
+    const connector = new SlackConnector({ bot_token: 'xoxb-test' });
+    (connector as unknown as { web: unknown }).web = {
+      chat: {
+        postMessage: async () => ({
+          ok: false,
+          error: 'xoxb-leaked-token https://slack.example.test/api /srv/agor/private-key\nunsafe',
+        }),
+      },
+    };
+
+    const result = connector.sendDirectMessage({ target: 'channel:C123', text: 'hello' });
+    await expect(result).rejects.toThrow(/redacted/);
+    await expect(result).rejects.not.toThrow('xoxb-leaked-token');
+    await expect(result).rejects.not.toThrow('https://slack.example.test');
+  });
+
+  it('resolves channel names via conversations.list', async () => {
+    const connector = new SlackConnector({ bot_token: 'xoxb-test' });
+    const calls: unknown[] = [];
+    (connector as unknown as { web: unknown }).web = {
+      conversations: {
+        list: async (args: unknown) => {
+          calls.push(args);
+          return {
+            ok: true,
+            channels: [
+              { id: 'C111', name: 'random' },
+              { id: 'C222', name: 'project-updates', name_normalized: 'project-updates' },
+            ],
+            response_metadata: {},
+          };
+        },
+      },
+    };
+
+    const resolved = await connector.resolveChannelByName('#project-updates');
+
+    expect(resolved).toEqual({ channel: 'C222', name: 'project-updates' });
+    expect(calls).toEqual([{ types: 'public_channel,private_channel', limit: 1000 }]);
+  });
+
+  it('opens a DM by Slack user email', async () => {
+    const connector = new SlackConnector({ bot_token: 'xoxb-test' });
+    const calls: Array<{ method: string; args: unknown }> = [];
+    (connector as unknown as { web: unknown }).web = {
+      users: {
+        lookupByEmail: async (args: unknown) => {
+          calls.push({ method: 'lookupByEmail', args });
+          return { ok: true, user: { id: 'U123' } };
+        },
+      },
+      conversations: {
+        open: async (args: unknown) => {
+          calls.push({ method: 'open', args });
+          return { ok: true, channel: { id: 'D123' } };
+        },
+      },
+    };
+
+    const resolved = await connector.openDmByEmail('User@Example.com');
+
+    expect(resolved).toEqual({ channel: 'D123', user_id: 'U123' });
+    expect(calls).toEqual([
+      { method: 'lookupByEmail', args: { email: 'user@example.com' } },
+      { method: 'open', args: { users: 'U123' } },
+    ]);
+  });
+
+  it('sends provider-neutral direct messages while preserving Slack target metadata', async () => {
+    const connector = new SlackConnector({ bot_token: 'xoxb-test' });
+    const calls: unknown[] = [];
+    (connector as unknown as { web: unknown }).web = {
+      chat: {
+        postMessage: async (args: unknown) => {
+          calls.push(args);
+          return { ok: true, ts: '1700000000.000010' };
+        },
+        getPermalink: async () => ({ ok: true, permalink: 'https://slack.example/message' }),
+      },
+    };
+
+    const receipt = await connector.sendDirectMessage({
+      target: 'channel:C123',
+      text: 'direct update',
+      threadId: '1700000000.000000',
+    });
+
+    expect(calls).toEqual([
+      expect.objectContaining({
+        channel: 'C123',
+        text: 'direct update',
+        thread_ts: '1700000000.000000',
+      }),
+    ]);
+    expect(receipt).toMatchObject({
+      messageId: '1700000000.000010',
+      platformChannelId: 'C123',
+      platformThreadId: 'C123-1700000000.000000',
+      permalink: 'https://slack.example/message',
+    });
+  });
+});
+
+describe('SlackConnector.fetchThreadHistory', () => {
+  it('sanitizes thrown Slack SDK errors before returning them', async () => {
+    const connector = new SlackConnector({ bot_token: 'xoxb-test' });
+    (connector as unknown as { web: unknown }).web = {
+      conversations: {
+        replies: async () => {
+          throw new Error('xoxb-leaked-token https://slack.example.test/api /srv/agor/private-key');
+        },
+      },
+    };
+
+    const result = connector.fetchThreadHistory({ threadId: 'C123-1700000000.000000' });
+    await expect(result).rejects.toThrow(/redacted|provider-url|path/);
+    await expect(result).rejects.not.toThrow('xoxb-leaked-token');
+  });
+
+  it('normalizes Slack thread replies and filters bot messages by default', async () => {
+    const calls: Array<{ method: string; args: unknown }> = [];
+    const connector = new SlackConnector({ bot_token: 'xoxb-test' });
+    (connector as unknown as { botUserId: string }).botUserId = 'U_BOT';
+    (connector as unknown as { web: unknown }).web = {
+      conversations: {
+        replies: async (args: unknown) => {
+          calls.push({ method: 'replies', args });
+          return {
+            ok: true,
+            has_more: true,
+            messages: [
+              { ts: '1700000000.000000', user: 'U1', text: 'hello' },
+              { ts: '1700000001.000000', bot_id: 'B1', text: 'bot output' },
+              { ts: '1700000002.000000', user: 'U2', text: '<@U_BOT> help' },
+            ],
+          };
+        },
+      },
+      users: {
+        info: async ({ user }: { user: string }) => {
+          calls.push({ method: 'users.info', args: { user } });
+          return {
+            ok: true,
+            user: {
+              real_name: user,
+              profile: {
+                display_name: user === 'U1' ? 'Alice' : 'Bob',
+                email: `${user.toLowerCase()}@example.com`,
+              },
+            },
+          };
+        },
+      },
+    };
+
+    const history = await connector.fetchThreadHistory({
+      threadId: 'C123-1700000000.000000',
+      oldestTs: '1699999999.000000',
+      latestTs: '1700000002.000000',
+      inclusive: true,
+      triggerTs: '1700000002.000000',
+      limit: 999,
+    });
+
+    expect(calls[0]).toEqual({
+      method: 'replies',
+      args: {
+        channel: 'C123',
+        ts: '1700000000.000000',
+        limit: 200,
+        oldest: '1699999999.000000',
+        latest: '1700000002.000000',
+        inclusive: true,
+      },
+    });
+    expect(history).toMatchObject({
+      threadId: 'C123-1700000000.000000',
+      channel: 'C123',
+      thread_ts: '1700000000.000000',
+      has_more: true,
+      messages: [
+        {
+          ts: '1700000000.000000',
+          iso_time: '2023-11-14T22:13:20.000Z',
+          user_id: 'U1',
+          user_name: 'Alice',
+          actor_label: 'Alice',
+          text: 'hello',
+          is_bot: false,
+          is_trigger: false,
+          is_mention: false,
+        },
+        {
+          ts: '1700000002.000000',
+          iso_time: '2023-11-14T22:13:22.000Z',
+          user_id: 'U2',
+          user_name: 'Bob',
+          actor_label: 'Bob',
+          text: '<@U_BOT> help',
+          is_bot: false,
+          is_trigger: true,
+          is_mention: true,
+        },
+      ],
+    });
+  });
+
+  it('applies the requested limit after bot-message filtering when possible', async () => {
+    const calls: unknown[] = [];
+    const connector = new SlackConnector({ bot_token: 'xoxb-test' });
+    (connector as unknown as { web: unknown }).web = {
+      conversations: {
+        replies: async (args: unknown) => {
+          calls.push(args);
+          return {
+            ok: true,
+            has_more: false,
+            messages: [
+              { ts: '1700000000.000000', bot_id: 'B1', text: 'lifecycle' },
+              { ts: '1700000001.000000', bot_id: 'B1', text: 'still lifecycle' },
+              { ts: '1700000002.000000', user: 'U1', text: 'human one' },
+              { ts: '1700000003.000000', bot_id: 'B1', text: 'bot output' },
+              { ts: '1700000004.000000', user: 'U2', text: 'human two' },
+            ],
+          };
+        },
+      },
+      users: {
+        info: async ({ user }: { user: string }) => ({
+          ok: true,
+          user: { profile: { display_name: user } },
+        }),
+      },
+    };
+
+    const history = await connector.fetchThreadHistory({
+      threadId: 'C123-1700000000.000000',
+      limit: 2,
+      includeBotMessages: false,
+    });
+
+    expect(calls[0]).toMatchObject({ limit: 8 });
+    expect(history.messages.map((message) => message.text)).toEqual(['human one', 'human two']);
+    expect(history.has_more).toBe(false);
+  });
+
+  it('surfaces attached-file metadata without url_private_download', async () => {
+    const connector = new SlackConnector({ bot_token: 'xoxb-test' });
+    (connector as unknown as { web: unknown }).web = {
+      conversations: {
+        replies: async () => ({
+          ok: true,
+          has_more: false,
+          messages: [
+            {
+              ts: '1700000000.000000',
+              user: 'U1',
+              text: 'here is the log',
+              files: [
+                {
+                  id: 'F123',
+                  name: 'error.log',
+                  mimetype: 'text/plain',
+                  size: 512,
+                  url_private_download:
+                    'https://files.slack.com/files-pri/T1-F123/download/error.log',
+                  permalink: 'https://x.slack.com/p',
+                },
+                // Malformed entry (no url) is dropped, matching inbound ingestion.
+                { id: 'F999', name: 'ghost.txt' },
+              ],
+            },
+            { ts: '1700000001.000000', user: 'U2', text: 'no attachments here' },
+          ],
+        }),
+      },
+      users: {
+        info: async ({ user }: { user: string }) => ({
+          ok: true,
+          user: { profile: { display_name: user } },
+        }),
+      },
+    };
+
+    const history = await connector.fetchThreadHistory({
+      threadId: 'C123-1700000000.000000',
+      limit: 10,
+    });
+
+    expect(history.messages[0].files).toEqual([
+      { id: 'F123', name: 'error.log', mimetype: 'text/plain', size: 512 },
+    ]);
+    expect(history.messages[1].files).toBeUndefined();
+    expect(JSON.stringify(history)).not.toContain('url_private_download');
+    expect(JSON.stringify(history)).not.toContain('files.slack.com');
+  });
+});
+
+describe('SlackConnector.getFileInfo', () => {
+  const slackFile = {
+    id: 'F123',
+    name: 'error.log',
+    mimetype: 'text/plain',
+    size: 512,
+    url_private_download: 'https://files.slack.com/files-pri/T1-F123/download/error.log',
+  };
+
+  it('returns the normalized file and its source conversations from files.info', async () => {
+    const calls: unknown[] = [];
+    const connector = new SlackConnector({ bot_token: 'xoxb-test' });
+    (connector as unknown as { web: unknown }).web = {
+      files: {
+        info: async (args: unknown) => {
+          calls.push(args);
+          return {
+            ok: true,
+            file: {
+              ...slackFile,
+              permalink: 'https://x.slack.com/p',
+              channels: ['C123', 'C456'],
+              groups: ['G789'],
+              ims: ['D999'],
+            },
+          };
+        },
+      },
+    };
+
+    await expect(connector.getFileInfo('F123')).resolves.toEqual({
+      file: slackFile,
+      sourceConversationIds: ['C123', 'C456', 'G789', 'D999'],
+    });
+    expect(calls).toEqual([{ file: 'F123' }]);
+  });
+
+  it('returns empty source conversations when files.info omits or malforms them', async () => {
+    const connector = new SlackConnector({ bot_token: 'xoxb-test' });
+    (connector as unknown as { web: unknown }).web = {
+      files: { info: async () => ({ ok: true, file: { ...slackFile, channels: 'C123' } }) },
+    };
+
+    await expect(connector.getFileInfo('F123')).resolves.toEqual({
+      file: slackFile,
+      sourceConversationIds: [],
+    });
+  });
+
+  it('throws a Slack API error on a non-ok files.info response', async () => {
+    const connector = new SlackConnector({ bot_token: 'xoxb-test' });
+    (connector as unknown as { web: unknown }).web = {
+      files: { info: async () => ({ ok: false, error: 'file_not_found' }) },
+    };
+
+    await expect(connector.getFileInfo('F123')).rejects.toThrow('Slack API error: file_not_found');
+  });
+
+  it('throws when files.info returns a malformed file object', async () => {
+    const connector = new SlackConnector({ bot_token: 'xoxb-test' });
+    (connector as unknown as { web: unknown }).web = {
+      files: { info: async () => ({ ok: true, file: { id: 'F123', name: 'error.log' } }) },
+    };
+
+    await expect(connector.getFileInfo('F123')).rejects.toThrow('no downloadable file for F123');
+  });
+});
+
+describe('SlackConnector.fetchChannelHistory', () => {
+  it('sanitizes thrown Slack channel-history SDK errors before returning them', async () => {
+    const connector = new SlackConnector({ bot_token: 'xoxb-test' });
+    (connector as unknown as { web: unknown }).web = {
+      conversations: {
+        history: async () => {
+          throw new Error('xoxb-leaked-token https://slack.example.test/api /srv/agor/private-key');
+        },
+      },
+    };
+
+    const result = connector.fetchChannelHistory({ channelId: 'C123' });
+    await expect(result).rejects.toThrow(/redacted|provider-url|path/);
+    await expect(result).rejects.not.toThrow('xoxb-leaked-token');
+  });
+
+  it('normalizes newest-first channel history into chronological order and filters bots', async () => {
+    const calls: Array<{ method: string; args: unknown }> = [];
+    const connector = new SlackConnector({ bot_token: 'xoxb-test' });
+    (connector as unknown as { botUserId: string }).botUserId = 'U_BOT';
+    (connector as unknown as { web: unknown }).web = {
+      conversations: {
+        history: async (args: unknown) => {
+          calls.push({ method: 'history', args });
+          return {
+            ok: true,
+            has_more: false,
+            messages: [
+              { ts: '1700000002.000000', user: 'U2', text: '<@U_BOT> newest' },
+              { ts: '1700000001.000000', bot_id: 'B1', text: 'bot output' },
+              { ts: '1700000000.000000', user: 'U1', text: 'oldest' },
+            ],
+          };
+        },
+      },
+      users: {
+        info: async ({ user }: { user: string }) => ({
+          ok: true,
+          user: { profile: { display_name: user === 'U1' ? 'Alice' : 'Bob' } },
+        }),
+      },
+    };
+
+    const history = await connector.fetchChannelHistory({
+      channelId: 'C123',
+      oldestTs: '1699999999.000000',
+      latestTs: '1700000002.000000',
+      inclusive: true,
+      limit: 50,
+    });
+
+    expect(calls[0]).toEqual({
+      method: 'history',
+      args: {
+        channel: 'C123',
+        limit: 200,
+        oldest: '1699999999.000000',
+        latest: '1700000002.000000',
+        inclusive: true,
+      },
+    });
+    expect(history.channel).toBe('C123');
+    expect(history.has_more).toBe(false);
+    expect(history.messages.map((message) => message.text)).toEqual(['oldest', '<@U_BOT> newest']);
+    expect(history.messages[1]).toMatchObject({
+      user_id: 'U2',
+      user_name: 'Bob',
+      is_bot: false,
+      is_mention: true,
+      is_trigger: false,
+    });
+  });
+
+  it('keeps the most recent matches when the limit truncates', async () => {
+    const connector = new SlackConnector({ bot_token: 'xoxb-test' });
+    (connector as unknown as { web: unknown }).web = {
+      conversations: {
+        history: async () => ({
+          ok: true,
+          has_more: false,
+          messages: [
+            { ts: '1700000002.000000', user: 'U1', text: 'newest' },
+            { ts: '1700000001.000000', user: 'U1', text: 'middle' },
+            { ts: '1700000000.000000', user: 'U1', text: 'oldest' },
+          ],
+        }),
+      },
+      users: {
+        info: async () => ({ ok: true, user: { profile: { display_name: 'Alice' } } }),
+      },
+    };
+
+    const history = await connector.fetchChannelHistory({ channelId: 'C123', limit: 2 });
+
+    expect(history.messages.map((message) => message.text)).toEqual(['middle', 'newest']);
+    expect(history.has_more).toBe(true);
+  });
+
+  it('enforces the allowed_channel_ids whitelist', async () => {
+    const connector = new SlackConnector({
+      bot_token: 'xoxb-test',
+      allowed_channel_ids: ['C_ALLOWED'],
+    });
+    let apiCalled = false;
+    (connector as unknown as { web: unknown }).web = {
+      conversations: {
+        history: async () => {
+          apiCalled = true;
+          return { ok: true, messages: [] };
+        },
+      },
+    };
+
+    await expect(connector.fetchChannelHistory({ channelId: 'C_OTHER' })).rejects.toThrow(
+      /allowed_channel_ids/
+    );
+    expect(apiCalled).toBe(false);
+
+    const allowed = await connector.fetchChannelHistory({ channelId: 'C_ALLOWED' });
+    expect(allowed.messages).toEqual([]);
+    expect(apiCalled).toBe(true);
+  });
+});
+
+// Mirrors SECTION_MAX_CHARS in slack.ts; kept in the test as a lower-bound
+// sanity check (we expect the legacy mrkdwn fallback to carry more than this).
+const SECTION_MAX_CHARS_TEST = 3000;
+
+describe('SlackConnector.sendMessage', () => {
+  it('attaches supported message metadata to the initial post, not a false client_msg_id', async () => {
+    const posts: unknown[] = [];
+    const updates: unknown[] = [];
+    const connector = new SlackConnector({ bot_token: 'xoxb-test' });
+    (connector as unknown as { web: unknown }).web = {
+      chat: {
+        postMessage: async (args: unknown) => {
+          posts.push(args);
+          return { ok: true, ts: '1700000000.000001' };
+        },
+        update: async (args: unknown) => {
+          updates.push(args);
+          return { ok: true, ts: '1700000000.000001' };
+        },
+      },
+    };
+
+    await connector.sendMessage({
+      threadId: 'C123-1700000000.000000',
+      text: 'Reconnect required',
+      metadata: {
+        slack_message_metadata: {
+          event_type: 'agor_mcp_recovery',
+          event_payload: { delivery_id: 'delivery-1' },
+        },
+      },
+    });
+    await connector.sendMessage({
+      threadId: 'C123-1700000000.000000',
+      text: 'Recovered',
+      metadata: {
+        slack_update_ts: '1700000000.000001',
+      },
+    });
+
+    expect(posts).toEqual([
+      expect.objectContaining({
+        channel: 'C123',
+        thread_ts: '1700000000.000000',
+        metadata: {
+          event_type: 'agor_mcp_recovery',
+          event_payload: { delivery_id: 'delivery-1' },
+        },
+      }),
+    ]);
+    expect(updates).toEqual([
+      expect.objectContaining({ channel: 'C123', ts: '1700000000.000001' }),
+    ]);
+    expect(posts[0]).not.toHaveProperty('client_msg_id');
+    expect(updates[0]).not.toHaveProperty('metadata');
+  });
+
+  it('stamps every Agor lane it can reconcile, and refuses metadata it cannot', async () => {
+    // The connect lane posts under its own `event_type`, and
+    // `findMessageByMetadata` matches on exactly that value. A stamp that only
+    // recognised the recovery lane would post the connect card bare, so a
+    // daemon that crashed between the post and recording its `ts` would post a
+    // second card with a second live Connect button rather than finding the
+    // first. Found by driving the real projection, not by a unit test.
+    const posts: Array<{ metadata?: unknown }> = [];
+    const connector = new SlackConnector({ bot_token: 'xoxb-test' });
+    (connector as unknown as { web: unknown }).web = {
+      chat: {
+        postMessage: async (args: unknown) => {
+          posts.push(args as { metadata?: unknown });
+          return { ok: true, ts: '1700000000.000009' };
+        },
+      },
+    };
+
+    const post = (eventType: string, deliveryId: unknown) =>
+      connector.sendMessage({
+        threadId: 'C123-1700000000.000000',
+        text: 'Connect Notion',
+        metadata: {
+          slack_message_metadata: {
+            event_type: eventType,
+            event_payload: { delivery_id: deliveryId },
+          },
+        },
+      });
+
+    await post('agor_mcp_connect', 'delivery-connect');
+    await post('agor_mcp_recovery', 'delivery-recovery');
+    // Not an Agor lane, so Slack never sees it: the allowlist exists because
+    // the metadata request comes from a caller and Slack rejects unknown shapes.
+    await post('something_else', 'delivery-3');
+    // An Agor lane with an unusable payload is still dropped.
+    await post('agor_mcp_connect', 42);
+    await post('agor_mcp_connect', 'd'.repeat(129));
+
+    expect(posts.map((p) => p.metadata)).toEqual([
+      { event_type: 'agor_mcp_connect', event_payload: { delivery_id: 'delivery-connect' } },
+      { event_type: 'agor_mcp_recovery', event_payload: { delivery_id: 'delivery-recovery' } },
+      undefined,
+      undefined,
+      undefined,
+    ]);
+    // Whatever a lane stamps must be a value the reconciliation read can name.
+    expect([...SLACK_AGOR_MESSAGE_METADATA_EVENT_TYPES]).toEqual([
+      'agor_mcp_recovery',
+      'agor_mcp_connect',
+    ]);
+  });
+
+  it('reconciles one bounded ambiguous post by durable Slack metadata', async () => {
+    const calls: unknown[] = [];
+    const connector = new SlackConnector({
+      bot_token: 'xoxb-test',
+      allowed_channel_ids: ['C123'],
+    });
+    (connector as unknown as { web: unknown }).web = {
+      conversations: {
+        replies: async (args: unknown) => {
+          calls.push(args);
+          return {
+            ok: true,
+            messages: [
+              { ts: '1.1', metadata: { event_type: 'other', event_payload: {} } },
+              {
+                ts: '1.2',
+                metadata: {
+                  event_type: 'agor_mcp_recovery',
+                  event_payload: { delivery_id: 'delivery-1' },
+                },
+              },
+            ],
+          };
+        },
+      },
+    };
+
+    await expect(
+      connector.findMessageByMetadata({
+        threadId: 'C123-1.0',
+        eventType: 'agor_mcp_recovery',
+        payloadKey: 'delivery_id',
+        payloadValue: 'delivery-1',
+        limit: 500,
+      })
+    ).resolves.toBe('1.2');
+    expect(calls).toEqual([{ channel: 'C123', ts: '1.0', limit: 100, include_all_metadata: true }]);
+    await expect(
+      connector.findMessageByMetadata({
+        threadId: 'C_OTHER-1.0',
+        eventType: 'agor_mcp_recovery',
+        payloadKey: 'delivery_id',
+        payloadValue: 'delivery-1',
+      })
+    ).rejects.toThrow(/allowlist/);
+    expect(calls).toHaveLength(1);
+  });
+
+  it('updates an existing Slack message when slack_update_ts metadata is present', async () => {
+    const calls: unknown[] = [];
+    const connector = new SlackConnector({ bot_token: 'xoxb-test' });
+    (connector as unknown as { web: unknown }).web = {
+      chat: {
+        update: async (args: unknown) => {
+          calls.push(args);
+          return { ok: true, ts: '1700000000.000001' };
+        },
+        postMessage: async () => {
+          throw new Error('postMessage should not be called for status updates');
+        },
+      },
+    };
+
+    const ts = await connector.sendMessage({
+      threadId: 'C123-1700000000.000000',
+      text: 'still working',
+      metadata: { slack_update_ts: '1700000000.000001' },
+    });
+
+    expect(ts).toBe('1700000000.000001');
+    expect(calls).toEqual([
+      {
+        channel: 'C123',
+        ts: '1700000000.000001',
+        text: 'still working',
+        unfurl_links: false,
+        unfurl_media: false,
+      },
+    ]);
+  });
+
+  it('falls back to text when Slack rejects newer block types', async () => {
+    const calls: unknown[] = [];
+    const connector = new SlackConnector({ bot_token: 'xoxb-test' });
+    (connector as unknown as { web: unknown }).web = {
+      chat: {
+        postMessage: async (args: unknown) => {
+          calls.push(args);
+          if ((args as { blocks?: unknown[] }).blocks) {
+            return { ok: false, error: 'unsupported_block_type' };
+          }
+          return { ok: true, ts: '1700000000.000004' };
+        },
+      },
+    };
+
+    const ts = await connector.sendMessage({
+      threadId: 'C123-1700000000.000000',
+      text: '*Plan*\n○ Test\n⏳ Still working',
+      blocks: [{ type: 'plan', tasks: [] }],
+    });
+
+    expect(ts).toBe('1700000000.000004');
+    expect(calls).toHaveLength(2);
+    expect((calls[0] as { blocks?: unknown[] }).blocks).toBeDefined();
+    expect((calls[1] as { blocks?: unknown[] }).blocks).toBeUndefined();
+  });
+
+  it('mirrors message streams with Slack chat stream methods', async () => {
+    const calls: Array<{ method: string; args: unknown }> = [];
+    const connector = new SlackConnector({ bot_token: 'xoxb-test' });
+    (connector as unknown as { web: unknown }).web = {
+      chat: {
+        startStream: async (args: unknown) => {
+          calls.push({ method: 'startStream', args });
+          return { ok: true, ts: '1700000000.000002' };
+        },
+        appendStream: async (args: unknown) => {
+          calls.push({ method: 'appendStream', args });
+          return { ok: true };
+        },
+        stopStream: async (args: unknown) => {
+          calls.push({ method: 'stopStream', args });
+          return { ok: true };
+        },
+      },
+    };
+
+    const ts = await connector.startStream({ threadId: 'C123-1700000000.000000' });
+    await connector.appendStream({
+      threadId: 'C123-1700000000.000000',
+      ts,
+      text: 'hello',
+    });
+    await connector.stopStream({ threadId: 'C123-1700000000.000000', ts });
+
+    expect(calls).toEqual([
+      {
+        method: 'startStream',
+        args: {
+          channel: 'C123',
+          thread_ts: '1700000000.000000',
+          markdown_text: ' ',
+        },
+      },
+      {
+        method: 'appendStream',
+        args: {
+          channel: 'C123',
+          ts: '1700000000.000002',
+          markdown_text: 'hello',
+        },
+      },
+      {
+        method: 'stopStream',
+        args: {
+          channel: 'C123',
+          ts: '1700000000.000002',
+        },
+      },
+    ]);
+  });
+
+  it('passes Slack stream recipient ids when provided', async () => {
+    const calls: unknown[] = [];
+    const connector = new SlackConnector({ bot_token: 'xoxb-test' });
+    (connector as unknown as { web: unknown }).web = {
+      chat: {
+        startStream: async (args: unknown) => {
+          calls.push(args);
+          return { ok: true, ts: '1700000000.000005' };
+        },
+      },
+    };
+
+    await connector.startStream({
+      threadId: 'C123-1700000000.000000',
+      text: 'hello',
+      recipientUserId: 'U123',
+      recipientTeamId: 'T123',
+    });
+
+    expect(calls).toEqual([
+      {
+        channel: 'C123',
+        thread_ts: '1700000000.000000',
+        markdown_text: 'hello',
+        recipient_user_id: 'U123',
+        recipient_team_id: 'T123',
+      },
+    ]);
+  });
+
+  it('sets Slack assistant thread status', async () => {
+    const calls: unknown[] = [];
+    const connector = new SlackConnector({ bot_token: 'xoxb-test' });
+    (connector as unknown as { web: unknown }).web = {
+      assistant: {
+        threads: {
+          setStatus: async (args: unknown) => {
+            calls.push(args);
+            return { ok: true };
+          },
+        },
+      },
+    };
+
+    await connector.setThreadStatus?.({
+      threadId: 'C123-1700000000.000000',
+      status: 'is working on your request.',
+      loadingMessages: ['Reading context…'],
+      iconEmoji: ':hourglass_flowing_sand:',
+    });
+
+    expect(calls).toEqual([
+      {
+        channel_id: 'C123',
+        thread_ts: '1700000000.000000',
+        status: 'is working on your request.',
+        loading_messages: ['Reading context…'],
+        icon_emoji: ':hourglass_flowing_sand:',
+      },
+    ]);
+  });
+
+  it('deletes a previously sent Slack message', async () => {
+    const calls: unknown[] = [];
+    const connector = new SlackConnector({ bot_token: 'xoxb-test' });
+    (connector as unknown as { web: unknown }).web = {
+      chat: {
+        delete: async (args: unknown) => {
+          calls.push(args);
+          return { ok: true };
+        },
+      },
+    };
+
+    await connector.deleteMessage({
+      threadId: 'C123-1700000000.000000',
+      messageId: '1700000000.000003',
+    });
+
+    expect(calls).toEqual([
+      {
+        channel: 'C123',
+        ts: '1700000000.000003',
+      },
+    ]);
+  });
+});
+
+describe('SlackConnector.addReaction / removeReaction', () => {
+  it('adds a reaction via reactions.add', async () => {
+    const calls: unknown[] = [];
+    const connector = new SlackConnector({ bot_token: 'xoxb-test' });
+    (connector as unknown as { web: unknown }).web = {
+      reactions: {
+        add: async (args: unknown) => {
+          calls.push(args);
+          return { ok: true };
+        },
+      },
+    };
+
+    await connector.addReaction({ channel: 'C123', timestamp: '1700000000.000001', name: 'eyes' });
+
+    expect(calls).toEqual([{ channel: 'C123', timestamp: '1700000000.000001', name: 'eyes' }]);
+  });
+
+  it('removes a reaction via reactions.remove', async () => {
+    const calls: unknown[] = [];
+    const connector = new SlackConnector({ bot_token: 'xoxb-test' });
+    (connector as unknown as { web: unknown }).web = {
+      reactions: {
+        remove: async (args: unknown) => {
+          calls.push(args);
+          return { ok: true };
+        },
+      },
+    };
+
+    await connector.removeReaction({
+      channel: 'C123',
+      timestamp: '1700000000.000001',
+      name: 'eyes',
+    });
+
+    expect(calls).toEqual([{ channel: 'C123', timestamp: '1700000000.000001', name: 'eyes' }]);
+  });
+
+  it('throws a Slack API error when reactions.add fails', async () => {
+    const connector = new SlackConnector({ bot_token: 'xoxb-test' });
+    (connector as unknown as { web: unknown }).web = {
+      reactions: {
+        add: async () => ({ ok: false, error: 'already_reacted' }),
+      },
+    };
+
+    await expect(
+      connector.addReaction({ channel: 'C123', timestamp: '1700000000.000001', name: 'eyes' })
+    ).rejects.toThrow('already_reacted');
+  });
+
+  it('throws a Slack API error when reactions.remove fails', async () => {
+    const connector = new SlackConnector({ bot_token: 'xoxb-test' });
+    (connector as unknown as { web: unknown }).web = {
+      reactions: {
+        remove: async () => ({ ok: false, error: 'no_reaction' }),
+      },
+    };
+
+    await expect(
+      connector.removeReaction({ channel: 'C123', timestamp: '1700000000.000001', name: 'eyes' })
+    ).rejects.toThrow('no_reaction');
+  });
+});
+
+describe('SlackConnector.uploadFile', () => {
+  it('uploads a file via files.uploadV2', async () => {
+    const calls: unknown[] = [];
+    const connector = new SlackConnector({ bot_token: 'xoxb-test' });
+    (connector as unknown as { web: unknown }).web = {
+      files: {
+        uploadV2: async (args: unknown) => {
+          calls.push(args);
+          return {
+            ok: true,
+            files: [{ id: 'F123', permalink: 'https://slack.example/files/F123', name: 'a.png' }],
+          };
+        },
+      },
+    };
+
+    const result = await connector.uploadFile({
+      channel: 'C123',
+      file: Buffer.from('bytes'),
+      filename: 'a.png',
+    });
+
+    expect(calls).toEqual([{ channel_id: 'C123', file: Buffer.from('bytes'), filename: 'a.png' }]);
+    expect(result).toEqual({
+      id: 'F123',
+      permalink: 'https://slack.example/files/F123',
+      name: 'a.png',
+    });
+  });
+
+  it('passes thread_ts and initial_comment when provided', async () => {
+    const calls: unknown[] = [];
+    const connector = new SlackConnector({ bot_token: 'xoxb-test' });
+    (connector as unknown as { web: unknown }).web = {
+      files: {
+        uploadV2: async (args: unknown) => {
+          calls.push(args);
+          return { ok: true, files: [{ id: 'F456', name: 'b.png' }] };
+        },
+      },
+    };
+
+    await connector.uploadFile({
+      channel: 'C123',
+      threadTs: '1700000000.000001',
+      file: Buffer.from('bytes'),
+      filename: 'b.png',
+      comment: 'here you go',
+    });
+
+    expect(calls).toEqual([
+      {
+        channel_id: 'C123',
+        thread_ts: '1700000000.000001',
+        file: Buffer.from('bytes'),
+        filename: 'b.png',
+        initial_comment: 'here you go',
+      },
+    ]);
+  });
+
+  it('throws a Slack API error when the upload fails', async () => {
+    const connector = new SlackConnector({ bot_token: 'xoxb-test' });
+    (connector as unknown as { web: unknown }).web = {
+      files: {
+        uploadV2: async () => ({ ok: false, error: 'invalid_channel' }),
+      },
+    };
+
+    await expect(
+      connector.uploadFile({ channel: 'C123', file: Buffer.from('x'), filename: 'a.png' })
+    ).rejects.toThrow('invalid_channel');
+  });
+});
+
+describe('SlackConnector.lookupUserAvatarByEmail', () => {
+  it('treats Slack users_not_found platform errors as a skipped lookup', async () => {
+    const connector = new SlackConnector({ bot_token: 'xoxb-test' });
+    (connector as unknown as { web: { users: { lookupByEmail: unknown } } }).web = {
+      users: {
+        lookupByEmail: async () => {
+          const error = new Error('users_not_found') as Error & { data?: { error?: string } };
+          error.data = { error: 'users_not_found' };
+          throw error;
+        },
+      },
+    };
+
+    await expect(connector.lookupUserAvatarByEmail('missing@example.com')).resolves.toBeNull();
+  });
+});
+
+describe('isChannelAllowedByWhitelist', () => {
+  const whitelist = ['C123'];
+
+  it('always accepts DMs even when a channel whitelist is configured', () => {
+    expect(isChannelAllowedByWhitelist('im', 'D999', whitelist)).toBe(true);
+  });
+
+  it('rejects a channel-like surface not in the whitelist', () => {
+    expect(isChannelAllowedByWhitelist('channel', 'C999', whitelist)).toBe(false);
+  });
+
+  it('accepts a channel-like surface that is in the whitelist', () => {
+    expect(isChannelAllowedByWhitelist('channel', 'C123', whitelist)).toBe(true);
+  });
+
+  it('applies the whitelist to private channels and group DMs', () => {
+    expect(isChannelAllowedByWhitelist('group', 'C999', whitelist)).toBe(false);
+    expect(isChannelAllowedByWhitelist('mpim', 'C999', whitelist)).toBe(false);
+  });
+
+  it('accepts everything when no whitelist is configured', () => {
+    expect(isChannelAllowedByWhitelist('channel', 'C999', undefined)).toBe(true);
+    expect(isChannelAllowedByWhitelist('channel', 'C999', [])).toBe(true);
+  });
+});
+
+describe('isSlackDirectMessageId', () => {
+  it('treats D-prefixed ids as direct messages', () => {
+    expect(isSlackDirectMessageId('D123ABC')).toBe(true);
+  });
+
+  it('treats C/G-prefixed and other ids as not a direct message', () => {
+    expect(isSlackDirectMessageId('C123ABC')).toBe(false);
+    expect(isSlackDirectMessageId('G123ABC')).toBe(false);
+  });
+});
+
+describe('isSlackWriteTargetAllowed', () => {
+  it('always allows DMs even when a channel whitelist is configured', () => {
+    expect(isSlackWriteTargetAllowed({ allowed_channel_ids: ['C123'] }, 'D999')).toBe(true);
+  });
+
+  it('denies a channel-like target not in the whitelist', () => {
+    expect(isSlackWriteTargetAllowed({ allowed_channel_ids: ['C123'] }, 'C999')).toBe(false);
+  });
+
+  it('allows a channel-like target that is in the whitelist', () => {
+    expect(isSlackWriteTargetAllowed({ allowed_channel_ids: ['C123'] }, 'C123')).toBe(true);
+  });
+
+  it('allows everything when no whitelist is configured', () => {
+    expect(isSlackWriteTargetAllowed({}, 'C999')).toBe(true);
+    expect(isSlackWriteTargetAllowed({ allowed_channel_ids: [] }, 'C999')).toBe(true);
+  });
+});
+
+describe('isSlackFileSourceAllowed', () => {
+  const restricted = { allowed_channel_ids: ['C123'] };
+
+  it('allows a file shared in a whitelisted channel', () => {
+    expect(isSlackFileSourceAllowed(restricted, ['C999', 'C123'])).toBe(true);
+  });
+
+  it('denies a file whose only sources are non-whitelisted channels', () => {
+    expect(isSlackFileSourceAllowed(restricted, ['C999', 'G777'])).toBe(false);
+  });
+
+  it('allows a file shared in a DM even when a whitelist is configured', () => {
+    expect(isSlackFileSourceAllowed(restricted, ['D999'])).toBe(true);
+  });
+
+  it('denies a file with no visible source conversations when a whitelist is configured', () => {
+    expect(isSlackFileSourceAllowed(restricted, [])).toBe(false);
+  });
+
+  it('allows everything, including source-less files, when no whitelist is configured', () => {
+    expect(isSlackFileSourceAllowed({}, ['C999'])).toBe(true);
+    expect(isSlackFileSourceAllowed({}, [])).toBe(true);
+    expect(isSlackFileSourceAllowed({ allowed_channel_ids: [] }, [])).toBe(true);
+  });
+});
+
+describe('SlackConnector.testConnection', () => {
+  /**
+   * Build a connector with mocked bot (`this.web`) and app-token
+   * (`createWebClient`) clients so the probe never touches the network.
+   */
+  function makeProbeConnector(args: {
+    config?: Record<string, unknown>;
+    authTest?: () => Promise<unknown>;
+    appConnectionsOpen?: () => Promise<unknown>;
+    conversationsInfo?: () => Promise<unknown>;
+    capture?: { appToken?: string };
+  }) {
+    const connector = new SlackConnector({ bot_token: 'xoxb-test', ...args.config });
+    (connector as unknown as { web: unknown }).web = {
+      auth: {
+        test:
+          args.authTest ??
+          (async () => ({
+            ok: true,
+            team_id: 'T1',
+            team: 'Acme',
+            user_id: 'U1',
+            user: 'agor-bot',
+          })),
+      },
+      conversations: {
+        info: args.conversationsInfo ?? (async () => ({ ok: true, channel: { id: 'C1' } })),
+      },
+    };
+    (connector as unknown as { createWebClient: (t: string) => unknown }).createWebClient = (
+      token: string
+    ) => {
+      if (args.capture) args.capture.appToken = token;
+      return {
+        apps: {
+          connections: {
+            open: args.appConnectionsOpen ?? (async () => ({ ok: true, url: 'wss://example' })),
+          },
+        },
+      };
+    };
+    return connector;
+  }
+
+  it('reports ok on the happy path (bot + app token + channel)', async () => {
+    const capture: { appToken?: string } = {};
+    const connector = makeProbeConnector({
+      config: { app_token: 'xapp-test', allowed_channel_ids: ['C1'] },
+      capture,
+    });
+    const result = await connector.testConnection();
+
+    expect(result.ok).toBe(true);
+    expect(result.team).toEqual({ id: 'T1', name: 'Acme' });
+    expect(result.bot).toEqual({ userId: 'U1', name: 'agor-bot' });
+    expect(result.appTokenValid).toBe(true);
+    expect(result.channelAccess).toEqual([{ channelId: 'C1', ok: true }]);
+    expect(result.failures).toEqual([]);
+    expect(result.notVerifiable.length).toBeGreaterThan(0);
+    // The app-token client must be built from the app-level token, not the bot token.
+    expect(capture.appToken).toBe('xapp-test');
+  });
+
+  it('classifies invalid_auth bot-token failures', async () => {
+    const connector = makeProbeConnector({
+      config: { app_token: 'xapp-test' },
+      authTest: async () => {
+        throw { data: { ok: false, error: 'invalid_auth' } };
+      },
+    });
+    const result = await connector.testConnection();
+
+    expect(result.ok).toBe(false);
+    expect(result.team).toBeUndefined();
+    const failure = result.failures.find((f) => f.capability === 'bot_token');
+    expect(failure?.slackError).toBe('invalid_auth');
+    expect(failure?.reason).toMatch(/invalid/i);
+  });
+
+  it('surfaces missing_scope needed/provided verbatim', async () => {
+    const connector = makeProbeConnector({
+      config: { app_token: 'xapp-test', allowed_channel_ids: ['C1'] },
+      conversationsInfo: async () => {
+        throw {
+          data: {
+            ok: false,
+            error: 'missing_scope',
+            needed: 'channels:read',
+            provided: 'chat:write',
+          },
+        };
+      },
+    });
+    const result = await connector.testConnection();
+
+    expect(result.ok).toBe(false);
+    const failure = result.failures.find((f) => f.capability === 'channel_access');
+    expect(failure?.slackError).toBe('missing_scope');
+    expect(failure?.needed).toBe('channels:read');
+    expect(failure?.provided).toBe('chat:write');
+  });
+
+  it('reports app-token failures from apps.connections.open', async () => {
+    const connector = makeProbeConnector({
+      config: { app_token: 'xapp-bad' },
+      appConnectionsOpen: async () => ({ ok: false, error: 'invalid_auth' }),
+    });
+    const result = await connector.testConnection();
+
+    expect(result.ok).toBe(false);
+    expect(result.appTokenValid).toBe(false);
+    const failure = result.failures.find((f) => f.capability === 'app_token');
+    expect(failure?.slackError).toBe('invalid_auth');
+  });
+
+  it('reports a missing app token as an app_token failure', async () => {
+    const connector = makeProbeConnector({ config: {} });
+    const result = await connector.testConnection();
+
+    expect(result.ok).toBe(false);
+    expect(result.appTokenValid).toBe(false);
+    expect(result.failures.some((f) => f.capability === 'app_token')).toBe(true);
+  });
+
+  it('catches restricted-channel not_in_channel errors', async () => {
+    const connector = makeProbeConnector({
+      config: { app_token: 'xapp-test', allowed_channel_ids: ['C1'] },
+      conversationsInfo: async () => {
+        throw { data: { ok: false, error: 'not_in_channel' } };
+      },
+    });
+    const result = await connector.testConnection();
+
+    expect(result.ok).toBe(false);
+    expect(result.channelAccess).toEqual([{ channelId: 'C1', ok: false }]);
+    const failure = result.failures.find((f) => f.capability === 'channel_access');
+    expect(failure?.slackError).toBe('not_in_channel');
+    expect(failure?.reason).toMatch(/not a member/i);
+  });
+});
+
+describe('SlackConnector.getAppInfo', () => {
+  /** Build a connector with a mocked bot web client so no network is touched. */
+  function makeAppInfoConnector(args: {
+    authTest?: () => Promise<unknown>;
+    botsInfo?: (params: { bot: string }) => Promise<unknown>;
+    capture?: { botsInfoParams?: { bot: string } };
+  }) {
+    const connector = new SlackConnector({ bot_token: 'xoxb-secret-token' });
+    (connector as unknown as { web: unknown }).web = {
+      auth: {
+        test:
+          args.authTest ?? (async () => ({ ok: true, team_id: 'T1', user_id: 'U1', bot_id: 'B1' })),
+      },
+      bots: {
+        info: async (params: { bot: string }) => {
+          if (args.capture) args.capture.botsInfoParams = params;
+          return args.botsInfo
+            ? args.botsInfo(params)
+            : { ok: true, bot: { id: params.bot, app_id: 'A123' } };
+        },
+      },
+    };
+    return connector;
+  }
+
+  it('resolves appId + teamId via auth.test → bots.info', async () => {
+    const capture: { botsInfoParams?: { bot: string } } = {};
+    const connector = makeAppInfoConnector({ capture });
+
+    const result = await connector.getAppInfo();
+
+    expect(result).toEqual({ appId: 'A123', teamId: 'T1' });
+    // bots.info must be queried with the bot id auth.test reported.
+    expect(capture.botsInfoParams).toEqual({ bot: 'B1' });
+  });
+
+  it('returns nulls without throwing when auth.test fails', async () => {
+    const connector = makeAppInfoConnector({
+      authTest: async () => {
+        throw { data: { ok: false, error: 'invalid_auth' } };
+      },
+    });
+
+    await expect(connector.getAppInfo()).resolves.toEqual({ appId: null, teamId: null });
+  });
+
+  it('keeps teamId but yields null appId when bots.info throws', async () => {
+    const connector = makeAppInfoConnector({
+      botsInfo: async () => {
+        throw { data: { ok: false, error: 'bot_not_found' } };
+      },
+    });
+
+    await expect(connector.getAppInfo()).resolves.toEqual({ appId: null, teamId: 'T1' });
+  });
+
+  it('yields null appId on a non-OK bots.info response', async () => {
+    const connector = makeAppInfoConnector({
+      botsInfo: async () => ({ ok: false, error: 'bot_not_found' }),
+    });
+
+    await expect(connector.getAppInfo()).resolves.toEqual({ appId: null, teamId: 'T1' });
+  });
+
+  it('yields null appId when an OK bots.info response carries no app_id', async () => {
+    const connector = makeAppInfoConnector({
+      botsInfo: async (params) => ({ ok: true, bot: { id: params.bot } }),
+    });
+
+    await expect(connector.getAppInfo()).resolves.toEqual({ appId: null, teamId: 'T1' });
+  });
+
+  it('yields null appId when auth.test carries no bot_id', async () => {
+    const connector = makeAppInfoConnector({
+      authTest: async () => ({ ok: true, team_id: 'T1', user_id: 'U1' }),
+    });
+
+    await expect(connector.getAppInfo()).resolves.toEqual({ appId: null, teamId: 'T1' });
+  });
+
+  it('never includes token material in the result', async () => {
+    const result = await makeAppInfoConnector({}).getAppInfo();
+    const serialized = JSON.stringify(result);
+
+    expect(serialized).not.toContain('xoxb');
+    expect(serialized).not.toContain('secret');
+  });
+});
+
+describe('extractSlackInboundFiles', () => {
+  const slackFile = {
+    id: 'F123',
+    name: 'screenshot.png',
+    mimetype: 'image/png',
+    size: 2048,
+    url_private_download: 'https://files.slack.com/files-pri/T1-F123/download/screenshot.png',
+  };
+
+  it('maps well-formed Slack file objects and drops extra fields', () => {
+    const raw = [{ ...slackFile, permalink: 'https://x.slack.com/p', user: 'U1' }];
+    expect(extractSlackInboundFiles(raw)).toEqual([slackFile]);
+  });
+
+  it('drops malformed entries but keeps valid ones', () => {
+    const raw = [
+      null,
+      'not-an-object',
+      { ...slackFile, id: undefined },
+      { ...slackFile, size: '2048' },
+      { ...slackFile, url_private_download: undefined },
+      slackFile,
+    ];
+    expect(extractSlackInboundFiles(raw)).toEqual([slackFile]);
+  });
+
+  it('returns an empty array for non-array input', () => {
+    expect(extractSlackInboundFiles(undefined)).toEqual([]);
+    expect(extractSlackInboundFiles({})).toEqual([]);
+    expect(extractSlackInboundFiles('files')).toEqual([]);
+  });
+});

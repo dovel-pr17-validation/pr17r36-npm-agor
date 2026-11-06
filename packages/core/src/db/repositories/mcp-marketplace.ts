@@ -1,0 +1,409 @@
+/**
+ * Secret-free Marketplace overview projection.
+ *
+ * The MCP server configuration lives in one JSON column that also carries
+ * credentials. Selecting that column and redacting it afterwards would make a
+ * future missed field a credential disclosure. Every JSON value below is
+ * therefore extracted in SQL by name; the secret-bearing object is never part
+ * of a JavaScript result.
+ */
+
+import type {
+  MCPMarketplaceAttachment,
+  MCPMarketplaceCredential,
+  MCPMarketplaceOverview,
+  MCPMarketplaceServer,
+  MCPMarketplaceTool,
+  MCPServerID,
+  MCPSource,
+  SessionID,
+  SessionStatus,
+  ToolPermission,
+  UserID,
+} from '@agor/core/types';
+import { and, desc, eq, isNull, ne, or, sql } from 'drizzle-orm';
+import type { Database } from '../client';
+import { jsonExtract, select } from '../database-wrapper';
+import { branches, mcpServers, sessionMcpServers, sessions, userMcpOauthTokens } from '../schema';
+import { RepositoryError } from './base';
+import { visibleSessionReferenceAccessExists } from './branch-access';
+
+type SafeServerRow = {
+  session_count: number;
+  mcp_server_id: string;
+  owner_user_id: string | null;
+  name: string;
+  transport: MCPMarketplaceServer['transport'];
+  enabled: unknown;
+  source: MCPSource;
+  catalog_entry_name: string | null;
+  created_at: Date | string | number;
+  updated_at: Date | string | number | null;
+  display_name: unknown;
+  description: unknown;
+  tools_json: unknown;
+  capabilities_discovered_at: unknown;
+  permissions_json: unknown;
+  auth_type: unknown;
+  oauth_mode: unknown;
+  credential_configured: unknown;
+  credential_created_at: Date | string | number | null;
+  credential_updated_at: Date | string | number | null;
+  credential_expires_at: Date | string | number | null;
+  credential_refresh_status: unknown;
+  credential_has_access_token: unknown;
+  credential_has_refresh_token: unknown;
+};
+
+export type MCPMarketplaceOAuthAuthorityResolver = (
+  userId: UserID,
+  serverIds: readonly MCPServerID[],
+  options?: MCPMarketplaceOverviewOptions
+) => Promise<ReadonlyMap<MCPServerID, boolean>>;
+
+export interface MCPMarketplaceOverviewOptions {
+  /**
+   * Also list Shared (ownerless) servers. The daemon decides this from the
+   * same authority that lets the caller change a shared row; the repository
+   * only applies the answer.
+   */
+  includeShared?: boolean;
+}
+
+type SafeAttachmentRow = {
+  session_id: string;
+  mcp_server_id: string;
+  enabled: unknown;
+  added_at: Date | string | number;
+  session_title: unknown;
+  session_status: SessionStatus;
+  agentic_tool: MCPMarketplaceAttachment['agentic_tool'];
+  branch_id: string;
+  branch_name: string;
+};
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+function iso(value: Date | string | number | null | undefined): string | undefined {
+  if (value == null) return undefined;
+  const date = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
+}
+
+function parseJson(value: unknown): unknown {
+  if (typeof value !== 'string') return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return undefined;
+  }
+}
+
+function readPermissions(value: unknown): Record<string, ToolPermission> {
+  const parsed = parseJson(value);
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+  const permissions: Record<string, ToolPermission> = {};
+  for (const [name, permission] of Object.entries(parsed)) {
+    if (permission === 'allow' || permission === 'ask' || permission === 'deny') {
+      permissions[name] = permission;
+    }
+  }
+  return permissions;
+}
+
+function readTools(toolsValue: unknown, permissionsValue: unknown): MCPMarketplaceTool[] {
+  const parsed = parseJson(toolsValue);
+  if (!Array.isArray(parsed)) return [];
+  const permissions = readPermissions(permissionsValue);
+  const tools: MCPMarketplaceTool[] = [];
+  for (const candidate of parsed) {
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) continue;
+    const record = candidate as Record<string, unknown>;
+    if (typeof record.name !== 'string' || record.name.length === 0) continue;
+    tools.push({
+      name: record.name,
+      description: typeof record.description === 'string' ? record.description : '',
+      permission: permissions[record.name] ?? 'default',
+    });
+  }
+  return tools;
+}
+
+function credentialFrom(
+  row: SafeServerRow,
+  now: number,
+  oauthAuthority: ReadonlyMap<MCPServerID, boolean>
+): MCPMarketplaceCredential | undefined {
+  const method = row.auth_type;
+  if (method !== 'oauth' && method !== 'bearer' && method !== 'jwt') return undefined;
+
+  if (method !== 'oauth') {
+    return {
+      mcp_server_id: row.mcp_server_id as MCPServerID,
+      server_name: row.name,
+      ...(stringValue(row.display_name)
+        ? { server_display_name: stringValue(row.display_name) }
+        : {}),
+      method,
+      status: row.credential_configured ? 'configured' : 'not_connected',
+    };
+  }
+
+  const grantCreatedAt = iso(row.credential_created_at);
+  const grantUpdatedAt = iso(row.credential_updated_at);
+  const expiresAt = iso(row.credential_expires_at);
+  const expiresAtMs = expiresAt ? Date.parse(expiresAt) : undefined;
+  let detailStatus: NonNullable<MCPMarketplaceCredential['detail_status']>;
+  if (!grantCreatedAt) {
+    detailStatus = 'not_connected';
+  } else {
+    // This callback is the daemon's canonical binding/mode authority. When it
+    // is unavailable or fails, the closed projection fails safe rather than
+    // advertising a credential on the strength of timestamps alone.
+    const authorized = oauthAuthority.get(row.mcp_server_id as MCPServerID) === true;
+    const refreshStatus =
+      row.credential_refresh_status === 'refreshing' ||
+      row.credential_refresh_status === 'ambiguous'
+        ? row.credential_refresh_status
+        : row.credential_refresh_status === 'idle'
+          ? 'idle'
+          : 'invalid';
+    const accessUsable = Boolean(
+      row.credential_has_access_token &&
+        refreshStatus === 'idle' &&
+        (expiresAtMs === undefined || expiresAtMs > now)
+    );
+    const refreshable = Boolean(
+      row.credential_has_refresh_token &&
+        refreshStatus !== 'ambiguous' &&
+        refreshStatus !== 'invalid'
+    );
+
+    detailStatus = !authorized
+      ? 'reauthentication_required'
+      : refreshStatus === 'refreshing' && refreshable
+        ? 'refreshing'
+        : accessUsable
+          ? 'active'
+          : refreshable
+            ? 'refreshable'
+            : 'reauthentication_required';
+  }
+
+  const status: MCPMarketplaceCredential['status'] =
+    detailStatus === 'refreshing' || detailStatus === 'reauthentication_required'
+      ? 'attention'
+      : detailStatus === 'refreshable'
+        ? expiresAtMs !== undefined && expiresAtMs <= now
+          ? 'expired'
+          : 'active'
+        : detailStatus;
+
+  return {
+    mcp_server_id: row.mcp_server_id as MCPServerID,
+    server_name: row.name,
+    ...(stringValue(row.display_name)
+      ? { server_display_name: stringValue(row.display_name) }
+      : {}),
+    method,
+    oauth_mode: row.oauth_mode === 'shared' ? 'shared' : 'per_user',
+    status,
+    detail_status: detailStatus,
+    ...(expiresAt ? { expires_at: expiresAt } : {}),
+    ...(grantCreatedAt ? { created_at: grantCreatedAt } : {}),
+    ...(grantUpdatedAt ? { updated_at: grantUpdatedAt } : {}),
+  };
+}
+
+export class MCPMarketplaceRepository {
+  constructor(
+    private readonly db: Database,
+    private readonly isOAuthGrantAuthorized?: MCPMarketplaceOAuthAuthorityResolver
+  ) {}
+
+  async overviewForUser(
+    userId: UserID,
+    now = Date.now(),
+    options: MCPMarketplaceOverviewOptions = {}
+  ): Promise<MCPMarketplaceOverview> {
+    try {
+      // Another user's private row never appears here, admins included.
+      const listedServers = options.includeShared
+        ? or(eq(mcpServers.owner_user_id, userId), isNull(mcpServers.owner_user_id))!
+        : eq(mcpServers.owner_user_id, userId);
+      const displayName = jsonExtract(this.db, mcpServers.data, 'display_name');
+      const description = jsonExtract(this.db, mcpServers.data, 'description');
+      const tools = jsonExtract(this.db, mcpServers.data, 'tools');
+      const capabilitiesDiscoveredAt = jsonExtract(
+        this.db,
+        mcpServers.data,
+        'capabilities_discovered_at'
+      );
+      const permissions = jsonExtract(this.db, mcpServers.data, 'tool_permissions');
+      const authType = jsonExtract(this.db, mcpServers.data, 'auth.type');
+      const oauthMode = jsonExtract(this.db, mcpServers.data, 'auth.oauth_mode');
+      // Boolean presence only: SQL evaluates the secret-bearing fields but
+      // their values never enter a row returned to JavaScript.
+      const credentialConfigured = sql<boolean>`case
+        when ${authType} = 'bearer' then ${jsonExtract(this.db, mcpServers.data, 'auth.token')} is not null
+        when ${authType} = 'jwt' then ${jsonExtract(this.db, mcpServers.data, 'auth.jwt_config.api_secret')} is not null
+        else false
+      end`;
+      const sessionTitle = jsonExtract(this.db, sessions.data, 'title');
+
+      const serverRows = (await select(this.db, {
+        mcp_server_id: mcpServers.mcp_server_id,
+        owner_user_id: mcpServers.owner_user_id,
+        name: mcpServers.name,
+        session_count: sql<number>`(select count(*) from ${sessionMcpServers} where ${sessionMcpServers.mcp_server_id} = ${mcpServers.mcp_server_id})`,
+        transport: mcpServers.transport,
+        enabled: mcpServers.enabled,
+        source: mcpServers.source,
+        catalog_entry_name: mcpServers.catalog_entry_name,
+        created_at: mcpServers.created_at,
+        updated_at: mcpServers.updated_at,
+        display_name: displayName,
+        description,
+        tools_json: tools,
+        capabilities_discovered_at: capabilitiesDiscoveredAt,
+        permissions_json: permissions,
+        auth_type: authType,
+        oauth_mode: oauthMode,
+        credential_configured: credentialConfigured,
+        // OAuth metadata only. Token bytes, client registration, binding,
+        // resource, issuer, and endpoint columns are intentionally absent.
+        credential_created_at: userMcpOauthTokens.created_at,
+        credential_updated_at: userMcpOauthTokens.updated_at,
+        credential_expires_at: userMcpOauthTokens.oauth_token_expires_at,
+        credential_refresh_status: userMcpOauthTokens.refresh_status,
+        // Boolean presence only. Token bytes never enter this result row.
+        credential_has_access_token: sql<boolean>`${userMcpOauthTokens.oauth_access_token} is not null`,
+        credential_has_refresh_token: sql<boolean>`${userMcpOauthTokens.oauth_refresh_token} is not null`,
+      })
+        .from(mcpServers)
+        .leftJoin(
+          userMcpOauthTokens,
+          and(
+            eq(userMcpOauthTokens.mcp_server_id, mcpServers.mcp_server_id),
+            or(
+              and(eq(oauthMode, 'shared'), isNull(userMcpOauthTokens.user_id)),
+              and(
+                or(isNull(oauthMode), ne(oauthMode, 'shared')),
+                eq(userMcpOauthTokens.user_id, userId)
+              )
+            )
+          )
+        )
+        // Deliberately no admin exception for other users' private rows.
+        // Shared rows are listed only when the caller may manage them.
+        .where(listedServers)
+        .orderBy(desc(mcpServers.updated_at), desc(mcpServers.created_at))
+        .all()) as SafeServerRow[];
+
+      const attachmentRows = (await select(this.db, {
+        session_id: sessionMcpServers.session_id,
+        mcp_server_id: sessionMcpServers.mcp_server_id,
+        enabled: sessionMcpServers.enabled,
+        added_at: sessionMcpServers.added_at,
+        session_title: sessionTitle,
+        session_status: sessions.status,
+        agentic_tool: sessions.agentic_tool,
+        branch_id: branches.branch_id,
+        branch_name: branches.name,
+      })
+        .from(sessionMcpServers)
+        .innerJoin(mcpServers, eq(mcpServers.mcp_server_id, sessionMcpServers.mcp_server_id))
+        .innerJoin(sessions, eq(sessions.session_id, sessionMcpServers.session_id))
+        .innerJoin(branches, eq(branches.branch_id, sessions.branch_id))
+        .where(
+          and(
+            listedServers,
+            // A private server is valid only in its owner's Session. Keep the
+            // invariant at this read boundary too so pre-enforcement stale rows
+            // cannot surface as somebody else's session metadata. A shared
+            // server lists only the caller's own Sessions for the same reason;
+            // session_count still counts every attachment.
+            eq(sessions.created_by, userId),
+            visibleSessionReferenceAccessExists(this.db, userId, sessionMcpServers.session_id)
+          )
+        )
+        .orderBy(desc(sessionMcpServers.added_at))
+        .all()) as SafeAttachmentRow[];
+
+      const attachments: MCPMarketplaceAttachment[] = attachmentRows.map((row) => ({
+        session_id: row.session_id as SessionID,
+        mcp_server_id: row.mcp_server_id as MCPServerID,
+        enabled: Boolean(row.enabled),
+        added_at: iso(row.added_at)!,
+        ...(stringValue(row.session_title)
+          ? { session_title: stringValue(row.session_title) }
+          : {}),
+        session_status: row.session_status,
+        agentic_tool: row.agentic_tool,
+        branch_id: row.branch_id,
+        branch_name: row.branch_name,
+      }));
+
+      const servers: MCPMarketplaceServer[] = serverRows.map((row) => {
+        const createdAt = iso(row.created_at)!;
+        return {
+          mcp_server_id: row.mcp_server_id as MCPServerID,
+          name: row.name,
+          transport: row.transport,
+          ...(stringValue(row.display_name) ? { display_name: stringValue(row.display_name) } : {}),
+          ...(stringValue(row.description) ? { description: stringValue(row.description) } : {}),
+          source: row.source,
+          ...(row.catalog_entry_name ? { catalog_entry_name: row.catalog_entry_name } : {}),
+          ...(row.owner_user_id ? {} : { shared: true }),
+          enabled: Boolean(row.enabled),
+          tools: readTools(row.tools_json, row.permissions_json),
+          ...(iso(row.capabilities_discovered_at as string | number | Date | null)
+            ? {
+                capabilities_discovered_at: iso(
+                  row.capabilities_discovered_at as string | number | Date
+                ),
+              }
+            : {}),
+          session_count: Number(row.session_count),
+          created_at: createdAt,
+          updated_at: iso(row.updated_at) ?? createdAt,
+        };
+      });
+
+      const oauthServerIds = serverRows
+        .filter((row) => row.auth_type === 'oauth')
+        .map((row) => row.mcp_server_id as MCPServerID);
+      // One closed batch crosses into the daemon's canonical authority
+      // resolver. The overview never fans out repository/HMAC work per row.
+      if (oauthServerIds.length > 0 && !this.isOAuthGrantAuthorized) {
+        throw new Error('OAuth grant authority resolver is unavailable');
+      }
+      // An authority-read failure is not evidence that every saved grant was
+      // revoked. Let the overview fail so clients retain their last good
+      // projection during stale-while-refresh instead of showing a definite
+      // reconnect requirement.
+      const oauthAuthority = this.isOAuthGrantAuthorized
+        ? await this.isOAuthGrantAuthorized(userId, oauthServerIds, options)
+        : new Map<MCPServerID, boolean>();
+      const credentials = serverRows
+        .map((row) => credentialFrom(row, now, oauthAuthority))
+        .filter((item): item is MCPMarketplaceCredential => item !== undefined);
+
+      return {
+        servers,
+        attachments,
+        credentials,
+        generated_at: new Date(now).toISOString(),
+      };
+    } catch (error) {
+      throw new RepositoryError(
+        `Failed to load MCP Marketplace overview: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+        error
+      );
+    }
+  }
+}

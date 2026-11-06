@@ -1,0 +1,439 @@
+import type { PersistedAgenticToolName } from './agentic-tool';
+import type { BranchPermissionLevel } from './branch';
+import type { CardID } from './card';
+import type { ArtifactID, BoardID, BranchID } from './id';
+
+/**
+ * Canvas position (x/y coordinates in board space)
+ */
+export type BoardPosition = { x: number; y: number };
+
+/**
+ * Board object types for canvas annotations.
+ *
+ * Single source of truth for every consumer that enumerates object types
+ * (board import validation, MCP filters). Adding a type here forces the
+ * import validator's exhaustive per-type table to handle it.
+ */
+export const BOARD_OBJECT_TYPES = ['text', 'zone', 'markdown', 'app', 'artifact'] as const;
+export type BoardObjectType = (typeof BOARD_OBJECT_TYPES)[number];
+
+/**
+ * Entity type discriminator for board objects
+ */
+export type BoardEntityType = 'branch' | 'card';
+
+/**
+ * Positioned entity on a board (branch or card)
+ *
+ * Polymorphic placement: exactly one of branch_id or card_id is set.
+ * The entity_type field indicates which one.
+ */
+export interface BoardEntityObject {
+  /** Unique object identifier */
+  object_id: string;
+
+  /** Board this entity belongs to */
+  board_id: BoardID;
+
+  /** Branch reference (set when entity_type === 'branch') */
+  branch_id?: BranchID;
+
+  /** Card reference (set when entity_type === 'card') */
+  card_id?: CardID;
+
+  /** Computed entity type discriminator */
+  entity_type: BoardEntityType;
+
+  /** Position on canvas */
+  position: BoardPosition;
+
+  /** Zone this entity is pinned to (optional) */
+  zone_id?: string;
+
+  /** Ephemeral PATCH correlation echoed in the response/event; never persisted or used for access. */
+  placement_write_id?: string;
+
+  /** When this entity was added to the board */
+  created_at: string;
+}
+
+/**
+ * Text annotation object
+ */
+export interface TextBoardObject {
+  type: 'text';
+  x: number;
+  y: number;
+  width?: number;
+  height?: number;
+  content: string;
+  fontSize?: number;
+  color?: string;
+  background?: string;
+  /** Explicit stacking order. Falls back to the per-type default when unset. */
+  zIndex?: number;
+}
+
+/**
+ * Zone trigger behavior modes for branch drops
+ */
+export type ZoneTriggerBehavior = 'always_new' | 'show_picker';
+
+/**
+ * Zone trigger configuration for branch drops
+ *
+ * When a branch is dropped on a zone with a trigger:
+ * - 'always_new': Automatically create new root session and apply trigger
+ * - 'show_picker': Open modal to select existing session or create new one
+ */
+export interface ZoneTrigger {
+  /** Handlebars template for the prompt */
+  template: string;
+  /** Trigger behavior mode (default: 'show_picker') */
+  behavior: ZoneTriggerBehavior;
+  /**
+   * Preferred agent for auto-created sessions (default: 'claude-code').
+   *
+   * This is persisted board metadata, so removed identifiers remain readable.
+   * Runtime trigger paths must narrow it to an active tool before execution.
+   */
+  agent?: PersistedAgenticToolName;
+}
+
+/**
+ * How a zone places its pinned branches and cards. `free` keeps stored
+ * positions; `row`, `column` and `grid` arrange them in display-only slots.
+ */
+export type ZoneLayout = 'free' | 'row' | 'column' | 'grid';
+
+/**
+ * Zone rectangle object (for organizing sessions visually)
+ */
+export interface ZoneBoardObject {
+  type: 'zone';
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  label: string;
+  /** Border color (supports alpha) - falls back to `color` for backwards compatibility */
+  borderColor?: string;
+  /** Background color (supports alpha) - falls back to derived from `color` for backwards compatibility */
+  backgroundColor?: string;
+  /** @deprecated Use borderColor instead. Kept for backwards compatibility */
+  color?: string;
+  status?: string;
+  /** Lock zone to prevent dragging/resizing */
+  locked?: boolean;
+  /** Trigger configuration for sessions dropped into this zone */
+  trigger?: ZoneTrigger;
+  /** Label/status font size in px. Falls back to the theme default when unset. */
+  fontSize?: number;
+  /** Explicit stacking order. Falls back to the per-type default when unset. */
+  zIndex?: number;
+  /** Placement of pinned entities. Missing means `free`. */
+  layout?: ZoneLayout;
+  /** Pinned branch and card node ids in the order an arranged layout shows them. */
+  order?: string[];
+}
+
+/**
+ * Markdown note annotation object
+ * Rich text notes with markdown rendering, user-selected width, auto-expanding height
+ */
+export interface MarkdownBoardObject {
+  type: 'markdown';
+  x: number;
+  y: number;
+  width: number; // User-selected width (300-800px)
+  content: string; // Markdown text
+  // Optional future enhancements:
+  fontSize?: number; // Font size multiplier (default: 1.0)
+  backgroundColor?: string; // Background color with alpha (default: card background)
+  /** Explicit stacking order. Falls back to the per-type default when unset. */
+  zIndex?: number;
+}
+
+/**
+ * Sandpack template options for app board objects
+ */
+export type SandpackTemplate =
+  | 'static'
+  | 'react'
+  | 'react-ts'
+  | 'vanilla'
+  | 'vanilla-ts'
+  | 'vue'
+  | 'vue3'
+  | 'svelte'
+  | 'solid'
+  | 'angular';
+
+/**
+ * Live web application rendered via Sandpack (in-browser bundler)
+ *
+ * Apps render as interactive iframes on the board canvas.
+ * Agents can create/update apps via MCP tools.
+ */
+export interface AppBoardObject {
+  type: 'app';
+  x: number;
+  y: number;
+  width: number; // Default: 600, min: 300
+  height: number; // Default: 400, min: 200
+  /** App title shown in the card header */
+  title: string;
+  /** Optional description */
+  description?: string;
+
+  /** Sandpack template (default: 'react') */
+  template: SandpackTemplate;
+  /** File map: path -> code content */
+  files: Record<string, string>;
+  /** NPM dependencies beyond template defaults */
+  dependencies?: Record<string, string>;
+  /** Entry file path (default: determined by template) */
+  entryFile?: string;
+  /** Whether to show the code editor alongside preview */
+  showEditor?: boolean;
+  /** Whether to show the console output */
+  showConsole?: boolean;
+  /** Explicit stacking order. Falls back to the per-type default when unset. */
+  zIndex?: number;
+}
+
+/**
+ * Artifact board object - thin reference to an Artifact entity
+ *
+ * Unlike AppBoardObject (which inlines all code), this stores only the
+ * artifact_id. The frontend fetches the payload from the daemon REST API.
+ */
+export interface ArtifactBoardObject {
+  type: 'artifact';
+  x: number;
+  y: number;
+  width: number; // Default: 600, min: 300
+  height: number; // Default: 400, min: 200
+  /** Reference to the artifact entity */
+  artifact_id: ArtifactID;
+  /** Lock artifact card to prevent dragging/resizing on the board */
+  locked?: boolean;
+  /** Explicit stacking order. Falls back to the per-type default when unset. */
+  zIndex?: number;
+}
+
+/**
+ * Union type for all board objects
+ */
+export type BoardObject =
+  | TextBoardObject
+  | ZoneBoardObject
+  | MarkdownBoardObject
+  | AppBoardObject
+  | ArtifactBoardObject;
+
+export interface TeammateWelcomeNoteRequest {
+  /** Board to create/update the bundled teammate welcome note on. */
+  boardId?: BoardID | string;
+  /** Alias accepted by Feathers custom method callers. */
+  id?: BoardID | string;
+  /** User-provided teammate display name. */
+  teammateName?: string;
+  /** Optional user-provided teammate emoji/icon. */
+  teammateEmoji?: string | null;
+}
+
+export type BoardAccessMode = 'private' | 'shared';
+export type BoardDefaultFsAccess = 'none' | 'read' | 'write';
+
+export interface Board {
+  /** Unique board identifier (UUIDv7) */
+  board_id: BoardID;
+
+  name: string;
+
+  /**
+   * Optional URL-friendly slug for board
+   *
+   * Examples: "main", "experiments", "bug-fixes"
+   *
+   * Allows CLI commands like:
+   *   agor session list --board experiments
+   * instead of:
+   *   agor session list --board 01933e4a
+   */
+  slug?: string;
+
+  description?: string;
+  primary_teammate_id?: BranchID;
+
+  /**
+   * DEPRECATED: Sessions and layout are now tracked in board_objects table
+   *
+   * Query board entities via:
+   * - boardObjectsService.find({ query: { board_id } })
+   *
+   * Old fields removed:
+   * - sessions: SessionID[]
+   * - layout: { [sessionId: string]: { x, y, parentId? } }
+   */
+
+  /**
+   * Canvas annotation objects (text labels, zones, etc.)
+   *
+   * Keys are object IDs (e.g., "text-123", "zone-456")
+   * Use atomic backend methods: upsertBoardObject(), removeBoardObject()
+   *
+   * IMPORTANT: Do NOT directly replace this entire object from client.
+   * Use atomic operations to prevent concurrent write conflicts.
+   */
+  objects?: {
+    [objectId: string]: BoardObject;
+  };
+
+  created_at: string;
+  last_updated: string;
+
+  /** User ID of the user who created this board */
+  created_by: string;
+
+  /** Primary owner, changed only by explicit ownership transfer; independent of attribution. */
+  primary_owner_user_id?: string;
+
+  /** Create-only board visibility (default 'shared'); reads return 'private', so use boards/:id/permissions. */
+  access_mode?: BoardAccessMode;
+
+  /** Create-only default branch permission for others; reads return 'none', so use boards/:id/permissions. */
+  default_others_can?: BranchPermissionLevel;
+
+  /** Create-only default branch filesystem access for others; reads return 'none'. */
+  default_others_fs_access?: BoardDefaultFsAccess;
+
+  /** Hex color for visual distinction */
+  color?: string;
+
+  /** Optional emoji/icon */
+  icon?: string;
+
+  /** Background color for the board canvas */
+  background_color?: string;
+
+  /**
+   * Custom CSS for the board canvas (rendered in a scoped <style> tag).
+   * Supports @keyframes, animation, background-size, and other CSS that
+   * can't be expressed as inline styles. Sanitized before rendering.
+   */
+  custom_css?: string;
+
+  /**
+   * Custom context for Handlebars templates (board-level)
+   * Example: { "team": "Backend", "sprint": 42, "deadline": "2025-03-15" }
+   * Access in templates: {{ board.context.team }}
+   */
+  custom_context?: Record<string, unknown>;
+
+  /**
+   * External/user-facing URL for viewing this board in the UI.
+   *
+   * Computed property added by the repository layer.
+   * Format: `{baseUrl}/ui/b/{slug-or-shortId}/`
+   * Prefers the board's slug when set; falls back to the canonical
+   * short ID.
+   */
+  url: string;
+
+  /** Whether this board is archived (soft deleted) */
+  archived: boolean;
+
+  /** ISO 8601 timestamp when the board was archived */
+  archived_at?: string;
+
+  /** User ID of the user who archived this board */
+  archived_by?: string;
+}
+
+/**
+ * Why a board import left an object out:
+ * - `unresolved_reference`: well-formed reference (e.g. an artifact) whose
+ *   target isn't available to the importer in this workspace
+ * - `unsupported_type`: object type this instance doesn't know
+ * - `invalid`: known type with missing/malformed fields
+ */
+export type BoardImportSkipReason = 'unresolved_reference' | 'unsupported_type' | 'invalid';
+
+export interface BoardImportSkippedObject {
+  object_id: string;
+  /** Declared object type, when it was a string. */
+  type?: string;
+  reason: BoardImportSkipReason;
+  /** Per-object detail for logs/CLI; UIs should prefer summarizeBoardImportSkips. */
+  detail: string;
+}
+
+/**
+ * Result of a board import: the created board plus the objects that were
+ * skipped rather than failing the whole import.
+ */
+export interface BoardImportResult extends Board {
+  import_skipped?: BoardImportSkippedObject[];
+}
+
+/**
+ * One short, user-facing sentence summarizing skipped objects, or null when
+ * nothing was skipped. Aggregates by reason so a board with many unavailable
+ * artifacts yields one message, not one per object.
+ */
+export function summarizeBoardImportSkips(
+  skipped: readonly BoardImportSkippedObject[] | undefined
+): string | null {
+  if (!skipped?.length) return null;
+  const unresolved = skipped.filter((s) => s.reason === 'unresolved_reference').length;
+  const unreadable = skipped.length - unresolved;
+  const parts: string[] = [];
+  if (unresolved) {
+    parts.push(
+      unresolved === 1
+        ? "1 referenced object isn't available to you in this workspace and couldn't be linked"
+        : `${unresolved} referenced objects aren't available to you in this workspace and couldn't be linked`
+    );
+  }
+  if (unreadable) {
+    parts.push(
+      unreadable === 1
+        ? '1 object was unsupported or malformed and was skipped'
+        : `${unreadable} objects were unsupported or malformed and were skipped`
+    );
+  }
+  return `${parts.join('; ')}.`;
+}
+
+/**
+ * Portable board export format (shell only)
+ *
+ * Contains board metadata and annotations, but no branches or sessions.
+ * Can be serialized to YAML/JSON for sharing or archival.
+ */
+export interface BoardExportBlob {
+  // Core metadata
+  name: string;
+  slug?: string;
+  description?: string;
+  icon?: string;
+  color?: string;
+  background_color?: string;
+  custom_css?: string;
+  access_mode?: BoardAccessMode;
+  default_others_can?: BranchPermissionLevel;
+  default_others_fs_access?: BoardDefaultFsAccess;
+
+  // Canvas objects (see BoardObjectType). Import skips objects it cannot use
+  // with a warning; `artifact` objects are references only (no content) and
+  // are kept only when the artifact resolves for the importer.
+  objects?: {
+    [objectId: string]: BoardObject;
+  };
+
+  // Custom context for templates
+  custom_context?: Record<string, unknown>;
+}

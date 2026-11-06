@@ -1,0 +1,469 @@
+import type {
+  MCPMarketplaceAttachment,
+  MCPMarketplaceCredential,
+  MCPMarketplaceServer,
+  SessionID,
+} from '@agor/core/types';
+import { DeleteOutlined, EditOutlined, KeyOutlined, ReloadOutlined } from '@ant-design/icons';
+import {
+  Alert,
+  Avatar,
+  Badge,
+  Button,
+  Descriptions,
+  Drawer,
+  Empty,
+  Flex,
+  Popconfirm,
+  Space,
+  Spin,
+  Switch,
+  Tag,
+  Typography,
+  theme,
+} from 'antd';
+import { useEffect, useId, useRef, useState } from 'react';
+import type { ActionErrorCopy } from '../../utils/connectionErrors';
+import { ActionErrorNotice } from '../CompactNotice';
+import { MARKETPLACE_SERVER_DRAWER_WIDTH } from './marketplaceLayout';
+import {
+  type MarketplaceCredentialPresentation,
+  marketplaceCredentialActionLabel,
+  marketplaceCredentialMethodLabel,
+  marketplaceCredentialNeedsRecovery,
+  marketplaceServerTitle,
+  marketplaceSessionTitle,
+} from './marketplacePresentation';
+
+const { Text, Title } = Typography;
+
+export interface ServerSettingsDrawerProps {
+  server: MCPMarketplaceServer | null;
+  credential?: MCPMarketplaceCredential;
+  connection: MarketplaceCredentialPresentation;
+  attachments: MCPMarketplaceAttachment[];
+  cursorAttached: boolean;
+  canRefresh: boolean;
+  canChangeTools: boolean;
+  canReconnect: boolean;
+  /** Defaults to `canChangeTools`; narrower when the OAuth grant is admin-only. */
+  canDisconnect?: boolean;
+  canRemove: boolean;
+  busy: ReadonlySet<string>;
+  toolDiscoveryError?: ActionErrorCopy;
+  onClose: () => void;
+  onAfterOpenChange: (open: boolean) => void;
+  reconnectingOAuth?: boolean;
+  disconnectingOAuth?: boolean;
+  editingCredential?: boolean;
+  onReconnectOAuth?: () => void;
+  onDisconnectOAuth?: () => void;
+  onEditCredential?: () => void;
+  /** Present only for a custom (non-Catalog) server; opens the full server form. */
+  onEditConfiguration?: () => void;
+  editingConfiguration?: boolean;
+  /** Makes each session attachment a link to its session. */
+  onOpenSession?: (sessionId: SessionID) => void;
+  /** Present only for a customer-owned OAuth app install the caller may edit. */
+  onEditOAuthApp?: () => void;
+  editingOAuthApp?: boolean;
+  onRefreshTools: (server: MCPMarketplaceServer) => void;
+  onToggleTool: (
+    server: MCPMarketplaceServer,
+    tool: MCPMarketplaceServer['tools'][number],
+    enabled: boolean
+  ) => void;
+  onRemove: (server: MCPMarketplaceServer) => void;
+}
+
+export const ServerSettingsDrawer: React.FC<ServerSettingsDrawerProps> = ({
+  server,
+  credential,
+  connection,
+  attachments,
+  cursorAttached,
+  canRefresh,
+  canChangeTools,
+  canReconnect,
+  canDisconnect = canChangeTools,
+  canRemove,
+  busy,
+  toolDiscoveryError,
+  onClose,
+  onAfterOpenChange,
+  reconnectingOAuth = false,
+  disconnectingOAuth = false,
+  editingCredential = false,
+  onReconnectOAuth,
+  onDisconnectOAuth,
+  onEditCredential,
+  onEditConfiguration,
+  editingConfiguration = false,
+  onOpenSession,
+  onEditOAuthApp,
+  editingOAuthApp = false,
+  onRefreshTools,
+  onToggleTool,
+  onRemove,
+}) => {
+  const { token } = theme.useToken();
+  const titleId = useId();
+  const removeTriggerRef = useRef<HTMLButtonElement>(null);
+  const [changedCountServerId, setChangedCountServerId] = useState<string | null>(null);
+  const [removeConfirm, setRemoveConfirm] = useState<{ serverId: string; count: number } | null>(
+    null
+  );
+  const confirmationCurrent =
+    !!removeConfirm &&
+    !!server &&
+    removeConfirm.serverId === server.mcp_server_id &&
+    removeConfirm.count === server.session_count;
+  useEffect(() => {
+    if (
+      removeConfirm &&
+      server &&
+      removeConfirm.serverId === server.mcp_server_id &&
+      removeConfirm.count !== server.session_count &&
+      canRemove
+    ) {
+      setChangedCountServerId(server.mcp_server_id);
+      removeTriggerRef.current?.focus();
+    }
+    if (!confirmationCurrent || !canRemove) setRemoveConfirm(null);
+  }, [canRemove, confirmationCurrent, removeConfirm, server]);
+  const discoveringTools = Boolean(server && busy.has(`discover:${server.mcp_server_id}`));
+  const toolMutationActive = Boolean(
+    server && Array.from(busy).some((key) => key.startsWith(`tool:${server.mcp_server_id}:`))
+  );
+  const toolWorkActive = discoveringTools || toolMutationActive;
+
+  return (
+    <Drawer
+      aria-labelledby={titleId}
+      open={server !== null}
+      size={MARKETPLACE_SERVER_DRAWER_WIDTH}
+      destroyOnHidden
+      onClose={onClose}
+      afterOpenChange={onAfterOpenChange}
+      title={
+        server && (
+          <Space id={titleId} size={token.marginSM}>
+            <Avatar shape="square">{marketplaceServerTitle(server).charAt(0).toUpperCase()}</Avatar>
+            <Flex vertical style={{ minWidth: 0 }}>
+              <Text strong ellipsis>
+                {marketplaceServerTitle(server)}
+              </Text>
+              <Text type="secondary" style={{ fontSize: token.fontSizeSM }}>
+                Server settings
+              </Text>
+            </Flex>
+          </Space>
+        )
+      }
+    >
+      {server && (
+        <Flex vertical gap={token.marginLG}>
+          <Descriptions
+            size="small"
+            column={1}
+            items={[
+              {
+                key: 'connection',
+                label: 'Authentication',
+                children: <Badge status={connection.badge} text={connection.label} />,
+              },
+              {
+                key: 'source',
+                label: 'Installed from',
+                children: server.source === 'catalog' ? 'Catalog' : 'Manual setup',
+              },
+              { key: 'sessions', label: 'Session attachments', children: server.session_count },
+            ]}
+          />
+          {onEditConfiguration && (
+            <Button
+              icon={<EditOutlined />}
+              disabled={!canChangeTools || toolWorkActive}
+              loading={editingConfiguration}
+              onClick={onEditConfiguration}
+              aria-label={`Edit ${marketplaceServerTitle(server)} configuration`}
+              style={{ alignSelf: 'flex-start' }}
+            >
+              Edit configuration
+            </Button>
+          )}
+
+          <Flex vertical gap={token.marginXS}>
+            <Title level={5} style={{ margin: 0 }}>
+              Credential
+            </Title>
+            {credential ? (
+              <Flex justify="space-between" align="center" gap={token.marginSM} wrap>
+                <Space>
+                  <KeyOutlined />
+                  <Text>
+                    {marketplaceCredentialMethodLabel(credential.method)} · {connection.label}
+                  </Text>
+                </Space>
+                <Space wrap>
+                  {marketplaceCredentialNeedsRecovery(credential, server.enabled) &&
+                    onReconnectOAuth && (
+                      <Button
+                        disabled={!canReconnect || toolWorkActive}
+                        loading={reconnectingOAuth}
+                        onClick={onReconnectOAuth}
+                        title={`${marketplaceCredentialActionLabel(credential, server.enabled)} ${marketplaceServerTitle(server)}`}
+                        aria-label={`${marketplaceCredentialActionLabel(credential, server.enabled)} ${marketplaceServerTitle(server)} account`}
+                      >
+                        {marketplaceCredentialActionLabel(credential, server.enabled)}
+                      </Button>
+                    )}
+                  {credential.method !== 'oauth' && onEditCredential && (
+                    <Button
+                      disabled={!canChangeTools || toolWorkActive}
+                      loading={editingCredential}
+                      onClick={onEditCredential}
+                      title={`Edit ${marketplaceServerTitle(server)} credential securely`}
+                      aria-label={`Edit ${marketplaceServerTitle(server)} credential`}
+                    >
+                      Edit credential
+                    </Button>
+                  )}
+                  {credential.method === 'oauth' && onEditOAuthApp && (
+                    <Button
+                      disabled={!canChangeTools || toolWorkActive}
+                      loading={editingOAuthApp}
+                      onClick={onEditOAuthApp}
+                      aria-label={`Edit ${marketplaceServerTitle(server)} OAuth app credentials`}
+                    >
+                      Edit OAuth app
+                    </Button>
+                  )}
+                  {credential.method === 'oauth' && onDisconnectOAuth && (
+                    <Popconfirm
+                      title={`Disconnect ${marketplaceServerTitle(server)}?`}
+                      description="This removes the saved OAuth connection from Agor. Provider-side access may remain until you revoke it with the provider."
+                      okText="Disconnect"
+                      okButtonProps={{ danger: true }}
+                      onConfirm={onDisconnectOAuth}
+                    >
+                      <Button
+                        danger
+                        disabled={!canDisconnect || toolWorkActive}
+                        loading={disconnectingOAuth}
+                        aria-label={`Disconnect ${marketplaceServerTitle(server)} OAuth connection`}
+                      >
+                        Disconnect OAuth
+                      </Button>
+                    </Popconfirm>
+                  )}
+                </Space>
+              </Flex>
+            ) : (
+              <Text type="secondary">No account is needed for this connection.</Text>
+            )}
+            <Text type="secondary" style={{ fontSize: token.fontSizeSM }}>
+              {connection.detail}
+            </Text>
+            <Text type="secondary" style={{ fontSize: token.fontSizeSM }}>
+              Credential values are never displayed here. OAuth recovery uses the existing secure
+              provider flow; API keys, JWT credentials, and your own OAuth app's Client ID and
+              secret open a secure editor.
+            </Text>
+          </Flex>
+
+          <Flex vertical gap={token.marginXS}>
+            <Flex justify="space-between" align="center" gap={token.marginSM} wrap>
+              <Title level={5} style={{ margin: 0 }}>
+                Enabled tools
+              </Title>
+              <Button
+                aria-label="Refresh tools"
+                icon={<ReloadOutlined />}
+                disabled={!canRefresh || toolMutationActive}
+                loading={discoveringTools}
+                onClick={() => onRefreshTools(server)}
+              >
+                Refresh tools
+              </Button>
+            </Flex>
+            <Text type="secondary" style={{ fontSize: token.fontSizeSM }}>
+              Default follows the server policy. Ask requires approval for each use; turning an Ask
+              tool off and back on restores Default.
+            </Text>
+            {cursorAttached && (
+              <Alert
+                type="warning"
+                showIcon
+                title="Cursor cannot enforce per-tool choices"
+                description="When any tool is Off or Ask, Agor withholds this entire server from Cursor."
+              />
+            )}
+            {discoveringTools && (
+              <Alert
+                type="info"
+                showIcon
+                role="status"
+                title="Discovering tools…"
+                description="Checking the server for its current tool list. Existing settings stay available while this finishes."
+              />
+            )}
+            {toolDiscoveryError && (
+              <ActionErrorNotice
+                error={toolDiscoveryError}
+                action={
+                  canRefresh && !toolMutationActive
+                    ? { label: 'Try again', onClick: () => onRefreshTools(server) }
+                    : undefined
+                }
+              />
+            )}
+            {server.tools.length ? (
+              <Flex
+                vertical
+                role="list"
+                aria-label={`${marketplaceServerTitle(server)} tools`}
+                aria-busy={toolWorkActive}
+              >
+                {server.tools.map((tool) => {
+                  const changing = busy.has(`tool:${server.mcp_server_id}:${tool.name}`);
+                  return (
+                    <Flex
+                      key={tool.name}
+                      role="listitem"
+                      justify="space-between"
+                      align="center"
+                      gap={token.marginSM}
+                      style={{
+                        paddingBlock: token.paddingSM,
+                        borderBottomWidth: token.lineWidth,
+                        borderBottomStyle: 'solid',
+                        borderBottomColor: token.colorBorderSecondary,
+                      }}
+                    >
+                      <Flex vertical style={{ minWidth: 0 }}>
+                        <Text strong>{tool.name}</Text>
+                        {tool.description && <Text type="secondary">{tool.description}</Text>}
+                      </Flex>
+                      <Space>
+                        {tool.permission === 'ask' && <Tag color="gold">Ask</Tag>}
+                        {changing && (
+                          <Spin size="small" aria-label={`Saving ${tool.name} permission`} />
+                        )}
+                        <Switch
+                          aria-label={`${marketplaceServerTitle(server)}: ${tool.name} ${tool.permission === 'deny' ? 'off' : 'on'}`}
+                          checked={tool.permission !== 'deny'}
+                          disabled={!canChangeTools}
+                          aria-disabled={!canChangeTools || toolWorkActive}
+                          aria-busy={changing || discoveringTools}
+                          onChange={(checked) => onToggleTool(server, tool, checked)}
+                        />
+                      </Space>
+                    </Flex>
+                  );
+                })}
+              </Flex>
+            ) : discoveringTools ? null : (
+              <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="No tools discovered yet" />
+            )}
+          </Flex>
+
+          <Flex vertical gap={token.marginXS}>
+            <Title level={5} style={{ margin: 0 }}>
+              Session attachments
+            </Title>
+            {attachments.length ? (
+              <Space wrap>
+                {attachments.map((attachment) => {
+                  const label = `${marketplaceSessionTitle(attachment)}${attachment.enabled ? '' : ' · Disabled'}`;
+                  return onOpenSession ? (
+                    <Button
+                      key={attachment.session_id}
+                      size="small"
+                      type={attachment.enabled ? 'default' : 'dashed'}
+                      aria-label={`Open session ${label}`}
+                      onClick={() => onOpenSession(attachment.session_id)}
+                    >
+                      {label}
+                    </Button>
+                  ) : (
+                    <Tag
+                      key={attachment.session_id}
+                      color={attachment.enabled ? undefined : 'default'}
+                    >
+                      {label}
+                    </Tag>
+                  );
+                })}
+              </Space>
+            ) : (
+              <Text type="secondary">
+                {server.session_count > 0
+                  ? 'No visible session attachments.'
+                  : 'No sessions are attached.'}
+              </Text>
+            )}
+          </Flex>
+
+          <Flex
+            vertical
+            gap={token.marginXS}
+            style={{
+              borderTopWidth: token.lineWidth,
+              borderTopStyle: 'solid',
+              borderTopColor: token.colorBorderSecondary,
+              paddingTop: token.paddingLG,
+            }}
+          >
+            <Title level={5} style={{ margin: 0 }}>
+              Remove server
+            </Title>
+            <Text type="secondary">
+              Deleting a server also detaches it from all sessions and removes its saved connection.
+            </Text>
+            <Popconfirm
+              open={confirmationCurrent && canRemove}
+              title={`Delete ${marketplaceServerTitle(server)}?`}
+              description={
+                server.session_count === 0
+                  ? 'Delete this server and its saved connection? No sessions are attached. Saved defaults are not changed.'
+                  : `${server.session_count} ${server.session_count === 1 ? 'session is' : 'sessions are'} attached to this server (including disabled attachments). Delete and detach it from all of them? Future turns omit this server; active tool calls may be interrupted. Saved defaults are not changed.`
+              }
+              okText={server.session_count === 0 ? 'Delete' : 'Delete and detach'}
+              okButtonProps={{ danger: true }}
+              disabled={!canRemove}
+              onOpenChange={(next) => {
+                if (next) setChangedCountServerId(null);
+                setRemoveConfirm(
+                  next && canRemove
+                    ? { serverId: server.mcp_server_id, count: server.session_count }
+                    : null
+                );
+              }}
+              onConfirm={() => {
+                if (confirmationCurrent) onRemove(server);
+              }}
+            >
+              <Button
+                ref={removeTriggerRef}
+                aria-label={`Remove ${marketplaceServerTitle(server)} server`}
+                title={`Remove ${marketplaceServerTitle(server)} server`}
+                danger
+                icon={<DeleteOutlined />}
+                disabled={!canRemove}
+                loading={busy.has(`remove:${server.mcp_server_id}`)}
+              >
+                Remove server
+              </Button>
+            </Popconfirm>
+            {changedCountServerId === server.mcp_server_id && (
+              <Text role="status" type="secondary">
+                Attachment count changed. Review the new count and confirm deletion again.
+              </Text>
+            )}
+          </Flex>
+        </Flex>
+      )}
+    </Drawer>
+  );
+};

@@ -1,0 +1,541 @@
+/**
+ * Schedules CRUD list for a branch (§6a of the design doc).
+ *
+ * Pre-#1253 this was a one-schedule-per-branch form; now it's a list of
+ * schedules with create / edit / delete / run-now / runs-drawer.
+ */
+
+import type { AgorClient, Branch, MCPServer, Schedule, User } from '@agor-live/client';
+import { humanizeCron, shortId } from '@agor-live/client';
+import {
+  DeleteOutlined,
+  EditOutlined,
+  HistoryOutlined,
+  InfoCircleOutlined,
+  PlayCircleOutlined,
+  PlusOutlined,
+  UnorderedListOutlined,
+} from '@ant-design/icons';
+import type { TableColumnsType } from 'antd';
+import { Button, Empty, Input, Popconfirm, Space, Spin, Switch, Tooltip, Typography } from 'antd';
+import type { ReactNode } from 'react';
+import { useCallback, useEffect, useState } from 'react';
+import {
+  type ActionErrorCopy,
+  describeActionError,
+  formatActionError,
+} from '../../../utils/connectionErrors';
+import { useThemedMessage } from '../../../utils/message';
+import { ActionErrorNotice } from '../../CompactNotice';
+import { ScheduleForm } from '../../ScheduleForm';
+import { ScheduleRunsPanel } from '../../ScheduleRunsPanel';
+import { ResponsiveTable } from '../../SettingsModal/ResponsiveTable';
+
+const { Text } = Typography;
+
+interface ScheduleTabProps {
+  branch: Branch;
+  client: AgorClient | null;
+  mcpServerById?: Map<string, MCPServer>;
+  currentUser?: User | null;
+  userById?: Map<string, User>;
+  onOpenSession?: (sessionId: string) => void;
+  /** Whether an open schedule form holds unsaved changes (for the branch editor's guard). */
+  /** The open schedule form's dirty getter (null when closed), for the branch editor's leave guard. */
+  onDraftChange?: (isDirty: (() => boolean) | null) => void;
+}
+
+const formatTimestamp = (ms: number | null | undefined) =>
+  ms ? new Date(ms).toLocaleString() : '—';
+
+const formatHumanizedCron = (cron: string): string => {
+  try {
+    return humanizeCron(cron);
+  } catch {
+    return cron;
+  }
+};
+
+const ellipsisStyle = {
+  display: 'block',
+  maxWidth: '100%',
+  overflow: 'hidden',
+  textOverflow: 'ellipsis',
+  whiteSpace: 'nowrap',
+} as const;
+
+const CompactTooltipText: React.FC<{
+  children: ReactNode;
+  title: ReactNode;
+  type?: 'secondary';
+  code?: boolean;
+  ariaLabel?: string;
+}> = ({ children, title, type, code, ariaLabel }) => (
+  <Tooltip title={title} mouseEnterDelay={0.4}>
+    <Text
+      aria-label={ariaLabel}
+      code={code}
+      type={type}
+      style={ellipsisStyle}
+      title={typeof children === 'string' ? children : undefined}
+    >
+      {children}
+    </Text>
+  </Tooltip>
+);
+
+const userLabel = (
+  userId: string | null | undefined,
+  userById: Map<string, User>,
+  currentUser?: User | null
+) => {
+  if (!userId) return '—';
+  const user = userById.get(userId);
+  const label = user?.email ?? user?.name ?? shortId(userId);
+  return currentUser?.user_id === userId ? `${label} (you)` : label;
+};
+
+const ScheduleDetails: React.FC<{
+  schedule: Schedule;
+  humanizedCron: string;
+  userById: Map<string, User>;
+  currentUser?: User | null;
+}> = ({ schedule, humanizedCron, userById, currentUser }) => (
+  <Space direction="vertical" size={2} style={{ maxWidth: 360 }}>
+    <Text strong>{schedule.name || 'Untitled schedule'}</Text>
+    {schedule.description ? <Text>{schedule.description}</Text> : null}
+    <Text>
+      <Text strong>Schedule:</Text> {humanizedCron}
+    </Text>
+    <Text>
+      <Text strong>Cron:</Text> <Text code>{schedule.cron_expression}</Text>
+    </Text>
+    <Text>
+      <Text strong>Timezone:</Text>{' '}
+      {schedule.timezone_mode === 'utc' ? 'UTC' : schedule.timezone || 'local'}
+    </Text>
+    <Text>
+      <Text strong>Next:</Text> {formatTimestamp(schedule.next_run_at)}
+    </Text>
+    <Text>
+      <Text strong>Last:</Text> {formatTimestamp(schedule.last_run_at)}
+    </Text>
+    <Text>
+      <Text strong>Runs as:</Text> {userLabel(schedule.created_by, userById, currentUser)}
+    </Text>
+  </Space>
+);
+
+export const ScheduleTab: React.FC<ScheduleTabProps> = ({
+  branch,
+  client,
+  mcpServerById = new Map(),
+  currentUser,
+  userById = new Map(),
+  onOpenSession,
+  onDraftChange,
+}) => {
+  const { showError, showSuccess } = useThemedMessage();
+  const [schedules, setSchedules] = useState<Schedule[]>([]);
+  const [scheduleSearch, setScheduleSearch] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState<ActionErrorCopy | null>(null);
+  // New/Edit opens the form in place of the list (no dialog over the editor).
+  const [formOpen, setFormOpen] = useState(false);
+  const [editingSchedule, setEditingSchedule] = useState<Schedule | null>(null);
+  const [runsPanelSchedule, setRunsPanelSchedule] = useState<Schedule | null>(null);
+  const [runningId, setRunningId] = useState<string | null>(null);
+  const storedExecutionOwner = editingSchedule?.created_by
+    ? userById.get(editingSchedule.created_by)
+    : undefined;
+  const executionOwner =
+    !editingSchedule?.created_by || editingSchedule.created_by === currentUser?.user_id
+      ? currentUser
+      : storedExecutionOwner?.user_id === editingSchedule.created_by
+        ? storedExecutionOwner
+        : null;
+
+  const fetchSchedules = useCallback(async () => {
+    if (!client) return;
+    setLoading(true);
+    try {
+      const result = await client.service('schedules').find({
+        query: {
+          branch_id: branch.branch_id,
+          $sort: { created_at: -1 },
+        },
+      });
+      setSchedules(Array.isArray(result) ? result : result.data);
+      setLoadError(null);
+    } catch (err) {
+      setLoadError(describeActionError('load schedules', err, { idempotent: true }));
+    } finally {
+      setLoading(false);
+    }
+  }, [client, branch.branch_id]);
+
+  useEffect(() => {
+    fetchSchedules();
+  }, [fetchSchedules]);
+
+  // Live updates via Feathers events. The service emits these for every
+  // CRUD op, including ones on other branches — filter to ours.
+  useEffect(() => {
+    if (!client) return;
+    const service = client.service('schedules');
+    const matchesBranch = (s: Schedule) => s.branch_id === branch.branch_id;
+    const onCreated = (s: Schedule) => {
+      if (matchesBranch(s)) setSchedules((prev) => [s, ...prev]);
+    };
+    const onPatched = (s: Schedule) => {
+      if (matchesBranch(s)) {
+        setSchedules((prev) => prev.map((p) => (p.schedule_id === s.schedule_id ? s : p)));
+      }
+    };
+    const onRemoved = (s: Schedule) => {
+      setSchedules((prev) => prev.filter((p) => p.schedule_id !== s.schedule_id));
+    };
+    service.on('created', onCreated);
+    service.on('patched', onPatched);
+    service.on('removed', onRemoved);
+    return () => {
+      service.off('created', onCreated);
+      service.off('patched', onPatched);
+      service.off('removed', onRemoved);
+    };
+  }, [client, branch.branch_id]);
+
+  const handleNew = () => {
+    setEditingSchedule(null);
+    setFormOpen(true);
+  };
+
+  const handleEdit = (schedule: Schedule) => {
+    setEditingSchedule(schedule);
+    setFormOpen(true);
+  };
+
+  const handleDelete = async (schedule: Schedule) => {
+    if (!client) return;
+    try {
+      await client.service('schedules').remove(schedule.schedule_id);
+      showSuccess(`Schedule "${schedule.name}" deleted.`);
+    } catch (err) {
+      showError(formatActionError('delete the schedule', err, { idempotent: true }));
+    }
+  };
+
+  const handleRunNow = async (schedule: Schedule) => {
+    if (!client) return;
+    setRunningId(schedule.schedule_id);
+    try {
+      await client.service(`schedules/${schedule.schedule_id}/run-now`).create({});
+      showSuccess(`Started a run of "${schedule.name}".`);
+    } catch (err) {
+      showError(formatActionError('start the scheduled run', err, { idempotent: false }));
+    } finally {
+      setRunningId(null);
+    }
+  };
+
+  const handleToggleEnabled = async (schedule: Schedule, enabled: boolean) => {
+    if (!client) return;
+    try {
+      await client.service('schedules').patch(schedule.schedule_id, { enabled });
+    } catch (err) {
+      showError(
+        formatActionError(enabled ? 'turn the schedule on' : 'turn the schedule off', err, {
+          idempotent: true,
+        })
+      );
+    }
+  };
+
+  const renderScheduleDetails = useCallback(
+    (schedule: Schedule, humanizedCron: string) => (
+      <ScheduleDetails
+        schedule={schedule}
+        humanizedCron={humanizedCron}
+        userById={userById}
+        currentUser={currentUser}
+      />
+    ),
+    [currentUser, userById]
+  );
+
+  const columns: TableColumnsType<Schedule> = [
+    {
+      title: 'On',
+      key: 'enabled',
+      width: 50,
+      render: (_, s) => (
+        <Tooltip title={s.enabled ? 'Disable schedule' : 'Enable schedule'}>
+          <Switch
+            aria-label={`${s.enabled ? 'Disable' : 'Enable'} schedule ${s.name}`}
+            checked={s.enabled}
+            onChange={(v) => handleToggleEnabled(s, v)}
+            size="small"
+          />
+        </Tooltip>
+      ),
+    },
+    {
+      title: 'Title',
+      key: 'name',
+      width: 220,
+      render: (_, s) => {
+        const humanizedCron = formatHumanizedCron(s.cron_expression);
+        const tooltip = renderScheduleDetails(s, humanizedCron);
+        return (
+          <Space direction="vertical" size={0} style={{ display: 'flex', minWidth: 0 }}>
+            <CompactTooltipText title={tooltip} ariaLabel={`Schedule title: ${s.name}`}>
+              {s.name || 'Untitled schedule'}
+            </CompactTooltipText>
+            {s.description ? (
+              <CompactTooltipText title={tooltip} type="secondary">
+                {s.description}
+              </CompactTooltipText>
+            ) : null}
+          </Space>
+        );
+      },
+    },
+    {
+      title: 'Schedule',
+      key: 'cron',
+      width: 240,
+      render: (_, s) => {
+        const humanizedCron = formatHumanizedCron(s.cron_expression);
+        const tooltip = renderScheduleDetails(s, humanizedCron);
+        return (
+          <Space direction="vertical" size={0} style={{ display: 'flex', minWidth: 0 }}>
+            <CompactTooltipText title={tooltip}>{humanizedCron}</CompactTooltipText>
+            <CompactTooltipText title={tooltip} type="secondary" code>
+              {s.cron_expression}
+            </CompactTooltipText>
+          </Space>
+        );
+      },
+    },
+    {
+      title: 'Next',
+      key: 'next_run_at',
+      width: 130,
+      render: (_, s) => (
+        <CompactTooltipText
+          title={
+            <Space direction="vertical" size={2}>
+              <Text strong>Next run</Text>
+              <Text>{formatTimestamp(s.next_run_at)}</Text>
+              <Text type="secondary">
+                {s.timezone_mode === 'utc' ? 'UTC' : s.timezone || 'local'}
+              </Text>
+            </Space>
+          }
+        >
+          {formatTimestamp(s.next_run_at)}
+        </CompactTooltipText>
+      ),
+    },
+    {
+      title: '',
+      key: 'details',
+      width: 32,
+      render: (_, s) => {
+        const humanizedCron = formatHumanizedCron(s.cron_expression);
+        return (
+          <Tooltip title={renderScheduleDetails(s, humanizedCron)}>
+            <Button
+              type="text"
+              size="small"
+              icon={<InfoCircleOutlined />}
+              aria-label={`Details for schedule ${s.name}`}
+            />
+          </Tooltip>
+        );
+      },
+    },
+    {
+      title: 'Actions',
+      key: 'actions',
+      width: 150,
+      render: (_, s) => (
+        <Space size={2} wrap={false}>
+          <Tooltip title="Run now">
+            <Button
+              type="text"
+              size="small"
+              icon={<PlayCircleOutlined />}
+              loading={runningId === s.schedule_id}
+              disabled={runningId === s.schedule_id}
+              onClick={() => handleRunNow(s)}
+              aria-label={`Run schedule ${s.name} now`}
+            />
+          </Tooltip>
+          {s.last_run_session_id && onOpenSession ? (
+            <Tooltip title={`View last run — ${formatTimestamp(s.last_run_at)}`}>
+              <Button
+                type="text"
+                size="small"
+                icon={<HistoryOutlined />}
+                onClick={() => onOpenSession(s.last_run_session_id!)}
+                aria-label={`View last run for schedule ${s.name}`}
+              />
+            </Tooltip>
+          ) : null}
+          <Tooltip title="View runs">
+            <Button
+              type="text"
+              size="small"
+              icon={<UnorderedListOutlined />}
+              onClick={() => setRunsPanelSchedule(s)}
+              aria-label={`View runs for schedule ${s.name}`}
+            />
+          </Tooltip>
+          <Tooltip title="Edit">
+            <Button
+              type="text"
+              size="small"
+              icon={<EditOutlined />}
+              onClick={() => handleEdit(s)}
+              aria-label={`Edit schedule ${s.name}`}
+            />
+          </Tooltip>
+          <Popconfirm
+            title="Delete schedule?"
+            description={`Are you sure you want to delete "${s.name}"?`}
+            onConfirm={() => handleDelete(s)}
+            okText="Delete"
+            cancelText="Cancel"
+            okButtonProps={{ danger: true }}
+          >
+            <Tooltip title="Delete">
+              <Button
+                type="text"
+                size="small"
+                icon={<DeleteOutlined />}
+                danger
+                aria-label={`Delete schedule ${s.name}`}
+              />
+            </Tooltip>
+          </Popconfirm>
+        </Space>
+      ),
+    },
+  ];
+
+  const searchTermLower = scheduleSearch.trim().toLowerCase();
+  const visibleSchedules = searchTermLower
+    ? schedules.filter(
+        (s) =>
+          s.name.toLowerCase().includes(searchTermLower) ||
+          (s.description ?? '').toLowerCase().includes(searchTermLower)
+      )
+    : schedules;
+
+  if (formOpen) {
+    return (
+      <div style={{ padding: 16, minWidth: 0 }}>
+        <ScheduleForm
+          onClose={() => setFormOpen(false)}
+          branchId={branch.branch_id}
+          schedule={editingSchedule}
+          mcpServerById={mcpServerById}
+          client={client}
+          executionOwner={executionOwner}
+          currentUser={currentUser}
+          onSaved={() => fetchSchedules()}
+          onDraftChange={onDraftChange}
+        />
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ padding: 16, minWidth: 0 }}>
+      <div style={{ marginBottom: 8, minWidth: 0 }}>
+        <CompactTooltipText
+          title={`Schedules for ${branch.name}`}
+          ariaLabel={`Schedules for ${branch.name}`}
+        >
+          Schedules for {branch.name}
+        </CompactTooltipText>
+        <Text type="secondary" style={{ display: 'block', marginTop: 2 }}>
+          Fire a prompt on a cadence — hourly heartbeats, daily summaries, weekly retros. Each run
+          starts a new session on this branch.
+        </Text>
+      </div>
+      <div
+        style={{
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          gap: 12,
+          marginBottom: 12,
+          minWidth: 0,
+        }}
+      >
+        <Input
+          allowClear
+          placeholder="Search schedules by name or description"
+          value={scheduleSearch}
+          onChange={(e) => setScheduleSearch(e.target.value)}
+          style={{ maxWidth: 320 }}
+          disabled={schedules.length === 0}
+        />
+        <Button
+          type="primary"
+          icon={<PlusOutlined />}
+          onClick={handleNew}
+          style={{ flex: '0 0 auto' }}
+        >
+          New
+        </Button>
+      </div>
+      {loading ? (
+        <Spin />
+      ) : loadError ? (
+        <ActionErrorNotice
+          error={loadError}
+          action={{ label: 'Try again', onClick: () => void fetchSchedules() }}
+        />
+      ) : schedules.length === 0 ? (
+        <Empty
+          description={
+            <span>
+              No schedules yet. Schedule a prompt to fire on a cadence — hourly heartbeats, daily
+              summaries, weekly retros.
+            </span>
+          }
+        >
+          <Button type="primary" icon={<PlusOutlined />} onClick={handleNew}>
+            New schedule
+          </Button>
+        </Empty>
+      ) : visibleSchedules.length === 0 ? (
+        <Empty description={`No schedules match "${scheduleSearch.trim()}"`} />
+      ) : (
+        // Cards below md: the columns are wider than a phone, and Settings clips
+        // horizontal overflow rather than scrolling it.
+        <ResponsiveTable<Schedule>
+          primaryColumnKey="name"
+          rowKey="schedule_id"
+          dataSource={visibleSchedules}
+          columns={columns}
+          pagination={false}
+          size="small"
+          tableLayout="fixed"
+          style={{ width: '100%' }}
+        />
+      )}
+
+      <ScheduleRunsPanel
+        open={runsPanelSchedule !== null}
+        onClose={() => setRunsPanelSchedule(null)}
+        schedule={runsPanelSchedule}
+        client={client}
+        onOpenSession={onOpenSession}
+      />
+    </div>
+  );
+};

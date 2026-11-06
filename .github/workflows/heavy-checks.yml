@@ -1,0 +1,19 @@
+# On-demand aggregate gate for maintainers. The full packaged-install matrix
+# belongs to releases and deliberate pre-release checks, not every PR or every
+# night. The lightweight security audit retains its own nightly schedule.
+name: Heavy checks (on demand)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  agor-live-smoke:
+    name: Full packaged-install matrix
+    uses: ./.github/workflows/agor-live-smoke.yml
+
+  audit:
+    name: Dependency security audit
+    uses: ./.github/workflows/audit.yml

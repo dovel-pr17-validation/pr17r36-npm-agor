@@ -1,0 +1,238 @@
+# Agor Documentation
+
+Documentation website built with Nextra.
+
+## Development
+
+```bash
+# From project root
+pnpm docs:dev
+
+# Or directly
+cd apps/agor-docs
+pnpm dev
+```
+
+Open http://localhost:3001
+
+## Site analytics
+
+The public docs deployment sets `NEXT_PUBLIC_GA_ID=G-DME77D3LDH`. A measurement ID is
+public configuration, not a credential. The integration is omitted when the variable is
+unset and is otherwise enabled for production builds. To exercise it in `pnpm dev`, also
+set `NEXT_PUBLIC_ANALYTICS_DEBUG=true`; use a test property or block collection requests.
+
+Google Analytics sends one explicit `page_view` for the initial URL and each client-side
+App Router navigation. Its automatic page view is disabled to prevent duplicates.
+
+### Cookie consent and trackers
+
+Every tracker runs behind the cookie banner (`components/CookieConsent.tsx`, logic in
+`lib/consent.ts`, policy at `/privacy`). Visitors choose Reject, Analytics only, or Accept
+all. Optional cookies default off in the EEA, UK, and Switzerland (judged by time zone)
+and for browsers sending Global Privacy Control; elsewhere they default on. The banner
+appears on its own only where opt-in applies; everyone can open it from Cookie settings
+in the footer.
+
+| Tracker                                                           | Category  | Loads                                                            |
+| ----------------------------------------------------------------- | --------- | ---------------------------------------------------------------- |
+| Google Analytics (`G-DME77D3LDH`)                                 | Analytics | Always, through Consent Mode: cookieless until analytics consent |
+| Microsoft Clarity                                                 | Analytics | Only with analytics consent                                      |
+| Google Tag Manager (`GTM-WL3Q29NW`): Google Ads, LinkedIn Insight | Marketing | Only with marketing consent                                      |
+| HubSpot tracking code                                             | Marketing | Only with marketing consent                                      |
+
+Rules of thumb:
+
+- **Never add a tracker straight to `app/layout.tsx`.** Load it from `CookieConsent.tsx` under
+  the right category, and add its cookies to the table on the privacy page
+  (`content/privacy.mdx`, "Cookies and storage we use").
+- **A new tag in Tag Manager** only ever runs for visitors who accepted marketing cookies, so
+  it can't leak consent. Still add the provider and its cookies to the privacy page.
+
+### Google Ads conversions (read this before changing them)
+
+Visitors without marketing consent never load Tag Manager, so its Google Ads tags can't
+fire for them. For those visitors, the site's own Google tag sends the Ads page hit and
+each conversion cookielessly instead, so Google can still count and model them. It only
+does this while Tag Manager is absent, so consenting visitors aren't counted twice.
+
+That means **Google Ads changes need a matching code change** in `lib/consent.ts`:
+
+- **Add or change a conversion action:** set up its tag in Tag Manager as usual, then add or
+  update its entry in `ADS_CONVERSIONS` (`send_to` is `AW-<account>/<label>`; the label is
+  in the conversion action's Tag setup, or the Tag Manager tag). If it's triggered by a new
+  event, call `adsConversionSnippet(...)` (inline scripts) or `gtag('event', 'conversion',
+{ send_to })` wherever that event is pushed to `dataLayer`. The two existing ones fire
+  from the HubSpot form and meeting listeners in `app/layout.tsx`.
+- **Remove a conversion action:** delete its entry and call.
+- **Switch Google Ads accounts:** update `ADS_ID`.
+
+The Tag Manager container is public, so you can confirm the IDs and labels it carries:
+`curl -s 'https://www.googletagmanager.com/gtm.js?id=GTM-WL3Q29NW' | grep -o 'AW-[0-9][0-9]*\|vtp_conversionLabel":"[^"]*'`.
+Sign-ups completed on console.agor.cloud (rather than the agor.live HubSpot form) don't
+reach Google Ads from this site; they're attributed through UTM parameters and HubSpot.
+
+The GitHub Pages deployment does not currently send a Content Security Policy. If one is
+added, it must allow the GA loader from `https://www.googletagmanager.com` and collection
+to `https://www.google-analytics.com` (plus the Tag Manager, Google Ads, LinkedIn, Clarity, and
+HubSpot origins).
+
+### Google Ads conversions for console sign-ups
+
+Most Cloud CTAs send visitors to `console.agor.cloud`, a different domain, so neither a
+`gclid`/`gbraid`/`wbraid` URL parameter nor GTM's HubSpot-form-submit trigger (which fires
+the conversion for the few sign-ups still completed through this site's own HubSpot form)
+ever reaches it. `CloudCtaLink` and `CloudInviteCTA` forward any Google Ads click id present
+on the page a CTA is clicked from (`lib/cloudCta.ts#adClickIds`,
+`lib/cloudCtaAttribution.ts#onCloudCtaClick`) as a query parameter on the outgoing console
+link, alongside the existing HubSpot visitor token. The console records it first-touch in
+its `agor_attribution` cookie and reports an Enhanced Conversion (hashed email + click id)
+once the account reaches `/welcome` — see `agor-cloud`'s `apps/console/src/analytics.ts`.
+
+## Brand assets
+
+`public/logo-mark.svg` is the transparent Agor mark for normal web and
+in-product rendering. `public/logo.svg` contains the same artwork on a fixed
+dark circular plate for favicons and other small contexts where the mark needs
+a predictable backdrop. Both have explicit `734 × 734` intrinsic dimensions
+and the same square viewBox.
+
+The standalone Vite app keeps byte-identical deployment copies of both SVGs in
+`../agor-ui/public/`; `pnpm validate:brand-assets` guards the copies and the
+transparent/backed distinction against drift. Do not add PNG logo/favicon
+copies for ordinary browser rendering.
+
+`public/apple-touch-icon.png` is the only compatibility raster. Apple touch
+icons require PNG output, so regenerate its transparent `180 × 180` render from
+the canonical SVG with:
+
+```bash
+apps/agor-docs/scripts/generate-apple-touch-icon.sh
+pnpm --filter @agor/docs validate:brand-assets
+```
+
+This stable Apple-touch URL is also a Google Search favicon candidate. Keep
+the complete badge and transparent outer corners; PNG header dimensions alone
+cannot detect missing artwork. Validation decodes and compares the raster to
+the canonical SVG. After a docs build, add `--export` to validate the actual
+homepage icon links and published asset bytes (also checked in docs PR CI).
+
+Screenshots, social-card images, generated video frames, and third-party tool
+logos are content assets rather than alternate Agor marks and keep the format
+required by their destination.
+
+## Structure
+
+```text
+content/              # Published MDX, including unlisted pages
+├── guide/            # Getting started, using, operating, developing/reference
+├── blog/             # Historical posts and case studies
+└── api-reference/    # Public API documentation
+app/                  # App Router routes and static page enumeration
+lib/docsNavigation.ts # Shared guide navigation, imported by guide/_meta.ts
+public/               # Static assets, OpenAPI schema, and LLM documentation indexes
+```
+
+The catch-all route recursively publishes MDX from `content/`; hiding a page in
+navigation does not unpublish it. The homepage has its own route.
+
+Organize guide navigation by reader task: **Getting started**, **Using Agor**,
+**Operating Agor**, and **Developing & Reference**. Keep everyday workflow and
+permission guidance accessible to users; put deployment configuration, migrations,
+and administrative recovery under Operating Agor. Contributor internals belong
+in development/reference, not feature introductions. Prefer stable URLs and
+leave a linked compatibility heading or anchor when moving an existing section.
+Update `public/llms.txt` and `public/llms-full.txt` when adding reader entry points.
+
+## Page metadata and social previews
+
+All page-level social metadata is centralized in `theme.config.tsx`. Authors should set
+frontmatter instead of adding ad hoc `<Head>` tags:
+
+```mdx
+---
+title: Cards
+description: Generic workflow cards that give you spatial oversight of any agentic workflow.
+heroImage: '/screenshots/cards-hero.png'
+---
+```
+
+- `image` is the existing blog-post hero/card image convention.
+- `heroImage` is the docs/feature-page convention for pages with a visible hero screenshot.
+- `socialImage` or `ogImage` may be used only when the social preview should intentionally
+  differ from the visible hero image.
+
+Local image paths must live under `public/` and start with `/`. The metadata layer turns
+them into absolute `og:image` and `twitter:image` URLs using `NEXT_PUBLIC_SITE_URL` plus
+`NEXT_PUBLIC_BASE_PATH` when configured. Pages without any image field fall back to
+`/screenshots/board-hero.png`. Add `imageWidth` and `imageHeight` only when you know the exact image
+dimensions.
+
+## Blog listing dates
+
+Keep each post's `date: YYYY-MM-DD` frontmatter in sync with `lib/blogPosts.ts`.
+The `/blog` listing reveals a post at **06:00 PST (fixed UTC−08:00 / 14:00 UTC)**
+on that date, including during daylight-saving time. `/blog?all` shows every
+post; presence of the `all` parameter is sufficient, regardless of its value.
+The browser checks the time on load, at the next publication boundary, and when
+a tab regains focus. This works without rebuilding the static site, but relies
+on JavaScript and the visitor's clock. Without JavaScript, the listing reflects
+the build time until the next deployment.
+
+This is **listing visibility, not an embargo or access control**. Article slugs
+are always exported and accessible. Sitemap, Pagefind, LLM indexes, other links
+and crawler indexing are unchanged and can expose future posts. For a real
+embargo, do not deploy the content. Existing `noindex: true` frontmatter can
+discourage search indexing, but removing it requires a rebuild/deployment; the
+listing timer does not change static article metadata.
+
+## Validate and build
+
+From the repository root:
+
+```bash
+pnpm --filter @agor/docs typecheck
+pnpm --filter @agor/docs test:blog
+pnpm --filter @agor/docs validate:brand-assets
+pnpm --filter @agor/docs validate:social-metadata
+pnpm docs:build
+```
+
+The build compiles MDX, exports the site to `apps/agor-docs/out/`, and generates
+sitemap and Pagefind search assets.
+
+Builds use Turbopack (`next build --turbopack`): about 40s to compile from cold,
+versus about 110s cold (55s warm) with webpack, with identical output. If a build
+ever misbehaves under Turbopack (it's still beta in Next 15), `pnpm --filter
+@agor/docs build:webpack` runs the same build on webpack. Locally, `pnpm serve` builds
+and then serves `out/`; `pnpm preview` serves the last build without rebuilding,
+and `pnpm dev` is the fast loop while editing. It does not regenerate API or CLI documentation.
+The legacy root `docs:generate` alias has no matching docs-package script.
+
+For an analytics export check, set a test `NEXT_PUBLIC_GA_ID` during both the build
+and `pnpm --filter @agor/docs validate:analytics`. Do not send test traffic to the
+production analytics property. Check internal links and fragments in the exported
+HTML, especially when moving headings or changing navigation.
+
+## Deployment
+
+Docs are automatically deployed to GitHub Pages on every push to `main` that changes:
+
+- `apps/agor-docs/**`
+- `apps/agor-cli/src/commands/**` (also triggers the workflow)
+
+**GitHub Pages Setup (one-time):**
+
+1. Go to repository Settings → Pages
+2. Source: **GitHub Actions**
+3. That's it! The workflow (`.github/workflows/deploy-docs.yml`) handles the rest.
+
+**Manual deployment trigger:**
+
+```bash
+gh workflow run deploy-docs.yml
+```
+
+**Deployment URL:** https://agor.live/
+
+Alternative deployment targets (Cloudflare Pages, Vercel) work as well — Nextra static export is portable.

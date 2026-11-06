@@ -1,0 +1,49 @@
+export { OPENCODE_AUXILIARY_ADAPTER } from './auxiliary-adapter.js';
+export {
+  createOpenCodeEventTranslator,
+  type OpenCodeEventEffect,
+  type OpenCodeEventTranslator,
+  type ReconciledOpenCodeMessage,
+  reconcileOpenCodeMessages,
+} from './event-translator.js';
+export {
+  assertOpenCodeBinaryCompatibility,
+  createOpenCodeSanitizer,
+  ensureOpenCodeDataHome,
+  isOpenCodeCleanupUnverifiedError,
+  type ManagedChild,
+  type ManagedOpenCodeServer,
+  OPENCODE_VERSION,
+  OpenCodeCleanupUnverifiedError,
+  type OpenCodeSanitizer,
+  readOpenCodeBinaryVersion,
+  resolvePackagedOpenCodeBinary,
+  startManagedOpenCodeServer,
+  verifyOpenCodeAuthFileBoundary,
+} from './managed-server.js';
+export {
+  assertOpenCodeCheckpointRuntime,
+  discardOpenCodeScratch,
+  OPENCODE_CHECKPOINT_ROOT_ENV,
+  OPENCODE_SCRATCH_ROOT_ENV,
+  OpenCodeNativeStateError,
+  type OpenCodeNativeStateLayout,
+  prepareOpenCodeScratch,
+  removeOpenCodeCheckpoints,
+  resolveOpenCodeNativeStateLayout,
+  restoreOpenCodeCheckpoint,
+  sealOpenCodeCheckpoint,
+} from './native-state.js';
+export {
+  type OpenCodeCanUseToolCallback,
+  OpenCodeInteractionTimeoutError,
+  type OpenCodeInvocationConfig,
+  type OpenCodePartialMessage,
+  type OpenCodePermissionRejection,
+  type OpenCodeStreamingCallbacks,
+  OpenCodeTool,
+  type OpenCodeToolDependencies,
+  type OpenCodeTurnResult,
+  openCodePartialMessage,
+  type RunOpenCodeTurnInput,
+} from './opencode-tool.js';

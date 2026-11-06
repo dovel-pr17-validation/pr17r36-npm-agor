@@ -1,0 +1,266 @@
+# Fast PR + main checks.
+#
+# The required check remains `CI / Lint, typecheck, build, test`.  It is now a
+# small aggregate gate over independent lanes.  The old single job started
+# five Vitest processes (each with its own worker pool) on one hosted runner;
+# that oversubscribed the runner and made the unit-test step take 10-16
+# minutes.  One package shard per runner keeps each pool within
+# the runner's CPU budget while retaining every test and boundary guard.
+#
+# Slow / cross-Node-version / publish-path checks stay in the release and
+# on-demand workflows.  PostgreSQL integration, docs, audit, Docker, and
+# packaged-install workflows remain separate and are not duplicated here.
+name: CI
+
+on:
+  # Stacked PRs target a feature branch, so maintainers need the same full
+  # read-only gate on an explicit ref without retargeting the PR to main.
+  workflow_dispatch:
+  # Do not path-filter main pushes: every main-head transition must complete
+  # this gate so a docs-only successor cannot strand an already-tested image
+  # promotion. PRs keep the fast path filters below.
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - 'apps/agor-docs/**'
+      - '*.md'
+      - 'context/**'
+
+concurrency:
+  # A new push supersedes an older PR run. This removes queue time and runner
+  # minutes from stale commits without changing the required check context.
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  PNPM_VERSION: '11.17.0'
+  NODE_VERSION: '22'
+
+jobs:
+  # Keep policy/lint output in one focused job. It has no test/build work, so
+  # failures are immediately actionable instead of being buried in a fanout.
+  lint:
+    name: Lint and policy checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      # This fails if a workspace gains a test script without being assigned
+      # to a matrix group below. It also records browser-only ownership.
+      - run: node --test scripts/ci-test-matrix.test.mjs
+      - run: node --test scripts/railway-image-inputs.test.mjs
+      - run: pnpm check:ci-test-coverage
+
+      - run: pnpm check:agor-live-deps
+      - run: pnpm check:agentic-tool-packages
+      - run: node --test scripts/verify-npm-release.test.mjs
+      # Provider lifecycle/runtime tests are synthetic: no credentials,
+      # external resources or deployment mutations are needed.
+      - run: node --test docker/runtime-*.test.mjs scripts/managed-environments/railway/*.test.mjs
+      - run: pnpm check:shortid
+      - run: pnpm check:multitenancy-boundaries
+      # The ratchet's own unit test: the baseline is a named inventory, and a
+      # replacement (one classified out, one new name in) must fail even though
+      # the count is unchanged.
+      - run: pnpm test:multitenancy-boundaries
+      - run: pnpm check:daemon-filesystem-boundaries
+      - run: pnpm check:realtime-boundaries
+      - run: pnpm lint
+
+  # Build and typecheck intentionally share one Turbo invocation. Turbo's
+  # ^build edges are therefore executed once, and the compiled executor smoke
+  # test stays next to the artifact it validates.
+  build:
+    name: Typecheck and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      # Docs have their own PR/push workflow and are intentionally excluded.
+      - run: pnpm turbo run build typecheck --filter='!@agor/docs'
+      - run: pnpm check:mcp-oauth-build
+
+      # Source aliases hide cross-entrypoint AsyncLocalStorage duplication.
+      - run: pnpm --filter @agor/core test:runtime
+
+      # @agor/executor#test includes this runtime check, which requires dist.
+      # Keep both executor checks here: a filtered test runner cannot compile
+      # all of its workspace declaration dependencies cheaply or reliably.
+      - run: pnpm --filter @agor/executor exec vitest run
+      - run: pnpm --filter @agor/executor test:runtime
+      - run: pnpm --filter @agor/executor test:gemini-contract
+      - run: pnpm --filter @agor/executor test:gemini-smoke
+
+      # Every @agor/core dist entry imported by plain Node, then the tenant
+      # scope stores driven across those entries. Vitest resolves this package
+      # to source with its own CJS interop, so it can see neither a named import
+      # Node's CJS lexer rejects (a daemon that cannot boot) nor the
+      # duplicated-module packaging contract — which is what hid F4 and what
+      # found B1 on built modules.
+      - run: pnpm --filter @agor/core test:packaged
+
+  unit:
+    name: Unit tests (${{ matrix.group }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # Keep this list in sync with scripts/ci-test-matrix.mjs. The lint lane
+        # checks that every package test script is represented exactly once;
+        # UI and daemon entries are complete native file-shard partitions.
+        group: [core, daemon-1, daemon-2, ui-1, ui-2, ui-3, ui-4, cli, support]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      # Filtered installs preserve workspace source links while avoiding the
+      # docs/release dependency tree in every test runner. The pnpm store cache
+      # is read-only on hits and remains safe for fork PRs (no secrets or
+      # build outputs are stored); setup-node handles its normal scoped save.
+      - name: Install test-group dependencies
+        run: node scripts/ci-test-matrix.mjs install "${{ matrix.group }}"
+
+      - name: Run test group
+        run: node scripts/ci-test-matrix.mjs run "${{ matrix.group }}"
+
+  # The Redis-backed tenant-isolation test needs a service; keep it in its own
+  # lane rather than provisioning Redis on every unit shard.
+  daemon-ha:
+    name: Daemon Redis HA isolation
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - run: node scripts/ci-test-matrix.mjs install daemon-1
+      - name: Run Redis tenant-isolation test
+        run: >-
+          pnpm --filter @agor/daemon exec vitest run
+          src/setup/socketio-ha-tenant-isolation.integration.test.ts
+          --no-file-parallelism
+        env:
+          AGOR_TEST_REDIS_URL: redis://127.0.0.1:6379
+
+  browser:
+    name: Browser layout tests (${{ matrix.shard }}/2)
+    runs-on: ubuntu-latest
+    # Cold Ubuntu dependency downloads can consume ten minutes before Chromium
+    # starts. Leave time for the full viewport shard and retention check too.
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # Native shards partition files/projects without dropping any viewport coverage.
+        shard: [1, 2]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - run: node scripts/ci-test-matrix.mjs install ui-1
+      - run: pnpm --filter agor-ui exec playwright install --with-deps chromium
+      - name: Test production search retention and concurrency
+        run: |
+          if [[ "${{ matrix.shard }}" == "1" ]]; then
+            pnpm --filter agor-ui test:search-retention
+          fi
+      - name: Test production transcript retention
+        run: |
+          if [[ "${{ matrix.shard }}" == "2" ]]; then
+            pnpm --filter agor-ui test:transcript-retention
+          fi
+      - run: pnpm --filter agor-ui test:browser --shard=${{ matrix.shard }}/2
+      - run: NODE_OPTIONS=--conditions=source pnpm exec tsx scripts/test-mcp-oauth-browser.mts
+
+  # Do not rename this job: branch protection currently requires the generated
+  # context `CI / Lint, typecheck, build, test (pull_request)`. `always()` makes
+  # failures and cancellations fail closed; a green gate is impossible if any
+  # matrix shard or focused lane failed.
+  gate:
+    name: Lint, typecheck, build, test
+    if: ${{ always() }}
+    needs: [lint, build, unit, daemon-ha, browser]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every CI lane to pass
+        env:
+          LINT_RESULT: ${{ needs.lint.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          UNIT_RESULT: ${{ needs.unit.result }}
+          HA_RESULT: ${{ needs.daemon-ha.result }}
+          BROWSER_RESULT: ${{ needs.browser.result }}
+        run: |
+          set -euo pipefail
+          printf 'lint=%s build=%s unit=%s daemon-ha=%s browser=%s\n' \
+            "$LINT_RESULT" "$BUILD_RESULT" "$UNIT_RESULT" "$HA_RESULT" "$BROWSER_RESULT"
+          if [[ "$LINT_RESULT" != success || "$BUILD_RESULT" != success || \
+                "$UNIT_RESULT" != success || "$HA_RESULT" != success || \
+                "$BROWSER_RESULT" != success ]]; then
+            echo 'One or more required CI lanes failed or was cancelled.' >&2
+            exit 1
+          fi

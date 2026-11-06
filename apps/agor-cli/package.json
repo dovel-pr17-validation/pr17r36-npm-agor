@@ -1,0 +1,95 @@
+{
+  "name": "@agor/cli",
+  "version": "0.27.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "agor": "./bin/run.js"
+  },
+  "scripts": {
+    "build": "tsup && tsc --emitDeclarationOnly --declaration --declarationMap --noEmit false --incremental false",
+    "dev": "NODE_NO_WARNINGS=1 NODE_OPTIONS=\"${NODE_OPTIONS:+$NODE_OPTIONS }--conditions=source\" tsx bin/dev.ts",
+    "clean": "rm -rf dist",
+    "typecheck": "tsc -p tsconfig.typecheck.json",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@agor-live/client": "workspace:*",
+    "@agor/agentic-tool-opencode": "workspace:*",
+    "@agor/core": "workspace:*",
+    "@agor/git": "workspace:*",
+    "@agor/daemon": "workspace:*",
+    "@oclif/core": "^4.13.3",
+    "@oclif/plugin-help": "^6.2.56",
+    "chalk": "^6.0.0",
+    "cli-table3": "^0.6.5",
+    "inquirer": "^12.10.0",
+    "proper-lockfile": "4.1.2"
+  },
+  "devDependencies": {
+    "@types/node": "^24.6.0",
+    "@types/proper-lockfile": "4.1.4",
+    "@lydell/node-pty": "1.2.0-beta.15",
+    "glob": "^13.0.6",
+    "oclif": "^6.0.1",
+    "tsup": "^8.5.1",
+    "tsx": "4.23.15",
+    "typescript": "^6.0.3",
+    "vitest": "^5.0.1"
+  },
+  "oclif": {
+    "bin": "agor",
+    "dirname": "agor",
+    "commands": "./dist/commands",
+    "topicSeparator": " ",
+    "helpClass": "./dist/lib/help.js",
+    "hooks": {
+      "command_not_found": "./dist/hooks/command-not-found.js",
+      "prerun": "./dist/hooks/prerun.js"
+    },
+    "topics": {
+      "board": {
+        "description": "Manage boards"
+      },
+      "branch": {
+        "description": "Manage branches and their environments"
+      },
+      "daemon": {
+        "description": "Manage the local daemon lifecycle"
+      },
+      "db": {
+        "description": "Manage local database migrations"
+      },
+      "kb": {
+        "description": "Plan and migrate current Knowledge namespaces"
+      },
+      "local": {
+        "description": "Run local filesystem operations"
+      },
+      "mcp": {
+        "description": "Manage MCP servers"
+      },
+      "repo": {
+        "description": "Manage repositories"
+      },
+      "session": {
+        "description": "Inspect agent sessions"
+      },
+      "telemetry": {
+        "description": "Manage community telemetry"
+      },
+      "tenant": {
+        "description": "Manage local tenant data operations",
+        "subtopics": {
+          "gate": {
+            "description": "Manage tenant write gates"
+          }
+        }
+      },
+      "user": {
+        "description": "Manage user accounts"
+      }
+    }
+  }
+}

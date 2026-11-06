@@ -1,0 +1,341 @@
+import { sql } from 'drizzle-orm';
+import type { BranchDeletionReferenceCursor, BranchID } from '../types';
+import type { Database } from './client';
+import { executeRaw, isPostgresDatabase, rawRows } from './database-wrapper';
+
+const SCANS = [
+  { table: 'sessions', key: 'session_id' },
+  { table: 'tasks', key: 'task_id' },
+  { table: 'board_comments', key: 'comment_id' },
+  { table: 'users', key: 'user_id' },
+  { table: 'branches', key: 'branch_id' },
+] as const;
+type JsonObject = Record<string, unknown>;
+const object = (value: unknown): value is JsonObject =>
+  !!value && typeof value === 'object' && !Array.isArray(value);
+const REFERENCE_KEYS = new Set([
+  'session_id',
+  'task_id',
+  'branch_id',
+  'child_session_id',
+  'child_task_id',
+  'target_session_id',
+  'queued_task_id',
+  'requested_from_session_id',
+  'fork_point_task_id',
+  'spawn_point_task_id',
+  'parent_session_id',
+  'forked_from_session_id',
+  'primary_teammate_id',
+  'primary_assistant_id',
+]);
+
+// Traverse only schema-owned paths, never arbitrary structured user context.
+const REFERENCE_PATHS = new Set([
+  'genealogy',
+  'callback_config',
+  'metadata',
+  'position',
+  'custom_context',
+  ...['teammate', 'assistant', 'agent'].flatMap((name) => [
+    `custom_context.${name}`,
+    `custom_context.${name}.kb`,
+  ]),
+]);
+
+/** Only canonical metadata paths change; caller-defined JSON remains intact. */
+export function scrubBranchDeletionReferences(
+  value: unknown,
+  owned: ReadonlySet<string>,
+  path = ''
+): unknown {
+  if (!object(value)) return value;
+  const result: JsonObject = {};
+  for (const [key, item] of Object.entries(value)) {
+    const childPath = path ? `${path}.${key}` : key;
+    if (path === 'custom_context' || /^custom_context\.(teammate|assistant|agent)$/.test(path)) {
+      result[key] = REFERENCE_PATHS.has(childPath)
+        ? scrubBranchDeletionReferences(item, owned, childPath)
+        : item;
+      continue;
+    }
+    if (REFERENCE_KEYS.has(key) && typeof item === 'string' && owned.has(item)) continue;
+    if (key === 'primary_namespace_id' && typeof item === 'string' && owned.has(item)) {
+      throw new Error(
+        'A surviving teammate depends on this branch Knowledge namespace; change its primary namespace before deletion'
+      );
+    }
+    if (
+      key === 'callback_config' &&
+      object(item) &&
+      typeof item.callback_session_id === 'string' &&
+      owned.has(item.callback_session_id)
+    ) {
+      result[key] = { ...item, enabled: false, callback_session_id: undefined };
+      continue;
+    }
+    if (
+      key === 'completion_callback' &&
+      object(item) &&
+      [item.target_session_id, item.requested_from_session_id].some(
+        (id) => typeof id === 'string' && owned.has(id)
+      )
+    )
+      continue;
+    if (
+      key === 'relative' &&
+      object(item) &&
+      typeof item.parent_id === 'string' &&
+      owned.has(item.parent_id) &&
+      (item.parent_type === 'branch' || item.parent_type === 'session')
+    )
+      continue;
+    if (key === 'children' && Array.isArray(item)) {
+      result[key] = item.filter((id) => typeof id !== 'string' || !owned.has(id));
+      continue;
+    }
+    if ((key === 'grants' || key === 'callback_dispatches') && Array.isArray(item)) {
+      result[key] = item.filter(
+        (entry) =>
+          !object(entry) ||
+          ![entry.namespace_id, entry.target_session_id, entry.queued_task_id].some(
+            (id) => typeof id === 'string' && owned.has(id)
+          )
+      );
+      continue;
+    }
+    result[key] = REFERENCE_PATHS.has(childPath)
+      ? scrubBranchDeletionReferences(item, owned, childPath)
+      : item;
+  }
+  return result;
+}
+
+// The list occurs three times in the ownership UNION: <= 753 bind parameters,
+// including branch IDs, even on SQLite builds with the historical 999 limit.
+const OWNERSHIP_QUERY_IDS = 250;
+/** Distinct candidate IDs per page (soft by one indivisible row). */
+const PAGE_CANDIDATE_IDS = OWNERSHIP_QUERY_IDS * 25;
+/** Rows read per page. They are read unlocked; only rows to change are locked. */
+export const BRANCH_DELETION_REFERENCE_PAGE_ROWS = 1000;
+
+function* collectIds(value: unknown, path = ''): Generator<string> {
+  if (!object(value)) return;
+  for (const [key, item] of Object.entries(value)) {
+    const childPath = path ? `${path}.${key}` : key;
+    if (REFERENCE_PATHS.has(childPath)) yield* collectIds(item, childPath);
+    if (path === 'custom_context' || /^custom_context\.(teammate|assistant|agent)$/.test(path))
+      continue;
+    if (
+      (REFERENCE_KEYS.has(key) ||
+        key === 'primary_namespace_id' ||
+        key === 'callback_session_id') &&
+      typeof item === 'string'
+    )
+      yield item;
+    if (key === 'children' && Array.isArray(item))
+      for (const id of item) if (typeof id === 'string') yield id;
+    if (['relative', 'completion_callback'].includes(key) && object(item)) {
+      for (const field of ['parent_id', 'target_session_id', 'requested_from_session_id'])
+        if (typeof item[field] === 'string') yield item[field];
+    }
+    if (['grants', 'callback_dispatches'].includes(key) && Array.isArray(item))
+      for (const entry of item) {
+        if (object(entry))
+          for (const field of ['namespace_id', 'target_session_id', 'queued_task_id'])
+            if (typeof entry[field] === 'string') yield entry[field];
+      }
+  }
+}
+
+type Scan = (typeof SCANS)[number];
+
+// Restrict traversal to application-owned metadata; never inspect message
+// content, prompt text, environment secrets, or arbitrary branch config.
+function selectReferences(scan: Scan, data: JsonObject): JsonObject {
+  return scan.table === 'sessions'
+    ? { genealogy: data.genealogy, callback_config: data.callback_config }
+    : scan.table === 'tasks'
+      ? { metadata: data.metadata }
+      : scan.table === 'board_comments'
+        ? { position: data.position }
+        : scan.table === 'users'
+          ? {
+              primary_teammate_id: data.primary_teammate_id,
+              primary_assistant_id: data.primary_assistant_id,
+            }
+          : { custom_context: data.custom_context };
+}
+
+function parseData(value: unknown): unknown {
+  return typeof value === 'string' ? JSON.parse(value) : value;
+}
+
+/** Add to `owned` every ID in `ids` that the deleting branch owns; bounded IN lists. */
+async function resolveOwnedIds(
+  db: Database,
+  branchId: BranchID,
+  ids: Iterable<string>,
+  owned: Set<string>
+): Promise<void> {
+  let chunk: string[] = [];
+  const flush = async () => {
+    if (!chunk.length) return;
+    const list = sql.join(
+      chunk.map((id) => sql`${id}`),
+      sql`, `
+    );
+    chunk = [];
+    const found = rawRows(
+      await executeRaw(
+        db,
+        sql`
+        SELECT session_id AS id FROM sessions WHERE branch_id = ${branchId} AND session_id IN (${list})
+        UNION ALL SELECT task_id AS id FROM tasks WHERE session_id IN (SELECT session_id FROM sessions WHERE branch_id = ${branchId}) AND task_id IN (${list})
+        UNION ALL SELECT namespace_id AS id FROM kb_namespaces WHERE branch_id = ${branchId} AND kind = 'branch' AND namespace_id IN (${list})`
+      )
+    );
+    for (const item of found) owned.add(String(item.id));
+  };
+  for (const id of ids) {
+    if (id === branchId) continue;
+    chunk.push(id);
+    if (chunk.length === OWNERSHIP_QUERY_IDS) await flush();
+  }
+  await flush();
+}
+
+/** True when scrubbing would change the row, including a dependency blocker. */
+function needsScrub(selected: JsonObject, owned: ReadonlySet<string>): boolean {
+  try {
+    return (
+      JSON.stringify(selected) !== JSON.stringify(scrubBranchDeletionReferences(selected, owned))
+    );
+  } catch {
+    // Let the locked authoritative pass raise the blocker on current data.
+    return true;
+  }
+}
+
+export interface BranchDeletionReferencePage {
+  done: boolean;
+  cursor: BranchDeletionReferenceCursor;
+  /** Rows inspected by this page. */
+  scanned: number;
+  /** Rows rewritten by this page. */
+  updated: number;
+}
+
+/**
+ * One keyset page of reference reconciliation before any owning
+ * session/task/namespace is removed. Call under the tenant reference lock and
+ * the invocation Branch lock. No external work in this transaction.
+ *
+ * Read-mostly: up to BRANCH_DELETION_REFERENCE_PAGE_ROWS rows are read WITHOUT
+ * row locks, and ownership of all their candidate IDs is resolved with a few
+ * batched queries (<= 250 IDs each). Only rows whose scrub would change
+ * something are then re-selected FOR UPDATE, re-read, re-resolved and written,
+ * so a concurrent writer is never clobbered and unrelated rows are never
+ * locked. Skipping locks on unchanged rows is safe because a NEW reference to
+ * this branch's sessions/tasks/namespaces is admitted only under that branch's
+ * row lock with no deletion in progress (lockBranchForAdmission): any such
+ * writer committed before the deletion claim, so this later read observes it.
+ * Rows behind the durable cursor already depended on that same fence.
+ *
+ * A page stops at a row boundary after PAGE_CANDIDATE_IDS distinct candidate
+ * IDs (soft by one indivisible row) and advances to the last processed row.
+ * A single row's JSON read/scrub/write still scales with its size. The cursor
+ * lives in the branch's private claim; no growing resource manifest.
+ */
+export async function reconcileBranchDeletionReferencesBatch(
+  db: Database,
+  branchId: BranchID,
+  cursor: BranchDeletionReferenceCursor = { table: 0 },
+  pageRows = BRANCH_DELETION_REFERENCE_PAGE_ROWS
+): Promise<BranchDeletionReferencePage> {
+  const scan = SCANS[cursor.table];
+  if (!scan) return { done: true, cursor, scanned: 0, updated: 0 };
+  const key = sql.identifier(scan.key);
+  const table = sql.identifier(scan.table);
+  const where =
+    scan.table === 'branches'
+      ? sql`AND branch_id <> ${branchId}`
+      : scan.table === 'sessions'
+        ? sql`AND branch_id <> ${branchId}`
+        : scan.table === 'tasks'
+          ? sql`AND session_id NOT IN (SELECT session_id FROM sessions WHERE branch_id = ${branchId})`
+          : sql``;
+  const rows = rawRows(
+    await executeRaw(
+      db,
+      sql`SELECT ${key} AS id, data FROM ${table}
+    WHERE ${key} > ${cursor.after ?? ''} ${where} ORDER BY ${key} LIMIT ${pageRows}`
+    )
+  );
+  if (!rows.length)
+    return { done: false, cursor: { table: cursor.table + 1 }, scanned: 0, updated: 0 };
+
+  const resolved = new Set<string>([branchId]);
+  const processed: { id: string; selected: JsonObject }[] = [];
+  for (const row of rows) {
+    const data = parseData(row.data);
+    const selected = object(data) ? selectReferences(scan, data) : undefined;
+    const ids = new Set(selected ? collectIds(selected) : []);
+    let added = 0;
+    for (const id of ids) if (!resolved.has(id)) added++;
+    if (processed.length && resolved.size + added > PAGE_CANDIDATE_IDS) break;
+    for (const id of ids) resolved.add(id);
+    processed.push({ id: String(row.id), selected: selected ?? {} });
+  }
+  const owned = new Set<string>([branchId]);
+  await resolveOwnedIds(db, branchId, resolved, owned);
+  const candidates = processed
+    .filter((row) => Object.keys(row.selected).length && needsScrub(row.selected, owned))
+    .map((row) => row.id);
+
+  let updated = 0;
+  for (let offset = 0; offset < candidates.length; offset += OWNERSHIP_QUERY_IDS) {
+    const list = sql.join(
+      candidates.slice(offset, offset + OWNERSHIP_QUERY_IDS).map((id) => sql`${id}`),
+      sql`, `
+    );
+    // Authoritative pass: lock, re-read the latest committed row, re-resolve
+    // any ID first seen now, and scrub with the complete matching-ID set.
+    const locked = rawRows(
+      await executeRaw(
+        db,
+        sql`SELECT ${key} AS id, data FROM ${table} WHERE ${key} IN (${list}) ${where}
+        ORDER BY ${key} ${isPostgresDatabase(db) ? sql`FOR UPDATE` : sql``}`
+      )
+    );
+    for (const row of locked) {
+      const data = parseData(row.data);
+      if (!object(data)) continue;
+      const selected = selectReferences(scan, data);
+      const fresh = [...new Set(collectIds(selected))].filter((id) => !resolved.has(id));
+      await resolveOwnedIds(db, branchId, fresh, owned);
+      for (const id of fresh) resolved.add(id);
+      const scrubbed = scrubBranchDeletionReferences(selected, owned) as JsonObject;
+      if (JSON.stringify(selected) === JSON.stringify(scrubbed)) continue;
+      const next = { ...data };
+      for (const name of Object.keys(selected)) {
+        if (Object.hasOwn(scrubbed, name) && scrubbed[name] !== undefined)
+          next[name] = scrubbed[name];
+        else delete next[name];
+      }
+      const encoded = JSON.stringify(next);
+      await executeRaw(
+        db,
+        sql`UPDATE ${table} SET data = ${isPostgresDatabase(db) ? sql`${encoded}::jsonb` : sql`${encoded}`}
+        WHERE ${key} = ${String(row.id)}`
+      );
+      updated++;
+    }
+  }
+  return {
+    done: false,
+    cursor: { table: cursor.table, after: processed.at(-1)!.id },
+    scanned: processed.length,
+    updated,
+  };
+}

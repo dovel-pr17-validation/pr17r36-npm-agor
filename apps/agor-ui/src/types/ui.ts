@@ -1,0 +1,27 @@
+// src/types/ui.ts
+// UI-specific types for view modes and component states
+// (SessionViewMode moved to @agor-live/client/ui.ts)
+
+/**
+ * UI-only type for agent selection (different from AgenticTool which has UUIDv7 ID)
+ */
+export interface AgenticToolOption {
+  id: string; // AgenticToolName as string
+  name: string;
+  icon: string;
+  version?: string;
+  description?: string;
+  beta?: boolean; // Show beta badge for experimental features
+}
+
+/**
+ * UI-level clone behavior options for shared repository creation handlers.
+ */
+export interface CreateRepoOptions {
+  /** Suppress shared toast side effects when the caller owns progress/error UI. */
+  silent?: boolean;
+  /** Still show request errors and status-refresh warnings when silent; not clone outcomes. */
+  showErrors?: boolean;
+  /** Suppress continuations once the initiating authenticated authority changes. */
+  shouldApply?: () => boolean;
+}
