@@ -57,20 +57,20 @@
     "test:ha:tenant-links": "node scripts/test-ha-tenant-links.mjs"
   },
   "devDependencies": {
-    "@biomejs/biome": "2.5.14",
+    "@biomejs/biome": "2.6.4",
     "@google-analytics/admin": "^9.2.0",
     "husky": "^9.1.7",
     "knip": "^5.85.0",
-    "lint-staged": "^17.5.1",
+    "lint-staged": "^17.6.0",
     "postgres": "^3.4.9",
-    "prettier": "^3.9.9",
-    "rollup": "4.63.4",
+    "prettier": "^3.9.10",
+    "rollup": "4.67.4",
     "rollup-plugin-dts": "^6.5.1",
     "socket.io-client": "^4.8.3",
     "tsx": "4.23.15",
-    "turbo": "^2.11.3",
+    "turbo": "^2.11.10",
     "typescript": "^6.0.3",
-    "vitest": "^5.0.1"
+    "vitest": "^5.1.0"
   },
   "packageManager": "pnpm@11.17.0",
   "engines": {
