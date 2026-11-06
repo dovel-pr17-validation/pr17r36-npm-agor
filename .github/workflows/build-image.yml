@@ -106,7 +106,7 @@ jobs:
       # do not export a PR-scoped cache: the source layer changes per commit and
       # measured exports cost more time than they save.
       - name: Build image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/Dockerfile
@@ -147,7 +147,7 @@ jobs:
       # Main/tag/manual runs keep validating; PRs never publish images/caches.
       - name: Build preview runtime
         if: steps.railway.outputs.build == 'true'
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/Dockerfile
@@ -203,7 +203,7 @@ jobs:
 
       - name: Push preview runtime
         if: github.event_name == 'workflow_run'
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/Dockerfile
@@ -234,7 +234,7 @@ jobs:
       # job/check name for branch-protection and dashboard compatibility.
       - name: Push image
         if: github.event_name != 'pull_request'
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/Dockerfile
