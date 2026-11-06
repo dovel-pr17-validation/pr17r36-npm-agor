@@ -216,7 +216,7 @@ jobs:
       - name: Docker metadata
         if: github.event_name != 'pull_request'
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.IMAGE }}
           # Full commit SHA on every build; PR ref and semver tags where
