@@ -423,8 +423,8 @@ importers:
         specifier: ^6.3.4
         version: 6.3.4(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
       '@ant-design/x':
-        specifier: ^2.9.0
-        version: 2.9.0(antd@6.6.4(luxon@3.7.2)(react-dom@19.3.0(react@19.3.0))(react@19.3.0))(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
+        specifier: ^2.10.0
+        version: 2.10.0(antd@6.6.4(luxon@3.7.2)(react-dom@19.3.0(react@19.3.0))(react@19.3.0))(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
       '@codemirror/lang-json':
         specifier: ^6.0.2
         version: 6.0.2
@@ -1385,8 +1385,8 @@ packages:
       react: ^0.14.0 || ^15.0.1 || ^16.0.0 || ^17.0.0 || ^18.0.0 || ^19.0.0
       react-dom: ^0.14.0 || ^15.0.1 || ^16.0.0 || ^17.0.0 || ^18.0.0 || ^19.0.0
 
-  '@ant-design/x@2.9.0':
-    resolution: {integrity: sha512-m3N2nprrPG/D0n93B/fBFhjpvSaJAb2IDF6w0rX0ycYXSGxtgrJQvqSI33Jhx6gxUHj495zdIzqA1NMFld9iQA==}
+  '@ant-design/x@2.10.0':
+    resolution: {integrity: sha512-OxBCe9zLRqP/reRbEefGhU8/7inGQ1I5hDTF4GfgaY7+X0kGYON20fl+YCu5bsWDCT1eXl5d9VfmHyoNvWk1XQ==}
     peerDependencies:
       antd: ^6.1.1
       react: '>=18.0.0'
@@ -11023,7 +11023,7 @@ snapshots:
       react-dom: 19.3.0(react@19.3.0)
       throttle-debounce: 5.0.2
 
-  '@ant-design/x@2.9.0(antd@6.6.4(luxon@3.7.2)(react-dom@19.3.0(react@19.3.0))(react@19.3.0))(react-dom@19.3.0(react@19.3.0))(react@19.3.0)':
+  '@ant-design/x@2.10.0(antd@6.6.4(luxon@3.7.2)(react-dom@19.3.0(react@19.3.0))(react@19.3.0))(react-dom@19.3.0(react@19.3.0))(react@19.3.0)':
     dependencies:
       '@ant-design/colors': 8.0.1
       '@ant-design/cssinjs': 2.1.2(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
