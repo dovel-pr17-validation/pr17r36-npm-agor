@@ -60,7 +60,7 @@
     "@biomejs/biome": "2.5.14",
     "@google-analytics/admin": "^9.2.0",
     "husky": "^9.1.7",
-    "knip": "^5.85.0",
+    "knip": "^6.45.1",
     "lint-staged": "^17.5.1",
     "postgres": "^3.4.9",
     "prettier": "^3.9.9",
